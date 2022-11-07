@@ -1,1 +1,2 @@
-# fqtools
+# fqtk
+FASTQ tool-kit

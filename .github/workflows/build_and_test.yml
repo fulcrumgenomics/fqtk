@@ -1,0 +1,31 @@
+name: Check
+
+on: [push, pull_request]
+
+env: 
+  CARGO_TERM_COLOR: always
+
+jobs:
+  precommit:
+    name: Pre-commit
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: bash src/scripts/precommit.sh
+
