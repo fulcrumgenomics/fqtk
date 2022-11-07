@@ -1,0 +1,28 @@
+[package]
+authors = [
+    "Nathan Roach <nathan@fulcrumgenomics.com>",
+    "Tim Fennel <tim@fulcrumgenomics.com>",
+    "Nils Homer <nils@fulcrumgenomics.com>"
+]
+name = "fqtk"
+publish = false
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fqtk_lib"
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "fqtk"
+path = "src/bin/main.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.38"
+clap = { version = "4.0.22", features = ["derive"] }
+enum_dispatch = "0.3.8"
+env_logger = "0.9.3"
+log = "0.4.17"
+serde = { version = "1.0.147", features = ["derive"] }
