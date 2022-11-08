@@ -41,7 +41,6 @@ pub struct BarcodeMatcher<'a> {
 // ``BarcodeMatcher`` struct.
 impl<'a: 'b, 'b> BarcodeMatcher<'a> {
     /// Counts the number of bases that differ between two byte arrays.
-    #[allow(dead_code)] // TODO - remove me once we call this fn in the binary
     fn count_mismatches(observed_bases: &[u8], expected_bases: &[u8]) -> u8 {
         assert_eq!(
             observed_bases.len(),
