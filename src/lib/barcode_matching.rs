@@ -5,7 +5,7 @@ fn byte_is_nocall(byte: u8) -> bool {
     byte == b'N' || byte == b'n' || byte == b'.'
 }
 
-/// Type alias for &str that contains the bytes matching the barcode for a given sample.
+/// Type alias for ``&BStr`` that contains the bytes matching the barcode for a given sample.
 type Barcode<'a> = &'a BStr;
 
 /// The struct that contains the info related to the best and next best sample barcode match.
@@ -217,7 +217,7 @@ mod tests {
         //                                   1 different base
         //                                   |
         //                                   v
-        let test_barcode = BStr::new("GAAAAAAAGATTACAGA".as_bytes());
+        let test_barcode: &BStr = BStr::new("GAAAAAAAGATTACAGA".as_bytes());
         let expected = expected_barcode_match(0, 1, 7);
         assert_ne!(
             expected.best_match,
@@ -233,7 +233,7 @@ mod tests {
         //                                   1 no-call
         //                                   |
         //                                   v
-        let test_barcode = BStr::new("NAAAAAAAGATTACAGA".as_bytes());
+        let test_barcode: &BStr = BStr::new("NAAAAAAAGATTACAGA".as_bytes());
         let expected = expected_barcode_match(0, 1, 8);
         assert_ne!(
             expected.best_match,
@@ -251,7 +251,7 @@ mod tests {
         //                                   | 1 different base
         //                                   | |
         //                                   v v
-        let test_barcode = BStr::new("NAGAAAAAGATTACAGA".as_bytes());
+        let test_barcode: &BStr = BStr::new("NAGAAAAAGATTACAGA".as_bytes());
         let expected = expected_barcode_match(0, 2, 7);
         assert_ne!(
             expected.best_match,
