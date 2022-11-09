@@ -129,7 +129,6 @@ impl BarcodeMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bstr::BStr;
 
     // ############################################################################################
     // Test ``BarcodeMatcher`` instantiation panics.
@@ -258,10 +257,10 @@ mod tests {
         let matcher = BarcodeMatcher::new(
             &sample_barcodes, Some(2), Some(2), Some(2)
         );
-        //                                   1 different base
-        //                                   |
-        //                                   v
-        let test_barcode: &BStr = BStr::new("GAAT".as_bytes());
+        //                          1 different base
+        //                          |
+        //                          v
+        let test_barcode: &[u8] = b"GAAT";
         let expected = BarcodeMatch{best_match: 0, best_mismatches: 1, next_best_mismatches: 3};
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
@@ -272,10 +271,10 @@ mod tests {
         let matcher = BarcodeMatcher::new(
             &sample_barcodes, Some(2), Some(2), Some(2)
         );
-        //                                   1 no-call
-        //                                   |
-        //                                   v
-        let test_barcode: &BStr = BStr::new("NAAT".as_bytes());
+        //                             1 no-call
+        //                             |
+        //                             v
+        let test_barcode: &[u8; 4] = b"NAAT";
         let expected = BarcodeMatch{best_match: 0, best_mismatches: 1, next_best_mismatches: 3};
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
