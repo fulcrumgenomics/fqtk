@@ -107,6 +107,7 @@ impl BarcodeMatcher {
                 next_best_mismatches = mismatches;
             }
         }
+
         if best_mismatches > self.max_mismatches
             || (next_best_mismatches - best_mismatches) < self.min_mismatch_delta
         {
