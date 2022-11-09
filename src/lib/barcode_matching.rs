@@ -232,18 +232,18 @@ mod tests {
     #[test]
     fn test_produce_no_match_if_too_many_mismatches() {
         let matcher = get_matcher(default_barcodes(), None, Some(0), None);
-        assert_eq!(matcher.assign(BStr::new(b"AAAAAAAAGATTACAGT")), None,);
+        assert_eq!(matcher.assign(BStr::new(b"AAAAAAAAGATTACAGT")), None);
     }
 
     #[test]
     fn test_produce_no_match_if_within_mismatch_delta() {
         let matcher = get_matcher(default_barcodes(), None, Some(10), Some(3));
-        assert_eq!(matcher.assign(BStr::new(SAMPLE_BARCODE_4.as_bytes())), None,);
+        assert_eq!(matcher.assign(BStr::new(SAMPLE_BARCODE_4.as_bytes())), None);
     }
 
     #[test]
     fn test_produce_no_match_if_too_many_no_calls() {
         let matcher = get_matcher(default_barcodes(), Some(0), Some(10), None);
-        assert_eq!(matcher.assign(BStr::new("GGGGGGTTGATTACAGN".as_bytes())), None,);
+        assert_eq!(matcher.assign(BStr::new("GGGGGGTTGATTACAGN".as_bytes())), None);
     }
 }
