@@ -1,4 +1,4 @@
-use bstr::{BStr, BString, ByteSlice};
+use bstr::{BString, ByteSlice};
 
 /// Checks whether a given u8 byte is a "No-call"-ed base, signified by the bytes 'N', 'n' and '.'
 fn byte_is_nocall(byte: u8) -> bool {
@@ -37,7 +37,7 @@ pub struct BarcodeMatcher {
 impl BarcodeMatcher {
     /// Instantiates a new ``BarcodeMatcher`` struct. Checks that the sample barcodes vector is not
     /// empty and that none of the barcodes provided are the empty string.
-    /// 
+    ///
     /// # Panics
     /// - Will panic if provided an empty vec of sample barcodes.
     /// - Will panic if any provided barcode is length zero.
@@ -87,7 +87,7 @@ impl BarcodeMatcher {
 
     /// Assigns the barcode that best matches the provided ``read_bases``.
     #[must_use]
-    pub fn assign(&self, read_bases: &BStr) -> Option<BarcodeMatch> {
+    pub fn assign(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
         let num_no_call = read_bases
             .iter()
             .filter(|&&byte| byte_is_nocall(byte))
@@ -130,32 +130,6 @@ impl BarcodeMatcher {
 mod tests {
     use super::*;
     use bstr::BStr;
-
-    const SAMPLE_BARCODE_1: &str = "AAAAAAAAGATTACAGA";
-    const SAMPLE_BARCODE_2: &str = "CCCCCCCCGATTACAGA";
-    const SAMPLE_BARCODE_3: &str = "GGGGGGGGGATTACAGA";
-    const SAMPLE_BARCODE_4: &str = "GGGGGGTTGATTACAGA";
-
-    fn default_barcodes() -> Vec<&'static str> {
-        vec![
-            SAMPLE_BARCODE_1,
-            SAMPLE_BARCODE_2,
-            SAMPLE_BARCODE_3,
-            SAMPLE_BARCODE_4,
-        ]
-    }
-
-    fn expected_barcode_match(
-        expected_barcode_index: usize,
-        best_mismatches: u8,
-        next_best_mismatches: u8,
-    ) -> BarcodeMatch {
-        BarcodeMatch {
-            best_match: expected_barcode_index,
-            best_mismatches,
-            next_best_mismatches,
-        }
-    }
 
     // ############################################################################################
     // Test ``BarcodeMatcher`` instantiation panics.
@@ -262,85 +236,134 @@ mod tests {
     // ############################################################################################
     // Some returns
     #[test]
-    fn test_assign_fragment_reads_demuxes_exact_match() {
-        let matcher = BarcodeMatcher::new(
-            &default_barcodes(),
-            None,
-            None,
-            None,
-        );
+    fn test_assign_exact_match() {
+        const EXPECTED_BARCODE_INDEX: usize = 0;
+        let sample_barcodes = vec!["ACGT", "AAAG", "CACA"];
+        let matcher = BarcodeMatcher::new(&sample_barcodes, Some(2), Some(2), Some(2));
         assert_eq!(
-            matcher.assign(BStr::new(SAMPLE_BARCODE_1.as_bytes())),
-            Some(expected_barcode_match(0, 0, 8)),
+            matcher.assign(sample_barcodes[EXPECTED_BARCODE_INDEX].as_bytes()),
+            Some(
+                BarcodeMatch{
+                    best_match: EXPECTED_BARCODE_INDEX,
+                    best_mismatches: 0,
+                    next_best_mismatches: 3,
+                }
+            ),
         );
     }
 
     #[test]
-    fn test_assign_fragment_reads_demuxes_imprecise_match() {
+    fn test_assign_imprecise_match() {
+        let sample_barcodes = vec!["AAAT", "AGAG", "CACA"];
         let matcher = BarcodeMatcher::new(
-            &default_barcodes(),
-            None,
-            None,
-            None,
+            &sample_barcodes, Some(2), Some(2), Some(2)
         );
         //                                   1 different base
         //                                   |
         //                                   v
-        let test_barcode: &BStr = BStr::new("GAAAAAAAGATTACAGA".as_bytes());
-        let expected = expected_barcode_match(0, 1, 7);
+        let test_barcode: &BStr = BStr::new("GAAT".as_bytes());
+        let expected = BarcodeMatch{best_match: 0, best_mismatches: 1, next_best_mismatches: 3};
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
     #[test]
-    fn test_assign_fragment_reads_demuxes_precise_match_with_no_call() {
+    fn test_assign_precise_match_with_no_call() {
+        let sample_barcodes = vec!["AAAT", "AGAG", "CACA"];
         let matcher = BarcodeMatcher::new(
-            &default_barcodes(),
-            None,
-            None,
-            None,
+            &sample_barcodes, Some(2), Some(2), Some(2)
         );
         //                                   1 no-call
         //                                   |
         //                                   v
-        let test_barcode: &BStr = BStr::new("NAAAAAAAGATTACAGA".as_bytes());
-        let expected = expected_barcode_match(0, 1, 8);
+        let test_barcode: &BStr = BStr::new("NAAT".as_bytes());
+        let expected = BarcodeMatch{best_match: 0, best_mismatches: 1, next_best_mismatches: 3};
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
     #[test]
-    fn test_assign_fragment_reads_demuxes_imprecise_match_with_no_call() {
+    fn test_assign_imprecise_match_with_no_call() {
+        let sample_barcodes = vec!["AAATTT", "AGAGGG", "CACAGG"];
         let matcher = BarcodeMatcher::new(
-            &default_barcodes(),
-            None,
-            None,
-            None,
+            &sample_barcodes, Some(2), Some(2), Some(2)
         );
-        //                                   1 no-call
-        //                                   |
-        //                                   | 1 different base
-        //                                   | |
-        //                                   v v
-        let test_barcode: &BStr = BStr::new("NAGAAAAAGATTACAGA".as_bytes());
-        let expected = expected_barcode_match(0, 2, 7);
+        //                             1 no-call
+        //                             |
+        //                             | 1 different base
+        //                             | |
+        //                             v v
+        let test_barcode: &[u8; 6] = b"NAGTTT";
+        let expected = BarcodeMatch{best_match: 0, best_mismatches: 2, next_best_mismatches: 5};
+        assert_eq!(matcher.assign(test_barcode), Some(expected));
+    }
+
+    #[test]
+    fn test_sample_no_call_doesnt_contribute_to_mismatch_number() {
+        let sample_barcodes = vec!["NAGTTT", "AGAGGG", "CACAGG"];
+        let matcher = BarcodeMatcher::new(
+            &sample_barcodes, Some(2), Some(1), Some(2)
+        );
+        //                             1 no-call
+        //                             |
+        //                             | 1 different base
+        //                             | |
+        //                             v v
+        let test_barcode: &[u8; 6] = b"AAATTT";
+        let expected = BarcodeMatch{best_match: 0, best_mismatches: 1, next_best_mismatches: 4};
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
     // None returns
     #[test]
+    fn test_read_no_call_contributes_to_mismatch_number() {
+        let sample_barcodes = vec!["AAATTT", "AGAGGG", "CACAGG"];
+        let matcher = BarcodeMatcher::new(
+            &sample_barcodes, Some(2), Some(1), Some(2)
+        );
+        //                             1 no-call
+        //                             |
+        //                             | 1 different base
+        //                             | |
+        //                             v v
+        let test_barcode: &[u8; 6] = b"NAGTTT";
+        assert_eq!(matcher.assign(test_barcode), None);
+    }
+
+    #[test]
     fn test_produce_no_match_if_too_many_mismatches() {
-        let matcher = BarcodeMatcher::new(&default_barcodes(), None, Some(0), None);
-        assert_eq!(matcher.assign(BStr::new(b"AAAAAAAAGATTACAGT")), None);
+        let sample_barcodes = vec![
+            "AAGCTAG",
+            "CAGCTAG",
+            "GAGCTAG",
+            "TAGCTAG",
+        ];
+        let assignment_barcode: &[u8] = b"ATCGATC";
+        let matcher = BarcodeMatcher::new(&sample_barcodes, Some(100), Some(0), Some(100));
+        assert_eq!(matcher.assign(assignment_barcode), None);
     }
 
     #[test]
     fn test_produce_no_match_if_within_mismatch_delta() {
-        let matcher = BarcodeMatcher::new(&default_barcodes(), None, Some(10), Some(3));
-        assert_eq!(matcher.assign(BStr::new(SAMPLE_BARCODE_4.as_bytes())), None);
+        let sample_barcodes = vec![
+            "AAAAAAAA",
+            "CCCCCCCC",
+            "GGGGGGGG",
+            "GGGGGGTT",
+        ];
+        let assignment_barcode: &[u8] = sample_barcodes[3].as_bytes();
+        let matcher = BarcodeMatcher::new(&sample_barcodes, Some(100), Some(100), Some(3));
+        assert_eq!(matcher.assign(assignment_barcode), None);
     }
 
     #[test]
     fn test_produce_no_match_if_too_many_no_calls() {
-        let matcher = BarcodeMatcher::new(&default_barcodes(), Some(0), Some(10), None);
-        assert_eq!(matcher.assign(BStr::new("GGGGGGTTGATTACAGN".as_bytes())), None);
+        let sample_barcodes = vec![
+            "AAAAAAAA",
+            "CCCCCCCC",
+            "GGGGGGGG",
+            "GGGGGGTT",
+        ];
+        let assignment_barcode: &[u8] = b"GGGGGGTN";
+        let matcher = BarcodeMatcher::new(&sample_barcodes, Some(0), Some(100), Some(100));
+        assert_eq!(matcher.assign(assignment_barcode), None);
     }
 }
