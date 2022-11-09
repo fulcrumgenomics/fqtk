@@ -35,6 +35,38 @@ pub struct BarcodeMatcher {
 }
 
 impl BarcodeMatcher {
+    /// Instantiates a new ``BarcodeMatcher`` struct. Checks that the sample barcodes vector is not
+    /// empty and that none of the barcodes provided are the empty string.
+    /// 
+    /// # Panics
+    /// - Will panic if provided an empty vec of sample barcodes.
+    /// - Will panic if any provided barcode is length zero.
+    #[must_use]
+    pub fn new(
+        sample_barcodes: &[&str],
+        max_no_calls: Option<usize>,
+        max_mismatches: Option<u8>,
+        min_mismatch_delta: Option<u8>,
+    ) -> Self {
+        assert!(!sample_barcodes.is_empty(), "Must provide at least one sample barcode");
+
+        let modified_sample_barcodes = sample_barcodes.iter().map(
+            |barcode|
+            if barcode.is_empty() {
+                None
+            } else {
+                Some(BString::from(barcode.to_ascii_uppercase()))
+            }
+        ).collect::<Option<Vec<_>>>().expect("Sample barcode cannot be empty string");
+
+        Self {
+            sample_barcodes: modified_sample_barcodes,
+            max_no_calls: max_no_calls.unwrap_or(2),
+            max_mismatches: max_mismatches.unwrap_or(2),
+            min_mismatch_delta: min_mismatch_delta.unwrap_or(1),
+        }
+    }
+
     /// Counts the number of bases that differ between two byte arrays.
     fn count_mismatches(observed_bases: &[u8], expected_bases: &[u8]) -> u8 {
         assert_eq!(
@@ -97,19 +129,19 @@ impl BarcodeMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bstr::{BStr, BString};
+    use bstr::BStr;
 
     const SAMPLE_BARCODE_1: &str = "AAAAAAAAGATTACAGA";
     const SAMPLE_BARCODE_2: &str = "CCCCCCCCGATTACAGA";
     const SAMPLE_BARCODE_3: &str = "GGGGGGGGGATTACAGA";
     const SAMPLE_BARCODE_4: &str = "GGGGGGTTGATTACAGA";
 
-    fn default_barcodes() -> Vec<BString> {
+    fn default_barcodes() -> Vec<&'static str> {
         vec![
-            BString::from(SAMPLE_BARCODE_1.as_bytes()),
-            BString::from(SAMPLE_BARCODE_2.as_bytes()),
-            BString::from(SAMPLE_BARCODE_3.as_bytes()),
-            BString::from(SAMPLE_BARCODE_4.as_bytes()),
+            SAMPLE_BARCODE_1,
+            SAMPLE_BARCODE_2,
+            SAMPLE_BARCODE_3,
+            SAMPLE_BARCODE_4,
         ]
     }
 
@@ -125,22 +157,42 @@ mod tests {
         }
     }
 
-    fn get_matcher(
-        sample_barcodes: Vec<BString>,
-        max_no_calls: Option<usize>,
-        max_mismatches: Option<u8>,
-        min_mismatch_delta: Option<u8>,
-    ) -> BarcodeMatcher {
-        BarcodeMatcher {
-            sample_barcodes,
-            max_no_calls: max_no_calls.unwrap_or(2),
-            max_mismatches: max_mismatches.unwrap_or(2),
-            min_mismatch_delta: min_mismatch_delta.unwrap_or(1),
-        }
+    // ############################################################################################
+    // Test ``BarcodeMatcher`` instantiation panics.
+    // ############################################################################################
+    #[test]
+    fn test_barcode_matcher_instantiation_can_succeed() {
+        let sample_barcodes = vec!["AGCT"];
+        let _matcher = BarcodeMatcher::new(
+            &sample_barcodes,
+            None,
+            None,
+            None,
+        );
     }
 
-    fn default_matcher() -> BarcodeMatcher {
-        get_matcher(default_barcodes(), None, None, None)
+    #[test]
+    #[should_panic(expected = "Must provide at least one sample barcode")]
+    fn test_barcode_matcher_fails_if_no_sample_barcodes_provided() {
+        let sample_barcodes: Vec<&str> = vec![];
+        let _matcher = BarcodeMatcher::new(
+            &sample_barcodes,
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Sample barcode cannot be empty string")]
+    fn test_barcode_matcher_fails_if_empty_sample_barcode_provided() {
+        let sample_barcodes = vec!["AGCT", ""];
+        let _matcher = BarcodeMatcher::new(
+            &sample_barcodes,
+            None,
+            None,
+            None,
+        );
     }
 
     // ############################################################################################
@@ -155,6 +207,10 @@ mod tests {
         assert!(!byte_is_nocall(b'C'));
         assert!(!byte_is_nocall(b'G'));
         assert!(!byte_is_nocall(b'T'));
+        assert!(!byte_is_nocall(b'a'));
+        assert!(!byte_is_nocall(b'c'));
+        assert!(!byte_is_nocall(b'g'));
+        assert!(!byte_is_nocall(b't'));
     }
 
     // ############################################################################################
@@ -180,13 +236,24 @@ mod tests {
         assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "CTAATGT".as_bytes()), 7,);
     }
 
+    #[test]
+    #[should_panic(expected = "observed_bases: 5, expected_bases: 6")]
+    fn find_compare_two_sequences_of_different_length() {
+        let _mismatches = BarcodeMatcher::count_mismatches("GATTA".as_bytes(), "CTATGT".as_bytes());
+    }
+
     // ############################################################################################
     // Test BarcodeMatcher::assign
     // ############################################################################################
     // Some returns
     #[test]
     fn test_assign_fragment_reads_demuxes_exact_match() {
-        let matcher = default_matcher();
+        let matcher = BarcodeMatcher::new(
+            &default_barcodes(),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             matcher.assign(BStr::new(SAMPLE_BARCODE_1.as_bytes())),
             Some(expected_barcode_match(0, 0, 8)),
@@ -195,7 +262,12 @@ mod tests {
 
     #[test]
     fn test_assign_fragment_reads_demuxes_imprecise_match() {
-        let matcher = default_matcher();
+        let matcher = BarcodeMatcher::new(
+            &default_barcodes(),
+            None,
+            None,
+            None,
+        );
         //                                   1 different base
         //                                   |
         //                                   v
@@ -206,7 +278,12 @@ mod tests {
 
     #[test]
     fn test_assign_fragment_reads_demuxes_precise_match_with_no_call() {
-        let matcher = default_matcher();
+        let matcher = BarcodeMatcher::new(
+            &default_barcodes(),
+            None,
+            None,
+            None,
+        );
         //                                   1 no-call
         //                                   |
         //                                   v
@@ -217,7 +294,12 @@ mod tests {
 
     #[test]
     fn test_assign_fragment_reads_demuxes_imprecise_match_with_no_call() {
-        let matcher = default_matcher();
+        let matcher = BarcodeMatcher::new(
+            &default_barcodes(),
+            None,
+            None,
+            None,
+        );
         //                                   1 no-call
         //                                   |
         //                                   | 1 different base
@@ -231,19 +313,19 @@ mod tests {
     // None returns
     #[test]
     fn test_produce_no_match_if_too_many_mismatches() {
-        let matcher = get_matcher(default_barcodes(), None, Some(0), None);
+        let matcher = BarcodeMatcher::new(&default_barcodes(), None, Some(0), None);
         assert_eq!(matcher.assign(BStr::new(b"AAAAAAAAGATTACAGT")), None);
     }
 
     #[test]
     fn test_produce_no_match_if_within_mismatch_delta() {
-        let matcher = get_matcher(default_barcodes(), None, Some(10), Some(3));
+        let matcher = BarcodeMatcher::new(&default_barcodes(), None, Some(10), Some(3));
         assert_eq!(matcher.assign(BStr::new(SAMPLE_BARCODE_4.as_bytes())), None);
     }
 
     #[test]
     fn test_produce_no_match_if_too_many_no_calls() {
-        let matcher = get_matcher(default_barcodes(), Some(0), Some(10), None);
+        let matcher = BarcodeMatcher::new(&default_barcodes(), Some(0), Some(10), None);
         assert_eq!(matcher.assign(BStr::new("GGGGGGTTGATTACAGN".as_bytes())), None);
     }
 }
