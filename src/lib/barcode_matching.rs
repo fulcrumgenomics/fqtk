@@ -216,9 +216,24 @@ mod tests {
     // ############################################################################################
     // Test BarcodeMatcher::count_mismatches
     // ############################################################################################
+
+    // Thought process behind not panicking on empty string is:
+    //   1. sample barcodes are checked to see if they are empty and sample vs read barcodes are
+    //      compared for length, so empty string will fail anyway
+    //   2. the fewer operations / better optimization in this core matching function the better.
+    #[test]
+    fn empty_string_can_run_in_count_mismatches() {
+        assert_eq!(BarcodeMatcher::count_mismatches("".as_bytes(), "".as_bytes()), 0);
+    }
+
     #[test]
     fn find_no_mismatches() {
         assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GATTACA".as_bytes()), 0,);
+    }
+
+    #[test]
+    fn ns_in_expected_barcode_dont_contribute_to_mismatch_counter() {
+        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GANNACA".as_bytes()), 0,);
     }
 
     #[test]
