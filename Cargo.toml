@@ -21,6 +21,7 @@ path = "src/bin/main.rs"
 
 [dependencies]
 anyhow = "1.0.38"
+bstr = "1.0.1"
 clap = { version = "4.0.22", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
