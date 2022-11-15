@@ -26,6 +26,8 @@ pub struct Sample {
 
 impl Display for Sample {
     /// Implements a nice format display for the [`Sample`] struct.
+    /// E.g. A sample with ordinal 2, name TEST_SAMPLE, and barcode GATTACA would look like:
+    /// Sample(0002) - { name: TEST_SAMPLE	barcode: GATTACA}
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
