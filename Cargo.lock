@@ -207,6 +207,7 @@ dependencies = [
  "anyhow",
  "bstr 1.0.1",
  "clap",
+ "csv",
  "enum_dispatch",
  "env_logger",
  "fgoxide",

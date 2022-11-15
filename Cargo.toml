@@ -31,4 +31,5 @@ log = "0.4.17"
 serde = { version = "1.0.147", features = ["derive"] }
 
 [dev-dependencies]
+csv = "1.1.6"
 tempfile = "3.3.0"

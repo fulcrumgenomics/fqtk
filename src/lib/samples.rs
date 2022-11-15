@@ -140,7 +140,11 @@ mod tests {
     use core::panic;
 
     use super::*;
+    use csv::DeserializeErrorKind as CsvDeserializeErrorEnum;
+    use csv::ErrorKind as CsvErrorEnum;
     use fgoxide::{self, io::Io};
+    use serde::de::value::Error as SerdeError;
+    use serde::de::Error;
     use tempfile::TempDir;
 
     // ############################################################################################
@@ -183,19 +187,22 @@ mod tests {
     // ############################################################################################
     #[test]
     fn test_reading_from_file_with_no_header() {
-        let expected_error_message =
-            "CSV deserialize error: record 1 (line: 2, byte: 16): missing field `name`";
         let lines = vec!["sample1\tGATTACA", "sample2\tCATGCTA"];
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        if let fgoxide::FgError::ConversionError(e) = SampleGroup::from_file(&f1).unwrap_err() {
-            assert_eq!(e.to_string(), expected_error_message);
-        } else {
-            panic!("Different error type than expected reading from headerless file.")
+        let mut to_panic = true;
+        if let fgoxide::FgError::ConversionError(csv_e) = SampleGroup::from_file(&f1).unwrap_err() {
+            if let CsvErrorEnum::Deserialize { pos: _, err: csv_de_err } = csv_e.into_kind() {
+                if let CsvDeserializeErrorEnum::Message(s) = csv_de_err.kind() {
+                    to_panic = false;
+                    assert_eq!(s, &SerdeError::missing_field("name").to_string());
+                }
+            }
         }
+        assert!(!to_panic, "Different error type than expected reading from headerless file.");
     }
 
     #[test]
