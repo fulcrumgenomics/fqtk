@@ -60,7 +60,6 @@ impl Sample {
 /// Struct for storing information about multiple samples and for defining functions associated
 /// with groups of [`Sample`]s, rather than individual structs.
 #[derive(Clone, Debug)]
-#[allow(clippy::module_name_repetitions)]
 pub struct SampleGroup {
     /// A group of samples
     pub samples: Vec<Sample>,
