@@ -81,8 +81,9 @@ impl SampleGroup {
     /// those cloneto match the order in which they are stored in this [`Self`]
     /// # Panics
     ///   - Will panic if sample metadata sheet is improperly formatted
-    ///   - Will panic if a different number of names and barcodes are provided
-    ///   - Will panic if each
+    ///   - Will panic if there are duplicate sample names provided
+    ///   - Will panic if there are duplicate barcodes provided
+    ///   - Will panic if barcodes don't all have the same length
     #[must_use]
     pub fn from_samples(samples: &[Sample]) -> Self {
         // Validate that we have at least one name
