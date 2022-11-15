@@ -156,8 +156,8 @@ mod tests {
         io.write_lines(&f1, &lines).unwrap();
         let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
-        assert!(samples_metadata.samples[0].name == *"sample1");
-        assert!(samples_metadata.samples[1].name == *"sample2");
+        assert!(samples_metadata.samples[0].name == "sample1");
+        assert!(samples_metadata.samples[1].name == "sample2");
         assert!(samples_metadata.samples[0].barcode == "GATTACA");
         assert!(samples_metadata.samples[1].barcode == "CATGCTA");
     }
@@ -172,8 +172,8 @@ mod tests {
         io.write_lines(&f1, &lines).unwrap();
         let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
-        assert!(samples_metadata.samples[0].name == *"sample1");
-        assert!(samples_metadata.samples[1].name == *"sample2");
+        assert!(samples_metadata.samples[0].name == "sample1");
+        assert!(samples_metadata.samples[1].name == "sample2");
         assert!(samples_metadata.samples[0].barcode == "GATTACA");
         assert!(samples_metadata.samples[1].barcode == "CATGCTA");
     }
