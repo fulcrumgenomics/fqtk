@@ -13,7 +13,7 @@ fn is_valid_base(byte: u8) -> bool {
 }
 
 /// Struct for describing a single sample and metadata associated with that sample.
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
 pub struct Sample {
     /// name of the sample
     pub name: String,
@@ -59,7 +59,7 @@ impl Sample {
 
 /// Struct for storing information about multiple samples and for defining functions associated
 /// with groups of [`Sample`]s, rather than individual structs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleGroup {
     /// A group of samples
     pub samples: Vec<Sample>,
@@ -265,11 +265,8 @@ mod tests {
         let name = "s_1_example_name".to_owned();
         let barcode = "GATTACA".to_owned();
         let ordinal = 0;
-        let sample = Sample::new(ordinal, name, barcode);
-        assert_eq!(
-            format!("{}", sample),
-            "Sample(0000) - { name: s_1_example_name\tbarcode: GATTACA }"
-        );
+        let sample = Sample::new(ordinal, name.clone(), barcode.clone());
+        assert_eq!(Sample { name, barcode, ordinal }, sample, "Sample differed from expectation");
     }
 
     // ############################################################################################
@@ -300,11 +297,7 @@ mod tests {
         let name = "s_1_example_name".to_owned();
         let barcode = "GATTANN".to_owned();
         let ordinal = 0;
-        let sample = Sample::new(ordinal, name, barcode);
-        assert_eq!(
-            format!("{}", sample),
-            "Sample(0000) - { name: s_1_example_name\tbarcode: GATTACA }"
-        );
+        let _sample = Sample::new(ordinal, name, barcode);
     }
 
     // ############################################################################################
@@ -314,10 +307,9 @@ mod tests {
     fn test_from_samples_sample_group_pass1_single_sample() {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let samples_vec = vec![sample1.clone()];
-        let samples_metadata = SampleGroup::from_samples(&samples_vec);
+        let sample_group = SampleGroup::from_samples(&samples_vec);
 
-        let expected_formatted_string = format!("SampleGroup {{\n    {sample1}\n}}\n");
-        assert_eq!(format!("{samples_metadata}"), expected_formatted_string);
+        assert_eq!(sample_group, SampleGroup { samples: vec![sample1] });
     }
 
     #[test]
@@ -325,11 +317,20 @@ mod tests {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let sample2 = Sample::new(1, "sample_2".to_owned(), "CATGGAT".to_owned());
         let samples_vec = vec![sample1.clone(), sample2.clone()];
-        let samples_metadata = SampleGroup::from_samples(&samples_vec);
+        let sample_group = SampleGroup::from_samples(&samples_vec);
 
-        let expected_formatted_string =
-            format!("SampleGroup {{\n    {sample1}\n    {sample2}\n}}\n");
-        assert_eq!(format!("{samples_metadata}"), expected_formatted_string);
+        assert_eq!(sample_group, SampleGroup { samples: vec![sample1, sample2] });
+    }
+
+    #[test]
+    fn test_from_samples_sample_group_pass3_ordinal_values_will_be_changed_by_new() {
+        let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
+        let sample2_before = Sample::new(2, "sample_2".to_owned(), "CATGGAT".to_owned());
+        let sample2_after = Sample::new(1, "sample_2".to_owned(), "CATGGAT".to_owned());
+        let samples_vec = vec![sample1.clone(), sample2_before];
+        let sample_group = SampleGroup::from_samples(&samples_vec);
+
+        assert_eq!(sample_group, SampleGroup { samples: vec![sample1, sample2_after] });
     }
 
     // ############################################################################################
@@ -339,7 +340,7 @@ mod tests {
     #[should_panic(expected = "Must provide one or more sample")]
     fn test_from_samples_sample_group_fail1_no_samples() {
         let samples = vec![];
-        let _samples_metadata = SampleGroup::from_samples(&samples);
+        let _sample_group = SampleGroup::from_samples(&samples);
     }
 
     #[test]
@@ -349,7 +350,7 @@ mod tests {
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_1".to_owned(), "CATGGAT".to_owned()),
         ];
-        let _samples_metadata = SampleGroup::from_samples(&samples);
+        let _sample_group = SampleGroup::from_samples(&samples);
     }
 
     #[test]
@@ -359,7 +360,7 @@ mod tests {
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "GATTACA".to_owned()),
         ];
-        let _samples_metadata = SampleGroup::from_samples(&samples);
+        let _sample_group = SampleGroup::from_samples(&samples);
     }
 
     #[test]
@@ -369,6 +370,6 @@ mod tests {
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "CATGGA".to_owned()),
         ];
-        let _samples_metadata = SampleGroup::from_samples(&samples);
+        let _sample_group = SampleGroup::from_samples(&samples);
     }
 }
