@@ -5,6 +5,8 @@ use serde::Deserialize;
 use std::fmt::{self, Display};
 use std::path::Path;
 
+const DEFAULT_FILE_DELIMETER: u8 = b'\t';
+
 /// Checks whether a provided byte is an A, G, C, or T.
 fn is_valid_base(byte: u8) -> bool {
     byte == b'A' || byte == b'C' || byte == b'G' || byte == b'T'
@@ -127,12 +129,9 @@ impl SampleGroup {
     ///   - Will panic if sample metadata sheet is improperly formatted
     ///   - Will panic if a different number of names and barcodes are provided
     ///   - Will panic if each
-    pub fn from_file<P: AsRef<Path>>(
-        path: &P,
-        delimiter: u8,
-    ) -> Result<SampleGroup, fgoxide::FgError> {
+    pub fn from_file<P: AsRef<Path>>(path: &P) -> Result<SampleGroup, fgoxide::FgError> {
         let reader = DelimFile::default();
-        Ok(Self::from_samples(&reader.read(path, delimiter, false)?))
+        Ok(Self::from_samples(&reader.read(path, DEFAULT_FILE_DELIMETER, false)?))
     }
 }
 
@@ -155,22 +154,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SampleGroup::from_file(&f1, b'\t').unwrap();
-
-        assert!(samples_metadata.samples[0].name == *"sample1");
-        assert!(samples_metadata.samples[1].name == *"sample2");
-        assert!(samples_metadata.samples[0].barcode == "GATTACA");
-        assert!(samples_metadata.samples[1].barcode == "CATGCTA");
-    }
-    #[test]
-    fn test_reading_from_csv_file() {
-        let lines = vec!["name,barcode", "sample1,GATTACA", "sample2,CATGCTA"];
-        let tempdir = TempDir::new().unwrap();
-        let f1 = tempdir.path().join("sample_metadata.tsv");
-
-        let io = Io::default();
-        io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SampleGroup::from_file(&f1, b',').unwrap();
+        let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
         assert!(samples_metadata.samples[0].name == *"sample1");
         assert!(samples_metadata.samples[1].name == *"sample2");
@@ -186,7 +170,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SampleGroup::from_file(&f1, b'\t').unwrap();
+        let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
         assert!(samples_metadata.samples[0].name == *"sample1");
         assert!(samples_metadata.samples[1].name == *"sample2");
@@ -207,10 +191,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        println!("{}", SampleGroup::from_file(&f1, b'\t').unwrap_err());
-        if let fgoxide::FgError::ConversionError(e) =
-            SampleGroup::from_file(&f1, b'\t').unwrap_err()
-        {
+        if let fgoxide::FgError::ConversionError(e) = SampleGroup::from_file(&f1).unwrap_err() {
             assert_eq!(e.to_string(), expected_error_message);
         } else {
             panic!("Different error type than expected reading from headerless file.")
@@ -226,7 +207,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let _sm = SampleGroup::from_file(&f1, b'\t').unwrap();
+        let _sm = SampleGroup::from_file(&f1).unwrap();
     }
 
     #[test]
@@ -238,14 +219,14 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let _sm = SampleGroup::from_file(&f1, b'\t').unwrap();
+        let _sm = SampleGroup::from_file(&f1).unwrap();
     }
 
     #[test]
     fn test_reading_non_existent_file() {
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
-        if let fgoxide::FgError::IoError(e) = SampleGroup::from_file(&f1, b'\t').unwrap_err() {
+        if let fgoxide::FgError::IoError(e) = SampleGroup::from_file(&f1).unwrap_err() {
             assert_eq!(e.to_string(), "No such file or directory (os error 2)");
         } else {
             panic!("Different error than expected reading non-existent file")
