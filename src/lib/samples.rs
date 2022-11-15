@@ -18,7 +18,7 @@ pub struct Sample {
     pub name: String,
     /// DNA barcode associated with the sample
     pub barcode: String,
-    /// index of the sample in the [`SamplesMetadata`] object, used for syncing indices across
+    /// index of the sample in the [`SampleGroup`] object, used for syncing indices across
     /// different structs
     #[serde(skip_deserializing)]
     ordinal: usize,
@@ -58,14 +58,14 @@ impl Sample {
 /// with groups of [`Sample`]s, rather than individual structs.
 #[derive(Clone, Debug)]
 #[allow(clippy::module_name_repetitions)]
-pub struct SamplesMetadata {
+pub struct SampleGroup {
     /// A group of samples
     pub samples: Vec<Sample>,
 }
 
-impl Display for SamplesMetadata {
+impl Display for SampleGroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "SamplesMetadata {{")?;
+        writeln!(f, "SampleGroup {{")?;
         for sample in &self.samples {
             writeln!(f, "    {}", sample)?;
         }
@@ -73,7 +73,7 @@ impl Display for SamplesMetadata {
     }
 }
 
-impl SamplesMetadata {
+impl SampleGroup {
     /// Validates a group of [`Sample`]s and instantiates a [`Self`] struct if they are
     /// valid. Will clone the [`Sample`] structs and change the number on the `ordinal` field on
     /// those cloneto match the order in which they are stored in this [`Self`]
@@ -131,7 +131,7 @@ impl SamplesMetadata {
     pub fn from_file<P: AsRef<Path>>(
         path: &P,
         delimiter: u8,
-    ) -> Result<SamplesMetadata, fgoxide::FgError> {
+    ) -> Result<SampleGroup, fgoxide::FgError> {
         let reader = DelimFile::default();
         Ok(Self::from_samples(&reader.read(path, delimiter, false)?))
     }
@@ -146,7 +146,7 @@ mod tests {
     use tempfile::TempDir;
 
     // ############################################################################################
-    // Test [`SamplesMetadata::from_file`] - Expected to pass
+    // Test [`SampleGroup::from_file`] - Expected to pass
     // ############################################################################################
     #[test]
     fn test_reading_from_tsv_file() {
@@ -156,7 +156,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SamplesMetadata::from_file(&f1, b'\t').unwrap();
+        let samples_metadata = SampleGroup::from_file(&f1, b'\t').unwrap();
 
         assert!(samples_metadata.samples[0].name == *"sample1");
         assert!(samples_metadata.samples[1].name == *"sample2");
@@ -171,7 +171,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SamplesMetadata::from_file(&f1, b',').unwrap();
+        let samples_metadata = SampleGroup::from_file(&f1, b',').unwrap();
 
         assert!(samples_metadata.samples[0].name == *"sample1");
         assert!(samples_metadata.samples[1].name == *"sample2");
@@ -187,7 +187,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let samples_metadata = SamplesMetadata::from_file(&f1, b'\t').unwrap();
+        let samples_metadata = SampleGroup::from_file(&f1, b'\t').unwrap();
 
         assert!(samples_metadata.samples[0].name == *"sample1");
         assert!(samples_metadata.samples[1].name == *"sample2");
@@ -196,7 +196,7 @@ mod tests {
     }
 
     // ############################################################################################
-    // Test [`SamplesMetadata::from_file`] - Expected to panic
+    // Test [`SampleGroup::from_file`] - Expected to panic
     // ############################################################################################
     #[test]
     fn test_reading_from_file_with_no_header() {
@@ -208,9 +208,9 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        println!("{}", SamplesMetadata::from_file(&f1, b'\t').unwrap_err());
+        println!("{}", SampleGroup::from_file(&f1, b'\t').unwrap_err());
         if let fgoxide::FgError::ConversionError(e) =
-            SamplesMetadata::from_file(&f1, b'\t').unwrap_err()
+            SampleGroup::from_file(&f1, b'\t').unwrap_err()
         {
             assert_eq!(e.to_string(), expected_error_message);
         } else {
@@ -227,7 +227,7 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let _sm = SamplesMetadata::from_file(&f1, b'\t').unwrap();
+        let _sm = SampleGroup::from_file(&f1, b'\t').unwrap();
     }
 
     #[test]
@@ -239,14 +239,14 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let _sm = SamplesMetadata::from_file(&f1, b'\t').unwrap();
+        let _sm = SampleGroup::from_file(&f1, b'\t').unwrap();
     }
 
     #[test]
     fn test_reading_non_existent_file() {
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
-        if let fgoxide::FgError::IoError(e) = SamplesMetadata::from_file(&f1, b'\t').unwrap_err() {
+        if let fgoxide::FgError::IoError(e) = SampleGroup::from_file(&f1, b'\t').unwrap_err() {
             assert_eq!(e.to_string(), "No such file or directory (os error 2)");
         } else {
             panic!("Different error than expected reading non-existent file")
@@ -322,67 +322,67 @@ mod tests {
     }
 
     // ############################################################################################
-    // Test [`SamplesMetadata::from_samples`] - expected to pass
+    // Test [`SampleGroup::from_samples`] - expected to pass
     // ############################################################################################
     #[test]
-    fn test_from_samples_samplesmetadata_pass1_single_sample() {
+    fn test_from_samples_sample_group_pass1_single_sample() {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let samples_vec = vec![sample1.clone()];
-        let samples_metadata = SamplesMetadata::from_samples(&samples_vec);
+        let samples_metadata = SampleGroup::from_samples(&samples_vec);
 
-        let expected_formatted_string = format!("SamplesMetadata {{\n    {sample1}\n}}\n");
+        let expected_formatted_string = format!("SampleGroup {{\n    {sample1}\n}}\n");
         assert_eq!(format!("{samples_metadata}"), expected_formatted_string);
     }
 
     #[test]
-    fn test_from_samples_samplesmetadata_pass2_multi_unique_samples() {
+    fn test_from_samples_sample_group_pass2_multi_unique_samples() {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let sample2 = Sample::new(1, "sample_2".to_owned(), "CATGGAT".to_owned());
         let samples_vec = vec![sample1.clone(), sample2.clone()];
-        let samples_metadata = SamplesMetadata::from_samples(&samples_vec);
+        let samples_metadata = SampleGroup::from_samples(&samples_vec);
 
         let expected_formatted_string =
-            format!("SamplesMetadata {{\n    {sample1}\n    {sample2}\n}}\n");
+            format!("SampleGroup {{\n    {sample1}\n    {sample2}\n}}\n");
         assert_eq!(format!("{samples_metadata}"), expected_formatted_string);
     }
 
     // ############################################################################################
-    // Test [`SamplesMetadata::from_samples`] - expected to panic
+    // Test [`SampleGroup::from_samples`] - expected to panic
     // ############################################################################################
     #[test]
     #[should_panic(expected = "Must provide one or more sample")]
-    fn test_from_samples_samplesmetadata_fail1_no_samples() {
+    fn test_from_samples_sample_group_fail1_no_samples() {
         let samples = vec![];
-        let _samples_metadata = SamplesMetadata::from_samples(&samples);
+        let _samples_metadata = SampleGroup::from_samples(&samples);
     }
 
     #[test]
     #[should_panic(expected = "Each sample name must be unique, duplicate identified")]
-    fn test_from_samples_samplesmetadata_fail2_duplicate_barcodes() {
+    fn test_from_samples_sample_group_fail2_duplicate_barcodes() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_1".to_owned(), "CATGGAT".to_owned()),
         ];
-        let _samples_metadata = SamplesMetadata::from_samples(&samples);
+        let _samples_metadata = SampleGroup::from_samples(&samples);
     }
 
     #[test]
     #[should_panic(expected = "Each sample barcode must be unique, duplicate identified")]
-    fn test_from_samples_samplesmetadata_fail3_duplicate_sample_names() {
+    fn test_from_samples_sample_group_fail3_duplicate_sample_names() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "GATTACA".to_owned()),
         ];
-        let _samples_metadata = SamplesMetadata::from_samples(&samples);
+        let _samples_metadata = SampleGroup::from_samples(&samples);
     }
 
     #[test]
     #[should_panic(expected = "All barcodes must have the same length")]
-    fn test_from_samples_samplesmetadata_fail4_barcodes_of_different_lengths() {
+    fn test_from_samples_sample_group_fail4_barcodes_of_different_lengths() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "CATGGA".to_owned()),
         ];
-        let _samples_metadata = SamplesMetadata::from_samples(&samples);
+        let _samples_metadata = SampleGroup::from_samples(&samples);
     }
 }
