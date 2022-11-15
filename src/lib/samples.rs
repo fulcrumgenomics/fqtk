@@ -1,5 +1,4 @@
 use anyhow::Result;
-use bstr::BString;
 use fgoxide::io::DelimFile;
 use itertools::Itertools;
 use serde::Deserialize;
@@ -26,8 +25,8 @@ pub struct Sample {
 
 impl Display for Sample {
     /// Implements a nice format display for the [`Sample`] struct.
-    /// E.g. A sample with ordinal 2, name TEST_SAMPLE, and barcode GATTACA would look like:
-    /// Sample(0002) - { name: TEST_SAMPLE	barcode: GATTACA}
+    /// E.g. A sample with ordinal 2, name test-sample, and barcode GATTACA would look like:
+    /// Sample(0002) - { name: test-sample    barcode: GATTACA}
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -95,19 +94,16 @@ impl SampleGroup {
             "Each sample name must be unique, duplicate identified"
         );
 
-        // Convert barcodes to BString
-        let bstr_barcodes: Vec<BString> =
-            samples.iter().map(|b| BString::from(b.barcode.as_bytes())).collect();
-
         // Validate that the barcodes are all unique
         assert!(
-            bstr_barcodes.iter().all_unique(),
+            samples.iter().map(|s| &s.barcode).all_unique(),
             "Each sample barcode must be unique, duplicate identified",
         );
 
-        let first_barcode_length = bstr_barcodes[0].len();
+        // Validate that the barcodes are all of the same length
+        let first_barcode_length = samples[0].barcode.len();
         assert!(
-            bstr_barcodes.iter().all(|b| b.len() == first_barcode_length),
+            samples.iter().map(|s| &s.barcode).all(|b| b.len() == first_barcode_length),
             "All barcodes must have the same length",
         );
 
