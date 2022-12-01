@@ -17,14 +17,14 @@ use std::{fs, io::BufReader, path::PathBuf};
 ///
 /// FASTQs and associated read structures for each sub-read should be given:
 ///
-/// - a single fragment read should have one FASTQ and one read structure
+/// - a single fragment read (with inline index) should have one FASTQ and one read structure
 /// - paired end reads should have two FASTQs and two read structures
 /// - a dual-index sample with paired end reads should have four FASTQs and four read structures
 ///   given: two for the two index reads, and two for the template reads.
 ///
 /// If multiple FASTQs are present for each sub-read, then the FASTQs for each sub-read should be
 /// concatenated together prior to running this tool
-/// (ex. `cat s_R1_L001.fq.gz s_R1_L002.fq.gz > s_R1.fq.gz`).
+/// (e.g. `zcat s_R1_L001.fq.gz s_R1_L002.fq.gz | bgzip -c > s_R1.fq.gz`).
 ///
 /// (Read structures)[<https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures>] are made up of
 /// `<number><operator>` pairs much like the `CIGAR` string in BAM files.
@@ -42,7 +42,7 @@ use std::{fs, io::BufReader, path::PathBuf};
 /// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
 /// tag.
 ///
-/// Metadata about the samples should be given as a headered metadata CSV file with two columns
+/// Metadata about the samples should be given as a headered metadata TSV file with two columns
 /// 1. name - the name of the sample.
 /// 2. barcode - the expected barcode sequence for that sample.
 ///
