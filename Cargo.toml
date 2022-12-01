@@ -31,6 +31,7 @@ log = "0.4.17"
 read-structure = "0.1.0"
 rstest="0.15.0"
 serde = { version = "1.0.147", features = ["derive"] }
+serde-aux="4.1.2"
 thiserror = "1.0.37"
 
 [dev-dependencies]

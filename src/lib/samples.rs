@@ -2,6 +2,9 @@ use anyhow::Result;
 use fgoxide::io::DelimFile;
 use itertools::Itertools;
 use serde::Deserialize;
+use serde_aux::prelude::*;
+use std::collections::hash_map::RandomState;
+use std::collections::HashSet;
 use std::fmt::{self, Display};
 use std::path::Path;
 
@@ -54,6 +57,19 @@ impl Sample {
             "All sample barcode bases must be one of A, C, G, or T"
         );
         Self { name, barcode, ordinal }
+    }
+
+    /// Returns the header line expected by serde when deserializing
+    #[must_use]
+    pub fn deserialize_header_line() -> String {
+        let field_names = serde_introspect::<Self>();
+        let skip_deserialize_fields: HashSet<&str, RandomState> = HashSet::from_iter(["ordinal"]);
+        let final_field_names: Vec<String> = field_names
+            .iter()
+            .filter(|&&f| !skip_deserialize_fields.contains(f))
+            .map(|&f| f.to_owned())
+            .collect();
+        final_field_names.join("\t")
     }
 }
 
@@ -151,7 +167,11 @@ mod tests {
     // ############################################################################################
     #[test]
     fn test_reading_from_tsv_file() {
-        let lines = vec!["name\tbarcode", "sample1\tGATTACA", "sample2\tCATGCTA"];
+        let lines = vec![
+            Sample::deserialize_header_line(),
+            "sample1\tGATTACA".to_owned(),
+            "sample2\tCATGCTA".to_owned(),
+        ];
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
 
@@ -167,7 +187,13 @@ mod tests {
 
     #[test]
     fn test_reading_from_file_with_empty_lines_at_end() {
-        let lines = vec!["name\tbarcode", "sample1\tGATTACA", "sample2\tCATGCTA", "", ""];
+        let lines = vec![
+            Sample::deserialize_header_line(),
+            "sample1\tGATTACA".to_owned(),
+            "sample2\tCATGCTA".to_owned(),
+            String::new(),
+            String::new(),
+        ];
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
 
@@ -207,7 +233,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Must provide one or more sample")]
     fn test_reading_header_only_file() {
-        let lines = vec!["name\tbarcode"];
+        let lines = vec![Sample::deserialize_header_line()];
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
 

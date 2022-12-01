@@ -1,135 +1,127 @@
 use crate::commands::command::Command;
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use fgoxide::io::Io;
 use fqtk_lib::samples::SampleGroup;
 use log::info;
 use read_structure::ReadStructure;
 use std::io::Read;
-use std::str::FromStr;
 use std::{fs, io::BufReader, path::PathBuf};
 
-/// the breakdown of threads allocated to each subtask of demultiplexing.
-#[allow(dead_code)]
-#[derive(Copy, Clone, Debug)]
-struct ThreadBreakdown {
-    /// The number of threads used to demultiplex reads / assign reads to samples
-    demux_threads: usize,
-    /// The number of threads used to compress output before writing
-    compressor_threads: usize,
-    /// The number of threads used to write output to file.
-    writer_threads: usize,
-}
-
-impl FromStr for ThreadBreakdown {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let threads = s.parse::<u16>().map_err(|e| anyhow!(e))?;
-        if threads < 3 {
-            return Err(anyhow!("Threads provided {} was too low!", threads));
-        }
-
-        // TODO - Optimize the breakdown of the thread allocation
-        // TODO - figure out how to handle different number of samples to be written.
-        //
-        let breakdown = match threads {
-            3u16 => ThreadBreakdown { demux_threads: 1, compressor_threads: 1, writer_threads: 1 },
-            4u16 => ThreadBreakdown { demux_threads: 2, compressor_threads: 1, writer_threads: 1 },
-            5u16 => ThreadBreakdown { demux_threads: 2, compressor_threads: 2, writer_threads: 1 },
-            6u16 => ThreadBreakdown { demux_threads: 2, compressor_threads: 3, writer_threads: 1 },
-            7u16 => ThreadBreakdown { demux_threads: 3, compressor_threads: 3, writer_threads: 1 },
-            8u16 => ThreadBreakdown { demux_threads: 4, compressor_threads: 3, writer_threads: 1 },
-            9u16 => ThreadBreakdown { demux_threads: 5, compressor_threads: 3, writer_threads: 1 },
-            10u16 => ThreadBreakdown { demux_threads: 6, compressor_threads: 3, writer_threads: 1 },
-            11u16 => ThreadBreakdown { demux_threads: 6, compressor_threads: 4, writer_threads: 1 },
-            12u16 => ThreadBreakdown { demux_threads: 7, compressor_threads: 4, writer_threads: 2 },
-            13u16 => ThreadBreakdown { demux_threads: 8, compressor_threads: 4, writer_threads: 2 },
-            14u16 => ThreadBreakdown { demux_threads: 9, compressor_threads: 4, writer_threads: 2 },
-            15u16 => {
-                ThreadBreakdown { demux_threads: 10, compressor_threads: 4, writer_threads: 2 }
-            }
-            16u16 => {
-                ThreadBreakdown { demux_threads: 11, compressor_threads: 4, writer_threads: 2 }
-            }
-            x => ThreadBreakdown {
-                demux_threads: (x - 7) as usize,
-                compressor_threads: 4,
-                writer_threads: 3,
-            },
-        };
-        Ok(breakdown)
-    }
-}
-
-/// Demultiplexes FASTQ files.
+/// Performs sample demultiplexing on FASTQs.
+///
+/// The sample barcode for each sample in the sample sheet will be compared against the sample
+/// barcode bases extracted from the FASTQs, to assign each read to a sample.  Reads that do not
+/// match any sample within the given error tolerance will be placed in the ``unmatched_prefix``
+/// file.
+///
+/// FASTQs and associated read structures for each sub-read should be given:
+///
+/// - a single fragment read should have one FASTQ and one read structure
+/// - paired end reads should have two FASTQs and two read structures
+/// - a dual-index sample with paired end reads should have four FASTQs and four read structures
+///   given: two for the two index reads, and two for the template reads.
+///
+/// If multiple FASTQs are present for each sub-read, then the FASTQs for each sub-read should be
+/// concatenated together prior to running this tool
+/// (ex. `cat s_R1_L001.fq.gz s_R1_L002.fq.gz > s_R1.fq.gz`).
+///
+/// (Read structures)[<https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures>] are made up of
+/// `<number><operator>` pairs much like the `CIGAR` string in BAM files.
+/// Four kinds of operators are recognized:
+///
+/// 1. `T` identifies a template read
+/// 2. `B` identifies a sample barcode read
+/// 3. `M` identifies a unique molecular index read
+/// 4. `S` identifies a set of bases that should be skipped or ignored
+///
+/// The last `<number><operator>` pair may be specified using a `+` sign instead of number to
+/// denote "all remaining bases". This is useful if, e.g., fastqs have been trimmed and contain
+/// reads of varying length. Both reads must have template bases.  Any molecular identifiers will
+/// be concatenated using the `-` delimiter and placed in the given SAM record tag (`RX` by
+/// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
+/// tag.
+///
+/// Metadata about the samples should be given as a headered metadata CSV file with two columns
+/// 1. name - the name of the sample.
+/// 2. barcode - the expected barcode sequence for that sample.
+///
+/// The read structures will be used to extract the observed sample barcode, template bases, and
+/// molecular identifiers from each read.  The observed sample barcode will be matched to the
+/// sample barcodes extracted from the bases in the sample metadata and associated read structures.
+/// ## Example Command Line
+///
+/// As an example, if the sequencing run was 2x100bp (paired end) with two 8bp index reads both
+/// reading a sample barcode, as well as an in-line 8bp sample barcode in read one, the command
+/// line would be
+///
+/// ```
+/// fqtk demux \
+///     --inputs r1.fq i1.fq i2.fq r2.fq \
+///     --read-structures 8B92T 8B 8B 100T \
+///     --sample-metadata metadata.tsv \
+///     --output output_folder
+/// ```
+///
 #[derive(Parser, Debug)]
 pub(crate) struct Demux {
-    /// One or more input fastq files each corresponding to a sub-read (ex. index-read, read-one,
-    /// read-two, fragment).
+    /// One or more input fastq files each corresponding to a sequencing (e.g. R1, I1).
     #[clap(long, short = 'i', required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 
-    /// The read structure for each of the FASTQs.
+    /// The read structures, one per input FASTQ in the same order.
     #[clap(long, short = 'r' , required = true, num_args = 1..)]
     read_structures: Vec<ReadStructure>,
 
     /// A file containing the metadata about the samples.
-    #[clap(long, short = 'x', required = true)]
-    metadata: PathBuf,
+    #[clap(long, short = 's', required = true)]
+    sample_metadata: PathBuf,
 
-    /// The output directory in which to place sample FASTQs.
+    /// The output directory into which to write per-sample FASTQs.
     #[clap(long, short = 'o', required = true)]
     output: PathBuf,
 
-    /// Output FASTQ file name for the unmatched records.
+    /// Output prefix for FASTQ file(s) for reads that cannot be matched to a sample.
     #[clap(long, short = 'u', default_value = "unmatched")]
-    unmatched: String,
+    unmatched_prefix: String,
 
     /// Maximum mismatches for a barcode to be considered a match.
-    #[clap(long, default_value = "1")]
+    #[clap(long, short = 's', default_value = "1")]
     max_mismatches: usize,
 
     /// Minimum difference between number of mismatches in the best and second best barcodes for a
     /// barcode to be considered a match.
-    #[clap(long, default_value = "2")]
+    #[clap(long, short = 'd', default_value = "2")]
     min_mismatch_delta: usize,
 
     /// The number of threads to use. Cannot be less than 3.
     #[clap(long, short = 't', default_value = "3")]
-    threads: ThreadBreakdown,
+    threads: usize,
 }
 
 impl Demux {
-    /// Attempts to open input files for reading.
-    ///
-    /// # Errors
-    ///     - Will fail if the files do not exist (which should be checked before calling this function).
-    ///     - Will fail if the files do not have read permissions.
-    fn open_inputs_for_reading(&self) -> anyhow::Result<Vec<BufReader<Box<dyn Read>>>> {
-        let io = Io::default();
-        self.inputs
-            .iter()
-            .map(|p| io.new_reader(p).map_err(|e| anyhow!(e)))
-            .collect::<Result<Vec<_>, anyhow::Error>>()
-    }
-
-    /// Checks that inputs to demux are valid.
+    /// Checks that inputs to demux are valid and returns open file handles for the inputs.
     /// Checks:
     ///     - That the number of input files and number of read structs provided are the same
     ///     - That the output directory is not read-only
     ///     - That the input files exist
-    fn validate_inputs(&self) -> anyhow::Result<()> {
+    ///     - That the input files have read permissions.
+    fn validate_inputs(&self) -> Result<Vec<BufReader<Box<dyn Read>>>> {
         let mut constraint_errors = vec![];
 
         if self.inputs.len() != self.read_structures.len() {
             let preamble = "The same number of read structures should be given as FASTQs";
             let specifics = format!(
-                "(currently {} vs {} respectively)",
+                "{} read-structures provided for {} FASTQs",
                 self.read_structures.len(),
                 self.inputs.len()
             );
             constraint_errors.push(format!("{preamble} {specifics}"));
+        }
+
+        if !self.output.exists() {
+            info!("Output directory {:#?} didn't exist, creating it.", self.output);
+            fs::create_dir_all(&self.output)?;
         }
 
         if self.output.metadata()?.permissions().readonly() {
@@ -142,15 +134,30 @@ impl Demux {
                 constraint_errors.push(format!("Provided input file {:#?} doesn't exist", input));
             }
         }
+        // Attempt to open the files for reading.
+        let io = Io::default();
+        let fq_readers_result = self
+            .inputs
+            .iter()
+            .map(|p| io.new_reader(p))
+            .collect::<Result<Vec<_>, fgoxide::FgError>>();
+        if let Err(e) = &fq_readers_result {
+            constraint_errors.push(format!("Error opening input files for reading: {}", e));
+        }
+
+        if self.threads < 3 {
+            constraint_errors
+                .push(format!("Threads provided {} was too low! Must be 3 or more.", self.threads));
+        }
 
         if constraint_errors.is_empty() {
-            Ok(())
+            Ok(fq_readers_result?)
         } else {
-            let mut error_string = "Inputs failed validation!\n".to_owned();
+            let mut details = "Inputs failed validation!\n".to_owned();
             for error_reason in constraint_errors {
-                error_string.push_str(&format!("    - {}\n", error_reason));
+                details.push_str(&format!("    - {}\n", error_reason));
             }
-            Err(anyhow!("{}Input Validation Error!", error_string))
+            Err(anyhow!("The following errors with the input(s) were detected:\n{}", details))
         }
     }
 }
@@ -158,23 +165,10 @@ impl Demux {
 impl Command for Demux {
     // (For now all this does is check the inputs to the demux command, but will eventually execute
     // TODO - remove this disclaimer once working core is implemented.)
-    /// Excecutes the demux command
-    fn execute(&self) -> anyhow::Result<()> {
+    /// Executes the demux command
+    fn execute(&self) -> Result<()> {
         self.validate_inputs()?;
-        let _fq_readers = self.open_inputs_for_reading()?;
-        let _sample_group = SampleGroup::from_file(&self.metadata)?;
-        if let Some(parent_path) = self.output.parent() {
-            assert!(
-                parent_path.exists(),
-                "Parent path ({:#?}) to output directory ({:#?}) didn't exist!\nexiting...",
-                parent_path,
-                self.output,
-            );
-        }
-        if !self.output.exists() {
-            info!("Output directory {:#?} didn't exist, creating it.", self.output);
-            fs::create_dir(&self.output)?;
-        }
+        let _sample_group = SampleGroup::from_file(&self.sample_metadata)?;
 
         Ok(())
     }
@@ -182,18 +176,20 @@ impl Command for Demux {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use fqtk_lib::samples::Sample;
     use rstest::rstest;
     use std::str::FromStr;
-
-    use super::*;
     use tempfile::TempDir;
 
     const SAMPLE1_BARCODE: &str = "GATTGGG";
 
+    /// Given a record name prefix and a slice of bases for a set of records, returns the contents
+    /// of a FASTQ file as a vec of Strings, one string per line of the FASTQ.
     fn fq_lines_from_bases(prefix: &str, records_bases: &[&str]) -> Vec<String> {
         let mut result = Vec::with_capacity(records_bases.len() * 4);
         for (i, &bases) in records_bases.iter().enumerate() {
-            result.push(format!("Example{}_{}", prefix, i));
+            result.push(format!("@{}_{}", prefix, i));
             result.push(bases.to_owned());
             result.push("+".to_owned());
             result.push(";".repeat(bases.len()));
@@ -201,6 +197,8 @@ mod tests {
         result
     }
 
+    /// Generates a FASTQ file in the tmpdir with filename "{prefix}.fastq" from the record bases
+    /// specified and returns the path to the FASTQ file.
     fn fastq_file(tmpdir: &TempDir, prefix: &str, records_bases: &[&str]) -> PathBuf {
         let io = Io::default();
 
@@ -213,7 +211,7 @@ mod tests {
 
     fn metadata_lines_from_barcodes(barcodes: &[&str]) -> Vec<String> {
         let mut result = Vec::with_capacity(barcodes.len() + 1);
-        result.push("name\tbarcode".to_owned());
+        result.push(Sample::deserialize_header_line());
         for (i, &barcode) in barcodes.iter().enumerate() {
             result.push(format!("Sample{:04}\t{}", i, barcode));
         }
@@ -234,30 +232,19 @@ mod tests {
         metadata_file(tmpdir, &[SAMPLE1_BARCODE])
     }
 
-    fn read1(tmpdir: &TempDir) -> PathBuf {
-        fastq_file(tmpdir, "read1", &["GATTACA"])
-    }
-
-    fn read2(tmpdir: &TempDir) -> PathBuf {
-        fastq_file(tmpdir, "read2", &["TAGGATTA"])
-    }
-
-    fn index1(tmpdir: &TempDir) -> PathBuf {
-        fastq_file(tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]])
-    }
-
-    fn index2(tmpdir: &TempDir) -> PathBuf {
-        fastq_file(tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]])
-    }
-
     // ############################################################################################
     // Test that ``Demux:: execute`` can succeed.
     // ############################################################################################
-    #[rstest]
+    #[test]
     fn validate_inputs_can_succeed() {
         let tmpdir = TempDir::new().unwrap();
-        let input_files = vec![read1(&tmpdir), read2(&tmpdir), index1(&tmpdir), index2(&tmpdir)];
-        let metadata = metadata(&tmpdir);
+        let input_files = vec![
+            fastq_file(&tmpdir, "read1", &["GATTACA"]),
+            fastq_file(&tmpdir, "read2", &["TAGGATTA"]),
+            fastq_file(&tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]]),
+        ];
+        let sample_metadata = metadata(&tmpdir);
 
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
@@ -269,12 +256,12 @@ mod tests {
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
-            metadata,
+            sample_metadata,
             output: tmpdir.path().to_path_buf(),
-            unmatched: "unmatched".to_owned(),
+            unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: ThreadBreakdown::from_str("3").unwrap(),
+            threads: 3,
         };
         demux_inputs.execute().unwrap();
     }
@@ -298,23 +285,28 @@ mod tests {
         #[case] read_structures: Vec<ReadStructure>,
     ) {
         let tmpdir = TempDir::new().unwrap();
-        let input_files = vec![read1(&tmpdir), read2(&tmpdir), index1(&tmpdir), index2(&tmpdir)];
-        let metadata = metadata(&tmpdir);
+        let input_files = vec![
+            fastq_file(&tmpdir, "read1", &["GATTACA"]),
+            fastq_file(&tmpdir, "read2", &["TAGGATTA"]),
+            fastq_file(&tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]]),
+        ];
+        let sample_metadata = metadata(&tmpdir);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
-            metadata,
+            sample_metadata,
             output: tmpdir.path().to_path_buf(),
-            unmatched: "unmatched".to_owned(),
+            unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: ThreadBreakdown::from_str("3").unwrap(),
+            threads: 3,
         };
         demux_inputs.execute().unwrap();
     }
 
-    #[rstest]
+    #[test]
     #[should_panic(expected = "cannot be read-only")]
     fn test_read_only_output_dir_fails() {
         let tmpdir = TempDir::new().unwrap();
@@ -325,8 +317,13 @@ mod tests {
             ReadStructure::from_str("+B").unwrap(),
         ];
 
-        let input_files = vec![read1(&tmpdir), read2(&tmpdir), index1(&tmpdir), index2(&tmpdir)];
-        let metadata = metadata(&tmpdir);
+        let input_files = vec![
+            fastq_file(&tmpdir, "read1", &["GATTACA"]),
+            fastq_file(&tmpdir, "read2", &["TAGGATTA"]),
+            fastq_file(&tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]]),
+        ];
+        let sample_metadata = metadata(&tmpdir);
         let mut permissions = tmpdir.path().metadata().unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(tmpdir.path(), permissions.clone()).unwrap();
@@ -334,12 +331,12 @@ mod tests {
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
-            metadata,
+            sample_metadata,
             output: tmpdir.path().to_path_buf(),
-            unmatched: "unmatched".to_owned(),
+            unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: ThreadBreakdown::from_str("3").unwrap(),
+            threads: 3,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -347,7 +344,7 @@ mod tests {
         demux_result.unwrap();
     }
 
-    #[rstest]
+    #[test]
     #[should_panic(expected = "doesn't exist")]
     fn test_inputs_doesnt_exist_fails() {
         let tmpdir = TempDir::new().unwrap();
@@ -360,26 +357,26 @@ mod tests {
 
         let input_files = vec![
             tmpdir.path().join("this_file_does_not_exist.fq"),
-            read2(&tmpdir),
-            index1(&tmpdir),
-            index2(&tmpdir),
+            fastq_file(&tmpdir, "read2", &["TAGGATTA"]),
+            fastq_file(&tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmpdir);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
-            metadata,
+            sample_metadata,
             output: tmpdir.path().to_path_buf(),
-            unmatched: "unmatched".to_owned(),
+            unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: ThreadBreakdown::from_str("3").unwrap(),
+            threads: 2,
         };
         demux_inputs.execute().unwrap();
     }
 
-    #[rstest]
+    #[test]
     #[should_panic(expected = "Threads provided 2 was too low!")]
     fn test_too_few_threads_fails() {
         let tmpdir = TempDir::new().unwrap();
@@ -390,18 +387,23 @@ mod tests {
             ReadStructure::from_str("+B").unwrap(),
         ];
 
-        let input_files = vec![read1(&tmpdir), read2(&tmpdir), index1(&tmpdir), index2(&tmpdir)];
-        let metadata = metadata(&tmpdir);
+        let input_files = vec![
+            fastq_file(&tmpdir, "read1", &["GATTACA"]),
+            fastq_file(&tmpdir, "read2", &["TAGGATTA"]),
+            fastq_file(&tmpdir, "index1", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmpdir, "index2", &[&SAMPLE1_BARCODE[3..]]),
+        ];
+        let sample_metadata = metadata(&tmpdir);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
-            metadata,
+            sample_metadata,
             output: tmpdir.path().to_path_buf(),
-            unmatched: "unmatched".to_owned(),
+            unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: ThreadBreakdown::from_str("2").unwrap(),
+            threads: 2,
         };
         demux_inputs.execute().unwrap();
     }
