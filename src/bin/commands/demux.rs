@@ -10,7 +10,7 @@ use std::{fs, io::BufReader, path::PathBuf};
 
 /// Performs sample demultiplexing on FASTQs.
 ///
-/// The sample barcode for each sample in the sample sheet will be compared against the sample
+/// The sample barcode for each sample in the metadata TSV will be compared against the sample
 /// barcode bases extracted from the FASTQs, to assign each read to a sample.  Reads that do not
 /// match any sample within the given error tolerance will be placed in the ``unmatched_prefix``
 /// file.
