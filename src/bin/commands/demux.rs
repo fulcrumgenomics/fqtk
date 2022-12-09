@@ -274,7 +274,7 @@ impl Demux {
             let file_type_code = match output_type {
                 SegmentType::Template => 'R',
                 SegmentType::SampleBarcode => 'I',
-                SegmentType::MolecularBarcode => 'M', // TODO ask tim about convention for molecular barcode read naming.
+                SegmentType::MolecularBarcode => 'U',
                 _ => 'S',
             };
 
