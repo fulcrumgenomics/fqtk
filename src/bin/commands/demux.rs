@@ -5,6 +5,8 @@ use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use log::info;
+use pooled_writer::PooledWriter;
+use pooled_writer::{bgzf::BgzfCompressor, Pool};
 use proglog::ProgLogBuilder;
 use read_structure::ReadSegment;
 use read_structure::ReadStructure;
@@ -14,8 +16,11 @@ use seq_io::fastq::write_to;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use seq_io::fastq::RecordsIntoIter;
+use std::cmp::min;
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{BufWriter, Read};
 use std::{
     fs,
     io::BufReader,
@@ -210,14 +215,15 @@ impl ReadSetIterator {
 /// Stores the writers for a single sample in demultiplexing. Fields can be None if that type of
 /// ``ReadSegment`` is not being written.
 struct SampleWriters {
+    /// Name of the sample this set of writers is for
+    name: String,
     /// Vec of the writers for template read segments.
-    template_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    template_writers: Option<Vec<BufWriter<File>>>,
     /// Vec of the writers for the sample barcode read segments.
-    sample_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    sample_barcode_writers: Option<Vec<BufWriter<File>>>,
     /// Vec of the writers for the molecular barcode read segments.
-    molecular_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    molecular_barcode_writers: Option<Vec<BufWriter<File>>>,
 }
-
 impl SampleWriters {
     /// Writes a set of reads (defined as a ``ReadSet``) to the appropriate writers on this
     /// ``Self`` struct.
@@ -237,6 +243,169 @@ impl SampleWriters {
         }
         Ok(())
     }
+    /// Destroys this struct and decomposes it into it's component types. Used when swaping writers
+    /// for pooled writers.
+    #[allow(clippy::type_complexity)]
+    fn decompose_into_components(
+        self,
+    ) -> (
+        String,
+        Option<Vec<BufWriter<File>>>,
+        Option<Vec<BufWriter<File>>>,
+        Option<Vec<BufWriter<File>>>,
+    ) {
+        (
+            self.name,
+            self.template_writers,
+            self.sample_barcode_writers,
+            self.molecular_barcode_writers,
+        )
+    }
+}
+
+struct PooledSingleSampleWriters {
+    /// Vec of the writers for template read segments.
+    template_writers: Option<Vec<PooledWriter>>,
+    /// Vec of the writers for the sample barcode read segments.
+    sample_barcode_writers: Option<Vec<PooledWriter>>,
+    /// Vec of the writers for the molecular barcode read segments.
+    molecular_barcode_writers: Option<Vec<PooledWriter>>,
+}
+
+impl PooledSingleSampleWriters {
+    fn num_template_writers(&self) -> usize {
+        if let Some(v) = &self.template_writers {
+            v.len()
+        } else {
+            0
+        }
+    }
+
+    fn num_sample_writers(&self) -> usize {
+        if let Some(v) = &self.sample_barcode_writers {
+            v.len()
+        } else {
+            0
+        }
+    }
+
+    fn num_molecular_writers(&self) -> usize {
+        if let Some(v) = &self.molecular_barcode_writers {
+            v.len()
+        } else {
+            0
+        }
+    }
+
+    fn write(&mut self, read_set: &ReadSet) -> Result<()> {
+        for (writers_opt, segments_opt) in [
+            (&mut self.template_writers, &read_set.template_segments),
+            (&mut self.sample_barcode_writers, &read_set.sample_barcode_segments),
+            (&mut self.molecular_barcode_writers, &read_set.molecular_barcode_segments),
+        ] {
+            if let (Some(writers), Some(segments)) = (writers_opt, segments_opt) {
+                for (writer, segment) in writers.iter_mut().zip(segments.iter()) {
+                    write_to(writer, &read_set.name, &segment.seq, &segment.quals)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Attempts to gracefully shutdown the writers in this struct, consuming the struct in the
+    /// process
+    /// # Errors
+    ///     - Will error if closing of the ``PooledWriter``s fails for any reason
+    fn shutdown(self) -> Result<()> {
+        for writers in
+            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers]
+                .into_iter()
+                .flatten()
+        {
+            writers.into_iter().try_for_each(PooledWriter::close)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Constructs a pooled writer from individual sample writers and a number of threads, and converts
+/// the writers to pooled writer objects.
+/// Returns the pooled writers organized into ``PooledSingleSampleWriter`` structs and the pool
+/// struct.
+/// # Errors:
+///     - Should never error but will iff there is an internal logic error that results in
+///         zero template read writers being produced during conversion.
+/// # Panics
+///     - Should never panic but will iff there is an internal logic issue that results in a None
+///         type being unwrapped when convering writers.
+fn build_pool(
+    samples: Vec<SampleWriters>,
+    compression_level: usize,
+    total_pool_threads: usize,
+) -> Result<(Vec<PooledSingleSampleWriters>, Pool)> {
+    let num_samples = samples.len();
+    let num_compressors = min(total_pool_threads * 2 / 3, total_pool_threads - 1);
+    let num_writers = total_pool_threads - num_compressors;
+    let num_templates = samples[0].template_writers.as_ref().map_or(0, Vec::len);
+    let num_barcodes = samples[0].sample_barcode_writers.as_ref().map_or(0, Vec::len);
+    let num_umis = samples[0].molecular_barcode_writers.as_ref().map_or(0, Vec::len);
+
+    let mut index = 0;
+    let mut sample_names = Vec::with_capacity(num_samples);
+    let mut serial_writers: Vec<BufWriter<File>> = vec![];
+    let mut mapping: HashMap<(String, char, usize), usize> = HashMap::new(); // key = (&sample_id, read_type, read_num)
+
+    for sample in samples {
+        let (name, template_writers, barcode_writers, mol_writers) =
+            sample.decompose_into_components();
+        for (optional_ws, kind) in
+            vec![(template_writers, 'T'), (barcode_writers, 'B'), (mol_writers, 'M')]
+        {
+            if let Some(ws) = optional_ws {
+                for (num, writer) in ws.into_iter().enumerate() {
+                    serial_writers.push(writer);
+                    mapping.insert((name.clone(), kind, num), index);
+                    index += 1;
+                }
+            }
+        }
+        sample_names.push(name);
+    }
+
+    let (pool, parallel_writers) = Pool::new::<_, BgzfCompressor>(
+        num_compressors,
+        num_writers,
+        u8::try_from(compression_level)?,
+        serial_writers,
+    )?;
+    let mut new_samples = vec![];
+    let mut paralllel_iterator = parallel_writers.into_iter();
+    for _ in 0..num_samples {
+        let mut template_writers = None;
+        let mut sample_barcode_writers = None;
+        let mut molecular_barcode_writers = None;
+
+        for &(kind, count) in &vec![('T', num_templates), ('B', num_barcodes), ('M', num_umis)] {
+            let mut new_ws = vec![];
+            for _ in 0..count {
+                new_ws.push(paralllel_iterator.next().expect("None returned while converting parallel iterator, something wrong with internal logic for conversion"));
+            }
+
+            match kind {
+                'T' => template_writers = Some(new_ws),
+                'B' => sample_barcode_writers = Some(new_ws),
+                'M' => molecular_barcode_writers = Some(new_ws),
+                x => return Err(anyhow!("Unexpected char type writer observed: {}", x)),
+            }
+        }
+
+        new_samples.push(PooledSingleSampleWriters {
+            template_writers,
+            sample_barcode_writers,
+            molecular_barcode_writers,
+        });
+    }
+    Ok((new_samples, pool))
 }
 
 /// Performs sample demultiplexing on FASTQs.
@@ -333,6 +502,10 @@ pub(crate) struct Demux {
     /// The number of threads to use. Cannot be less than 3.
     #[clap(long, short = 't', default_value = "3")]
     threads: usize,
+
+    /// The level of compression to use to compress outputs.
+    #[clap(long, short = 'c', default_value = "5")]
+    compression_level: usize,
 }
 
 impl Demux {
@@ -340,13 +513,13 @@ impl Demux {
     /// requested output type.
     /// # Errors:
     ///     - Will error if opening the output fails for any reason.
+    ///     - Will error if no template segments were found in the read structures on this object.
     fn create_sample_writers(
         read_structures: &[ReadStructure],
         prefix: &str,
         output_types: &HashSet<SegmentType>,
         output_dir: &Path,
     ) -> Result<SampleWriters> {
-        let fg_io = Io::default();
         let mut template_writers = None;
         let mut sample_barcode_writers = None;
         let mut molecular_barcode_writers = None;
@@ -365,9 +538,9 @@ impl Demux {
                 read_structures.iter().map(|s| s.segments_by_type(*output_type).count()).sum();
 
             for idx in 1..=segment_count {
-                output_type_writers.push(fg_io.new_writer(
+                output_type_writers.push(BufWriter::new(File::create(
                     &output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
-                )?);
+                )?));
             }
 
             match output_type {
@@ -382,7 +555,12 @@ impl Demux {
             }
         }
 
-        Ok(SampleWriters { template_writers, sample_barcode_writers, molecular_barcode_writers })
+        Ok(SampleWriters {
+            name: prefix.to_string(),
+            template_writers,
+            sample_barcode_writers,
+            molecular_barcode_writers,
+        })
     }
 
     /// Creates one writer per sample per read segment in the provided read structures for
@@ -393,17 +571,25 @@ impl Demux {
         read_structures: &[ReadStructure],
         sample_group: &SampleGroup,
         output_types: &HashSet<SegmentType>,
+        unmatched_prefix: &str,
         output_dir: &Path,
     ) -> Result<Vec<SampleWriters>> {
         let mut samples_writers = Vec::with_capacity(sample_group.samples.len());
         for sample in &sample_group.samples {
-            samples_writers.push(Demux::create_sample_writers(
+            samples_writers.push(Self::create_sample_writers(
                 read_structures,
                 &sample.name,
                 output_types,
                 output_dir,
             )?);
         }
+        // Add the unmatched 'sample'
+        samples_writers.push(Self::create_sample_writers(
+            read_structures,
+            unmatched_prefix,
+            output_types,
+            output_dir,
+        )?);
         Ok(samples_writers)
     }
     /// Checks that inputs to demux are valid and returns open file handles for the inputs.
@@ -500,18 +686,18 @@ impl Command for Demux {
             .map(|fq| FastqReader::new(fq).into_records())
             .collect::<Vec<_>>();
 
-        let mut unassigned_writers = Demux::create_sample_writers(
-            &self.read_structures,
-            &self.unmatched_prefix,
-            &output_segment_types,
-            &self.output,
+        let (mut sample_writers, mut pool) = build_pool(
+            Self::create_writers(
+                &self.read_structures,
+                &sample_group,
+                &output_segment_types,
+                &self.unmatched_prefix,
+                &self.output,
+            )?,
+            self.compression_level,
+            self.threads - 1,
         )?;
-        let mut sample_writers = Demux::create_writers(
-            &self.read_structures,
-            &sample_group,
-            &output_segment_types,
-            &self.output,
-        )?;
+        let unmatched_index = sample_writers.len() - 1;
         info!("Created sample (and unassigned) writers");
 
         let barcode_matcher = BarcodeMatcher::new(
@@ -535,11 +721,17 @@ impl Command for Demux {
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
             } else {
-                unassigned_writers.write(&read_set)?;
+                sample_writers[unmatched_index].write(&read_set)?;
             }
             logger.record();
         }
-
+        info!("Done writing outputs, shutting down pooled writers!");
+        sample_writers
+            .into_iter()
+            .map(PooledSingleSampleWriters::shutdown)
+            .collect::<Result<Vec<_>>>()?;
+        pool.stop_pool()?;
+        info!("Writers and pool shut down successfully.");
         Ok(())
     }
 }
@@ -649,6 +841,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -690,6 +883,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -726,6 +920,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -762,6 +957,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 2,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -795,6 +991,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 2,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -823,6 +1020,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -869,6 +1067,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -931,6 +1130,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -995,6 +1195,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -1057,6 +1258,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -1129,6 +1331,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1161,6 +1364,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1193,6 +1397,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
