@@ -28,11 +28,14 @@ env_logger = "0.9.3"
 fgoxide = "0.1.3"
 itertools = "0.10.5"
 log = "0.4.17"
+pooled-writer="0.2.0"
 read-structure = "0.1.0"
 rstest="0.15.0"
 serde = { version = "1.0.147", features = ["derive"] }
 serde-aux="4.1.2"
+seq_io="0.3.1"
 thiserror = "1.0.37"
+proglog = "0.3.0"
 
 [dev-dependencies]
 csv = "1.1.6"

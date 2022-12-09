@@ -10,7 +10,7 @@ fn byte_is_nocall(byte: u8) -> bool {
 pub struct BarcodeMatch {
     /// Index of the best bardcode match in the corresponding BarcodeMatcher struct that generated
     /// this match.
-    best_match: usize,
+    pub best_match: usize,
     /// The number of mismatches to the best matching barcode for the read described by this match.
     best_mismatches: u8,
     /// The number of mismatches to the second best matching barcode for the read described by this
