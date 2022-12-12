@@ -808,9 +808,8 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pooled-writer"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "402311aa58cafb9ef5361e69761c0d58e0ea2eec248629157f48c08f14ab6311"
+version = "0.2.1-alpha.0"
+source = "git+https://github.com/fulcrumgenomics/pooled-writer?rev=5c1d6e9fda5488f9b761002e106854c49155589d#5c1d6e9fda5488f9b761002e106854c49155589d"
 dependencies = [
  "bgzf",
  "bytes",
