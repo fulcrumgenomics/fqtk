@@ -34,7 +34,7 @@ pub struct BarcodeMatcher<K, V> {
     min_mismatch_delta: u8,
     /// If true will not attempt to use the cache when matching, otherwise will use the cache.
     no_cache: bool,
-    /// Caching struct for storing results of previous iterations
+    /// Caching struct for storing results of previous matches
     cache: AHashMap<K, V>,
 }
 
@@ -122,7 +122,8 @@ impl BarcodeMatcher<Vec<u8>, BarcodeMatch> {
     }
 
     /// Assigns the barcode that best matches the provided ``read_bases``, using internal caching
-    /// if configured to do so.
+    /// if configured to do so and skipping calculation for reads that cannot match any barcode (
+    /// due to having too many no-called bases).
     pub fn assign(&mut self, read_bases: &[u8]) -> Option<BarcodeMatch> {
         let num_no_calls = read_bases.iter().filter(|&&b| byte_is_nocall(b)).count();
         if num_no_calls > self.max_mismatches as usize {
