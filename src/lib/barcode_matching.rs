@@ -32,7 +32,7 @@ pub struct BarcodeMatcher<K, V> {
     /// The minimum difference between number of mismatches in the best and second best barcodes
     /// for a barcode to be considered a match.
     min_mismatch_delta: u8,
-    /// If true will attempt to use the cache when matching, otherwise will not
+    /// If true will not attempt to use the cache when matching, otherwise will use the cache.
     no_cache: bool,
     /// Caching struct for storing results of previous iterations
     cache: AHashMap<K, V>,
