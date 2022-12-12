@@ -5,8 +5,7 @@ use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use log::info;
-use pooled_writer::{bgzf::BgzfCompressor, Pool};
-use pooled_writer::{PoolBuilder, PooledWriter};
+use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::ProgLogBuilder;
 use read_structure::ReadSegment;
 use read_structure::ReadStructure;
@@ -225,8 +224,8 @@ struct SampleWriters<W: Write> {
 }
 
 impl<W: Write> SampleWriters<W> {
-    /// Destroys this struct and decomposes it into it's component types. Used when swaping writers
-    /// for pooled writers.
+    /// Destroys this struct and decomposes it into its component types. Used when swapping
+    /// writers for pooled writers.
     #[allow(clippy::type_complexity)]
     fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
@@ -277,13 +276,13 @@ impl SampleWriters<PooledWriter> {
 
 /// Constructs a pooled writer from individual sample writers and a number of threads, and converts
 /// the writers to pooled writer objects.
-/// Returns the pooled writers organized into ``PooledSingleSampleWriter`` structs and the pool
+/// Returns the pooled writers organized into ``SampleWriters`` structs and the pool
 /// struct.
 /// # Errors:
-///     - Should never error but will iff there is an internal logic error that results in
+///     - Should never error but will if there is an internal logic error that results in
 ///         zero template read writers being produced during conversion.
 /// # Panics
-///     - Should never panic but will iff there is an internal logic issue that results in a None
+///     - Should never panic but will if there is an internal logic issue that results in a None
 ///         type being unwrapped when convering writers.
 fn build_pool(
     sample_writers: Vec<SampleWriters<BufWriter<File>>>,
@@ -294,36 +293,32 @@ fn build_pool(
     let num_writers = threads - num_compressors;
 
     let mut new_sample_writers = Vec::with_capacity(sample_writers.len());
-    let mut pool_builder: PoolBuilder<BufWriter<File>, BgzfCompressor> =
-        PoolBuilder::new(num_compressors, num_writers)
-            .compression_level(u8::try_from(compression_level)?)?;
+    let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new(num_compressors, num_writers)
+        .compression_level(u8::try_from(compression_level)?)?;
     for sample in sample_writers {
         let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
-        let mut template_new_writers = None;
-        let mut sample_barcode_new_writers = None;
-        let mut molecular_barcode_new_writers = None;
+        let mut new_template_writers = None;
+        let mut new_sample_barcode_writers = None;
+        let mut new_molecular_barcode_writers = None;
 
-        for (optional_ws, kind) in
-            vec![(template_writers, 'T'), (barcode_writers, 'B'), (mol_writers, 'M')]
-        {
+        for (optional_ws, target) in vec![
+            (template_writers, &mut new_template_writers),
+            (barcode_writers, &mut new_sample_barcode_writers),
+            (mol_writers, &mut new_molecular_barcode_writers),
+        ] {
             if let Some(ws) = optional_ws {
                 let mut new_writers = Vec::with_capacity(ws.len());
                 for writer in ws {
                     new_writers.push(pool_builder.exchange(writer));
                 }
-                match kind {
-                    'T' => template_new_writers = Some(new_writers),
-                    'B' => sample_barcode_new_writers = Some(new_writers),
-                    'M' => molecular_barcode_new_writers = Some(new_writers),
-                    x => return Err(anyhow!("Unexpected char type writer observed: {}", x)),
-                }
+                _ = target.insert(new_writers);
             }
         }
         new_sample_writers.push(SampleWriters {
             name,
-            template_writers: template_new_writers,
-            sample_barcode_writers: sample_barcode_new_writers,
-            molecular_barcode_writers: molecular_barcode_new_writers,
+            template_writers: new_template_writers,
+            sample_barcode_writers: new_sample_barcode_writers,
+            molecular_barcode_writers: new_molecular_barcode_writers,
         });
     }
     let pool = pool_builder.build()?;
@@ -647,10 +642,10 @@ impl Command for Demux {
             }
             logger.record();
         }
-        info!("Done writing outputs, shutting down pooled writers!");
+        info!("Finished reading input FASTQs.");
         sample_writers.into_iter().map(SampleWriters::close).collect::<Result<Vec<_>>>()?;
         pool.stop_pool()?;
-        info!("Writers and pool shut down successfully.");
+        info!("Output FASTQ writing complete.");
         Ok(())
     }
 }
