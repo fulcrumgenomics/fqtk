@@ -5,6 +5,7 @@ use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use log::info;
+use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::ProgLogBuilder;
 use read_structure::ReadSegment;
 use read_structure::ReadStructure;
@@ -14,7 +15,9 @@ use seq_io::fastq::write_to;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use seq_io::fastq::RecordsIntoIter;
+use std::cmp::min;
 use std::collections::HashSet;
+use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::{
     fs,
@@ -209,16 +212,30 @@ impl ReadSetIterator {
 
 /// Stores the writers for a single sample in demultiplexing. Fields can be None if that type of
 /// ``ReadSegment`` is not being written.
-struct SampleWriters {
+struct SampleWriters<W: Write> {
+    /// Name of the sample this set of writers is for
+    name: String,
     /// Vec of the writers for template read segments.
-    template_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    template_writers: Option<Vec<W>>,
     /// Vec of the writers for the sample barcode read segments.
-    sample_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    sample_barcode_writers: Option<Vec<W>>,
     /// Vec of the writers for the molecular barcode read segments.
-    molecular_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
+    molecular_barcode_writers: Option<Vec<W>>,
 }
 
-impl SampleWriters {
+impl<W: Write> SampleWriters<W> {
+    /// Destroys this struct and decomposes it into its component types. Used when swapping
+    /// writers for pooled writers.
+    #[allow(clippy::type_complexity)]
+    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+        (
+            self.name,
+            self.template_writers,
+            self.sample_barcode_writers,
+            self.molecular_barcode_writers,
+        )
+    }
+
     /// Writes a set of reads (defined as a ``ReadSet``) to the appropriate writers on this
     /// ``Self`` struct.
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
@@ -237,6 +254,75 @@ impl SampleWriters {
         }
         Ok(())
     }
+}
+
+impl SampleWriters<PooledWriter> {
+    /// Attempts to gracefully shutdown the writers in this struct, consuming the struct in the
+    /// process
+    /// # Errors
+    ///     - Will error if closing of the ``PooledWriter``s fails for any reason
+    fn close(self) -> Result<()> {
+        for writers in
+            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers]
+                .into_iter()
+                .flatten()
+        {
+            writers.into_iter().try_for_each(PooledWriter::close)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Constructs a pooled writer from individual sample writers and a number of threads, and converts
+/// the writers to pooled writer objects.
+/// Returns the pooled writers organized into ``SampleWriters`` structs and the pool
+/// struct.
+/// # Errors:
+///     - Should never error but will if there is an internal logic error that results in
+///         zero template read writers being produced during conversion.
+/// # Panics
+///     - Should never panic but will if there is an internal logic issue that results in a None
+///         type being unwrapped when convering writers.
+fn build_pool(
+    sample_writers: Vec<SampleWriters<BufWriter<File>>>,
+    compression_level: usize,
+    threads: usize,
+) -> Result<(Vec<SampleWriters<PooledWriter>>, Pool)> {
+    let num_compressors = min(threads * 2 / 3, threads - 1);
+    let num_writers = threads - num_compressors;
+
+    let mut new_sample_writers = Vec::with_capacity(sample_writers.len());
+    let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new(num_compressors, num_writers)
+        .compression_level(u8::try_from(compression_level)?)?;
+    for sample in sample_writers {
+        let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
+        let mut new_template_writers = None;
+        let mut new_sample_barcode_writers = None;
+        let mut new_molecular_barcode_writers = None;
+
+        for (optional_ws, target) in vec![
+            (template_writers, &mut new_template_writers),
+            (barcode_writers, &mut new_sample_barcode_writers),
+            (mol_writers, &mut new_molecular_barcode_writers),
+        ] {
+            if let Some(ws) = optional_ws {
+                let mut new_writers = Vec::with_capacity(ws.len());
+                for writer in ws {
+                    new_writers.push(pool_builder.exchange(writer));
+                }
+                _ = target.insert(new_writers);
+            }
+        }
+        new_sample_writers.push(SampleWriters {
+            name,
+            template_writers: new_template_writers,
+            sample_barcode_writers: new_sample_barcode_writers,
+            molecular_barcode_writers: new_molecular_barcode_writers,
+        });
+    }
+    let pool = pool_builder.build()?;
+    Ok((new_sample_writers, pool))
 }
 
 /// Performs sample demultiplexing on FASTQs.
@@ -333,6 +419,10 @@ pub(crate) struct Demux {
     /// The number of threads to use. Cannot be less than 3.
     #[clap(long, short = 't', default_value = "3")]
     threads: usize,
+
+    /// The level of compression to use to compress outputs.
+    #[clap(long, short = 'c', default_value = "5")]
+    compression_level: usize,
 }
 
 impl Demux {
@@ -340,13 +430,13 @@ impl Demux {
     /// requested output type.
     /// # Errors:
     ///     - Will error if opening the output fails for any reason.
+    ///     - Will error if no template segments were found in the read structures on this object.
     fn create_sample_writers(
         read_structures: &[ReadStructure],
         prefix: &str,
         output_types: &HashSet<SegmentType>,
         output_dir: &Path,
-    ) -> Result<SampleWriters> {
-        let fg_io = Io::default();
+    ) -> Result<SampleWriters<BufWriter<File>>> {
         let mut template_writers = None;
         let mut sample_barcode_writers = None;
         let mut molecular_barcode_writers = None;
@@ -365,9 +455,9 @@ impl Demux {
                 read_structures.iter().map(|s| s.segments_by_type(*output_type).count()).sum();
 
             for idx in 1..=segment_count {
-                output_type_writers.push(fg_io.new_writer(
+                output_type_writers.push(BufWriter::new(File::create(
                     &output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
-                )?);
+                )?));
             }
 
             match output_type {
@@ -382,7 +472,12 @@ impl Demux {
             }
         }
 
-        Ok(SampleWriters { template_writers, sample_barcode_writers, molecular_barcode_writers })
+        Ok(SampleWriters {
+            name: prefix.to_string(),
+            template_writers,
+            sample_barcode_writers,
+            molecular_barcode_writers,
+        })
     }
 
     /// Creates one writer per sample per read segment in the provided read structures for
@@ -393,17 +488,25 @@ impl Demux {
         read_structures: &[ReadStructure],
         sample_group: &SampleGroup,
         output_types: &HashSet<SegmentType>,
+        unmatched_prefix: &str,
         output_dir: &Path,
-    ) -> Result<Vec<SampleWriters>> {
+    ) -> Result<Vec<SampleWriters<BufWriter<File>>>> {
         let mut samples_writers = Vec::with_capacity(sample_group.samples.len());
         for sample in &sample_group.samples {
-            samples_writers.push(Demux::create_sample_writers(
+            samples_writers.push(Self::create_sample_writers(
                 read_structures,
                 &sample.name,
                 output_types,
                 output_dir,
             )?);
         }
+        // Add the unmatched 'sample'
+        samples_writers.push(Self::create_sample_writers(
+            read_structures,
+            unmatched_prefix,
+            output_types,
+            output_dir,
+        )?);
         Ok(samples_writers)
     }
     /// Checks that inputs to demux are valid and returns open file handles for the inputs.
@@ -500,18 +603,18 @@ impl Command for Demux {
             .map(|fq| FastqReader::new(fq).into_records())
             .collect::<Vec<_>>();
 
-        let mut unassigned_writers = Demux::create_sample_writers(
-            &self.read_structures,
-            &self.unmatched_prefix,
-            &output_segment_types,
-            &self.output,
+        let (mut sample_writers, mut pool) = build_pool(
+            Self::create_writers(
+                &self.read_structures,
+                &sample_group,
+                &output_segment_types,
+                &self.unmatched_prefix,
+                &self.output,
+            )?,
+            self.compression_level,
+            self.threads - 1,
         )?;
-        let mut sample_writers = Demux::create_writers(
-            &self.read_structures,
-            &sample_group,
-            &output_segment_types,
-            &self.output,
-        )?;
+        let unmatched_index = sample_writers.len() - 1;
         info!("Created sample (and unassigned) writers");
 
         let barcode_matcher = BarcodeMatcher::new(
@@ -535,11 +638,14 @@ impl Command for Demux {
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
             } else {
-                unassigned_writers.write(&read_set)?;
+                sample_writers[unmatched_index].write(&read_set)?;
             }
             logger.record();
         }
-
+        info!("Finished reading input FASTQs.");
+        sample_writers.into_iter().map(SampleWriters::close).collect::<Result<Vec<_>>>()?;
+        pool.stop_pool()?;
+        info!("Output FASTQ writing complete.");
         Ok(())
     }
 }
@@ -649,6 +755,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -690,6 +797,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -726,6 +834,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -762,6 +871,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 2,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -795,6 +905,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 2,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -823,6 +934,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -869,6 +981,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -931,6 +1044,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -995,6 +1109,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -1057,6 +1172,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
 
@@ -1129,6 +1245,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1161,6 +1278,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1193,6 +1311,7 @@ mod tests {
             max_mismatches: 1,
             min_mismatch_delta: 2,
             threads: 3,
+            compression_level: 5,
         };
         demux_inputs.execute().unwrap();
     }
