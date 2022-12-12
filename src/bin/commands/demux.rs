@@ -423,6 +423,10 @@ pub(crate) struct Demux {
     /// The level of compression to use to compress outputs.
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
+
+    /// If true, caching of barcodes will be disabled
+    #[clap(long, hide = true)]
+    no_cache: bool,
 }
 
 impl Demux {
@@ -617,10 +621,11 @@ impl Command for Demux {
         let unmatched_index = sample_writers.len() - 1;
         info!("Created sample (and unassigned) writers");
 
-        let barcode_matcher = BarcodeMatcher::new(
+        let mut barcode_matcher = BarcodeMatcher::new(
             &sample_group.samples.iter().map(|s| s.barcode.as_str()).collect::<Vec<_>>(),
             u8::try_from(self.max_mismatches)?,
             u8::try_from(self.min_mismatch_delta)?,
+            !self.no_cache,
         );
 
         let fq_iterator =
@@ -728,6 +733,7 @@ mod tests {
     // Test that ``Demux:: execute`` can succeed.
     // ############################################################################################
     #[test]
+
     fn validate_inputs_can_succeed() {
         let tmp = TempDir::new().unwrap();
         let input_files = vec![
@@ -756,6 +762,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -798,6 +805,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -835,6 +843,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -872,6 +881,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -906,12 +916,15 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
 
-    #[test]
-    fn test_demux_fragment_reads() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_demux_fragment_reads(#[case] no_cache: bool) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![ReadStructure::from_str("17B100T").unwrap()];
         let s1_barcode = "AAAAAAAAGATTACAGA";
@@ -935,6 +948,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache,
         };
         demux_inputs.execute().unwrap();
 
@@ -952,8 +966,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_demux_paired_reads_with_in_line_sample_barcodes() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_demux_paired_reads_with_in_line_sample_barcodes(#[case] no_cache: bool) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("8B100T").unwrap(),
@@ -982,6 +998,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache,
         };
         demux_inputs.execute().unwrap();
 
@@ -1011,8 +1028,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_demux_dual_indexed_paired_end_reads() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_demux_dual_indexed_paired_end_reads(#[case] no_cache: bool) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("8B").unwrap(),
@@ -1045,6 +1064,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache,
         };
         demux_inputs.execute().unwrap();
 
@@ -1076,8 +1096,10 @@ mod tests {
 
     // TODO - expand this test to test molecular barcode once we add that info a la fgbio version
     // of this test.
-    #[test]
-    fn test_demux_a_wierd_set_of_reads() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_demux_a_wierd_set_of_reads(#[case] no_cache: bool) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("4B4M8S").unwrap(),
@@ -1110,6 +1132,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache,
         };
         demux_inputs.execute().unwrap();
 
@@ -1139,8 +1162,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_demux_a_read_structure_with_multiple_templates_in_one_read() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_demux_a_read_structure_with_multiple_templates_in_one_read(#[case] no_cache: bool) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![ReadStructure::from_str("17B20T20S20T20S20T").unwrap()];
         let s1_barcode = "AAAAAAAAGATTACAGA";
@@ -1173,6 +1198,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache,
         };
         demux_inputs.execute().unwrap();
 
@@ -1246,6 +1272,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1279,6 +1306,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1312,6 +1340,7 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_cache: false,
         };
         demux_inputs.execute().unwrap();
     }

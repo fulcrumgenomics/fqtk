@@ -1,4 +1,8 @@
+use ahash::HashMap as AHashMap;
+use ahash::HashMapExt;
 use bstr::{BString, ByteSlice};
+
+const STARTING_CACHE_SIZE: usize = 1_000_000;
 
 /// Checks whether a given u8 byte is a "No-call"-ed base, signified by the bytes 'N', 'n' and '.'
 fn byte_is_nocall(byte: u8) -> bool {
@@ -30,6 +34,10 @@ pub struct BarcodeMatcher {
     /// The minimum difference between number of mismatches in the best and second best barcodes
     /// for a barcode to be considered a match.
     min_mismatch_delta: u8,
+    /// If true will attempt to use the cache when matching.
+    use_cache: bool,
+    /// Caching struct for storing results of previous matches
+    cache: AHashMap<Vec<u8>, BarcodeMatch>,
 }
 
 impl BarcodeMatcher {
@@ -40,7 +48,12 @@ impl BarcodeMatcher {
     /// - Will panic if provided an empty vec of sample barcodes.
     /// - Will panic if any provided barcode is length zero.
     #[must_use]
-    pub fn new(sample_barcodes: &[&str], max_mismatches: u8, min_mismatch_delta: u8) -> Self {
+    pub fn new(
+        sample_barcodes: &[&str],
+        max_mismatches: u8,
+        min_mismatch_delta: u8,
+        use_cache: bool,
+    ) -> Self {
         assert!(!sample_barcodes.is_empty(), "Must provide at least one sample barcode");
         assert!(
             sample_barcodes.iter().all(|b| !b.is_empty()),
@@ -51,7 +64,13 @@ impl BarcodeMatcher {
             .iter()
             .map(|barcode| BString::from(barcode.to_ascii_uppercase()))
             .collect::<Vec<_>>();
-        Self { sample_barcodes: modified_sample_barcodes, max_mismatches, min_mismatch_delta }
+        Self {
+            sample_barcodes: modified_sample_barcodes,
+            max_mismatches,
+            min_mismatch_delta,
+            use_cache,
+            cache: AHashMap::with_capacity(STARTING_CACHE_SIZE),
+        }
     }
 
     /// Counts the number of bases that differ between two byte arrays.
@@ -74,7 +93,7 @@ impl BarcodeMatcher {
 
     /// Assigns the barcode that best matches the provided ``read_bases``.
     #[must_use]
-    pub fn assign(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
+    fn assign_internal(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
@@ -102,33 +121,62 @@ impl BarcodeMatcher {
             })
         }
     }
+
+    /// Assigns the barcode that best matches the provided ``read_bases``, using internal caching
+    /// if configured to do so and skipping calculation for reads that cannot match any barcode (
+    /// due to having too many no-called bases).
+    pub fn assign(&mut self, read_bases: &[u8]) -> Option<BarcodeMatch> {
+        let num_no_calls = read_bases.iter().filter(|&&b| byte_is_nocall(b)).count();
+        if num_no_calls > self.max_mismatches as usize {
+            None
+        } else if self.use_cache {
+            if let Some(cached_match) = self.cache.get(read_bases) {
+                Some(*cached_match)
+            } else {
+                let maybe_match = self.assign_internal(read_bases);
+                if let Some(internal_val) = maybe_match {
+                    self.cache.insert(read_bases.to_vec(), internal_val);
+                };
+                maybe_match
+            }
+        } else {
+            self.assign_internal(read_bases)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // ############################################################################################
     // Test ``BarcodeMatcher`` instantiation panics.
     // ############################################################################################
-    #[test]
-    fn test_barcode_matcher_instantiation_can_succeed() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_barcode_matcher_instantiation_can_succeed(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AGCT"];
-        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1);
+        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1, use_cache);
     }
 
-    #[test]
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
     #[should_panic(expected = "Must provide at least one sample barcode")]
-    fn test_barcode_matcher_fails_if_no_sample_barcodes_provided() {
+    fn test_barcode_matcher_fails_if_no_sample_barcodes_provided(#[case] use_cache: bool) {
         let sample_barcodes: Vec<&str> = vec![];
-        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1);
+        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1, use_cache);
     }
 
-    #[test]
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
     #[should_panic(expected = "Sample barcode cannot be empty string")]
-    fn test_barcode_matcher_fails_if_empty_sample_barcode_provided() {
+    fn test_barcode_matcher_fails_if_empty_sample_barcode_provided(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AGCT", ""];
-        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1);
+        let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1, use_cache);
     }
 
     // ############################################################################################
@@ -197,11 +245,13 @@ mod tests {
     // Test BarcodeMatcher::assign
     // ############################################################################################
     // Some returns
-    #[test]
-    fn test_assign_exact_match() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_assign_exact_match(#[case] use_cache: bool) {
         const EXPECTED_BARCODE_INDEX: usize = 0;
         let sample_barcodes = vec!["ACGT", "AAAG", "CACA"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2, use_cache);
         assert_eq!(
             matcher.assign(sample_barcodes[EXPECTED_BARCODE_INDEX].as_bytes()),
             Some(BarcodeMatch {
@@ -212,10 +262,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_assign_imprecise_match() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_assign_imprecise_match(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAAT", "AGAG", "CACA"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2, use_cache);
         //                          1 different base
         //                          |
         //                          v
@@ -224,10 +276,12 @@ mod tests {
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
-    #[test]
-    fn test_assign_precise_match_with_no_call() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_assign_precise_match_with_no_call(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAAT", "AGAG", "CACA"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2, use_cache);
         //                             1 no-call
         //                             |
         //                             v
@@ -236,10 +290,12 @@ mod tests {
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
-    #[test]
-    fn test_assign_imprecise_match_with_no_call() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_assign_imprecise_match_with_no_call(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAATTT", "AGAGGG", "CACAGG"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 2, 2, use_cache);
         //                             1 no-call
         //                             |
         //                             | 1 different base
@@ -250,10 +306,12 @@ mod tests {
         assert_eq!(matcher.assign(test_barcode), Some(expected));
     }
 
-    #[test]
-    fn test_sample_no_call_doesnt_contribute_to_mismatch_number() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_sample_no_call_doesnt_contribute_to_mismatch_number(#[case] use_cache: bool) {
         let sample_barcodes = vec!["NAGTTT", "AGAGGG", "CACAGG"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 1, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 1, 2, use_cache);
         //                             1 no-call
         //                             |
         //                             | 1 different base
@@ -265,10 +323,12 @@ mod tests {
     }
 
     // None returns
-    #[test]
-    fn test_read_no_call_contributes_to_mismatch_number() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_read_no_call_contributes_to_mismatch_number(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAATTT", "AGAGGG", "CACAGG"];
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 1, 2);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 1, 2, use_cache);
         //                             1 no-call
         //                             |
         //                             | 1 different base
@@ -278,27 +338,33 @@ mod tests {
         assert_eq!(matcher.assign(test_barcode), None);
     }
 
-    #[test]
-    fn test_produce_no_match_if_too_many_mismatches() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_produce_no_match_if_too_many_mismatches(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAGCTAG", "CAGCTAG", "GAGCTAG", "TAGCTAG"];
         let assignment_barcode: &[u8] = b"ATCGATC";
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 0, 100);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 0, 100, use_cache);
         assert_eq!(matcher.assign(assignment_barcode), None);
     }
 
-    #[test]
-    fn test_produce_no_match_if_within_mismatch_delta() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_produce_no_match_if_within_mismatch_delta(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAAAAAAA", "CCCCCCCC", "GGGGGGGG", "GGGGGGTT"];
         let assignment_barcode: &[u8] = sample_barcodes[3].as_bytes();
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 100, 3);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 100, 3, use_cache);
         assert_eq!(matcher.assign(assignment_barcode), None);
     }
 
-    #[test]
-    fn test_produce_no_match_if_too_many_mismatches_via_nocalls() {
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_produce_no_match_if_too_many_mismatches_via_nocalls(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AAAAAAAA", "CCCCCCCC", "GGGGGGGG", "GGGGGGTT"];
         let assignment_barcode: &[u8] = b"GGGGGGTN";
-        let matcher = BarcodeMatcher::new(&sample_barcodes, 0, 100);
+        let mut matcher = BarcodeMatcher::new(&sample_barcodes, 0, 100, use_cache);
         assert_eq!(matcher.assign(assignment_barcode), None);
     }
 }

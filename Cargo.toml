@@ -20,6 +20,7 @@ path = "src/bin/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ahash = "0.8.2"
 anyhow = "1.0.38"
 bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
