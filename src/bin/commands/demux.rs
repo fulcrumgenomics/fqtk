@@ -228,7 +228,7 @@ impl<W: Write> SampleWriters<W> {
     /// Destroys this struct and decomposes it into it's component types. Used when swaping writers
     /// for pooled writers.
     #[allow(clippy::type_complexity)]
-    fn decompose_into_components(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
             self.name,
             self.template_writers,
@@ -286,20 +286,19 @@ impl SampleWriters<PooledWriter> {
 ///     - Should never panic but will iff there is an internal logic issue that results in a None
 ///         type being unwrapped when convering writers.
 fn build_pool(
-    samples: Vec<SampleWriters<BufWriter<File>>>,
+    sample_writers: Vec<SampleWriters<BufWriter<File>>>,
     compression_level: usize,
-    total_pool_threads: usize,
+    threads: usize,
 ) -> Result<(Vec<SampleWriters<PooledWriter>>, Pool)> {
-    let num_compressors = min(total_pool_threads * 2 / 3, total_pool_threads - 1);
-    let num_writers = total_pool_threads - num_compressors;
+    let num_compressors = min(threads * 2 / 3, threads - 1);
+    let num_writers = threads - num_compressors;
 
-    let mut new_sample_writers = Vec::with_capacity(samples.len());
+    let mut new_sample_writers = Vec::with_capacity(sample_writers.len());
     let mut pool_builder: PoolBuilder<BufWriter<File>, BgzfCompressor> =
         PoolBuilder::new(num_compressors, num_writers)
             .compression_level(u8::try_from(compression_level)?)?;
-    for sample in samples {
-        let (name, template_writers, barcode_writers, mol_writers) =
-            sample.decompose_into_components();
+    for sample in sample_writers {
+        let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
         let mut template_new_writers = None;
         let mut sample_barcode_new_writers = None;
         let mut molecular_barcode_new_writers = None;
