@@ -12,10 +12,10 @@ pub struct BarcodeMatch {
     /// this match.
     pub best_match: usize,
     /// The number of mismatches to the best matching barcode for the read described by this match.
-    best_mismatches: u8,
+    pub best_mismatches: u8,
     /// The number of mismatches to the second best matching barcode for the read described by this
     /// match
-    next_best_mismatches: u8,
+    pub next_best_mismatches: u8,
 }
 
 /// The struct responsible for matching barcodes to a ``Vec`` of sample barcodes.

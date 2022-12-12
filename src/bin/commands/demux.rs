@@ -4,7 +4,6 @@ use clap::Parser;
 use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
-use itertools::any;
 use log::info;
 use proglog::ProgLogBuilder;
 use read_structure::ReadStructure;
@@ -15,11 +14,15 @@ use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use seq_io::fastq::RecordsIntoIter;
+use std::collections::HashSet;
 use std::io::{BufWriter, Read, Write};
-use std::time::Instant;
-use std::{fs, io::BufReader, path::PathBuf};
+use std::{
+    fs,
+    io::BufReader,
+    path::{Path, PathBuf},
+};
 
-type ReaderVec = Vec<BufReader<Box<dyn Read>>>;
+type VecOfReaders = Vec<BufReader<Box<dyn Read>>>;
 
 /// The bases and qualities associated with a segment of a FASTQ record.
 #[derive(Debug, Clone)]
@@ -39,70 +42,111 @@ struct ReadSet {
     /// segments)
     sample_barcode_sequence: Vec<u8>,
     /// The template segments for this set of reads.
-    template_segments: Vec<FastqSegment>,
+    template_segments: Option<Vec<FastqSegment>>,
     /// The sample barcode segments ofr this set of reads (if being output, otherwise None).
     sample_barcode_segments: Option<Vec<FastqSegment>>,
     /// The molecular barcode segments of this set of reads (if being ouput, otherwise None).
     molecular_barcode_segments: Option<Vec<FastqSegment>>,
 }
 
-/// A struct for iterating over the records in many FASTQ files simultaneously according to the
-/// provided read structures, yielding ``ReadSet`` objects on each iteration.
-struct FastqIterator {
+/// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
+/// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
+struct ReadSetIterator {
     /// Read structure objects describing the structure of the reads to be demultiplexed, one per
     /// input file.
     read_structures: Vec<ReadStructure>,
+    /// number of template segments per set of FASTQ records
+    num_templates: usize,
+    /// number of molecular barcode segments per set of FASTQ records
+    num_molecular_barcodes: usize,
+    /// number of sample barcode segments per set of FASTQ records
+    num_sample_barcodes: usize,
     /// Iterators over the files containing FASTQ records, one per input file.
     sources: Vec<RecordsIntoIter<BufReader<Box<dyn Read>>>>,
+    /// If true this iterator will populate the template segments field of the ReadSet object it
+    /// returns
+    generate_template_segments: bool,
     /// If true this iterator will populate the sample barcode segments field of the ReadSet
     /// objects it returns
-    generate_sample_barcodes: bool,
+    generate_sample_barcode_segments: bool,
     /// If true this iterator will populate the molecular barcode segments field of the ReadSet
     /// objects it returns
-    generate_molecular_barcodes: bool,
+    generate_molecular_barcode_segments: bool,
 }
-impl Iterator for FastqIterator {
+
+impl Iterator for ReadSetIterator {
     type Item = ReadSet;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let optional_next_sources = self.sources.iter_mut().map(Iterator::next).collect::<Vec<_>>();
-        if any(optional_next_sources.iter(), Option::is_none) {
+        let mut rec_results = Vec::with_capacity(self.sources.len());
+        for source in &mut self.sources {
+            if let Some(rec) = source.next() {
+                rec_results.push(rec);
+            }
+        }
+
+        if rec_results.is_empty() {
             return None;
         }
-        let next_sources = optional_next_sources
+        assert!(
+            rec_results.len() == self.sources.len(),
+            "FASTQ sources out of sync at records: {:?}",
+            rec_results
+        );
+
+        let next_sources = rec_results
             .into_iter()
-            .map(|s| s.expect("Result previously shown to be Some() was None..."))
             .collect::<Result<Vec<OwnedRecord>, seq_io::fastq::Error>>()
             .expect("Unexpected error parsing FASTQs");
 
         let read_name = next_sources[0].head.clone();
 
         let mut sample_barcode = Vec::new();
-        let mut template_segments = Vec::new();
-        let mut sample_barcode_segments =
-            if self.generate_sample_barcodes { Some(Vec::new()) } else { None };
-        let mut molecular_barcode_segments =
-            if self.generate_molecular_barcodes { Some(Vec::new()) } else { None };
+        let mut template_segments = if self.generate_template_segments {
+            Some(Vec::with_capacity(self.num_templates))
+        } else {
+            None
+        };
+        let mut sample_barcode_segments = if self.generate_sample_barcode_segments {
+            Some(Vec::with_capacity(self.num_sample_barcodes))
+        } else {
+            None
+        };
+        let mut molecular_barcode_segments = if self.generate_molecular_barcode_segments {
+            Some(Vec::with_capacity(self.num_molecular_barcodes))
+        } else {
+            None
+        };
 
         for (read_structure, fastq_record) in self.read_structures.iter().zip(next_sources.iter()) {
             for read_segment in read_structure.iter() {
                 let (seq, quals) = read_segment
                     .extract_bases_and_quals(fastq_record.seq(), fastq_record.qual())
-                    .expect("Error extracting read segment bases or quals from FASTQ record");
-                let fastq_segment = FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() };
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Error extracting read segment bases or quals from FASTQ record {}; {}",
+                            String::from_utf8(fastq_record.head().to_vec()).unwrap(),
+                            e
+                        )
+                    });
                 match read_segment.kind {
                     SegmentType::Template => {
-                        template_segments.push(fastq_segment);
+                        if let Some(ref mut templates) = template_segments {
+                            templates
+                                .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
+                        }
                     }
                     SegmentType::SampleBarcode => {
                         if let Some(ref mut sample_segments) = sample_barcode_segments {
-                            sample_segments.push(fastq_segment);
+                            sample_segments
+                                .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
                         }
                         sample_barcode.extend(seq.iter());
                     }
                     SegmentType::MolecularBarcode => {
                         if let Some(ref mut mol_segments) = molecular_barcode_segments {
-                            mol_segments.push(fastq_segment);
+                            mol_segments
+                                .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
                         }
                     }
                     _ => continue,
@@ -120,39 +164,51 @@ impl Iterator for FastqIterator {
     }
 }
 
-struct SingleSampleWriters {
+struct SampleWriters {
     /// Vec of the writers for template read segments.
-    template_writers: Vec<BufWriter<Box<dyn Write>>>,
+    template_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
     /// Vec of the writers for the sample barcode read segments.
     sample_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
     /// Vec of the writers for the molecular barcode read segments.
     molecular_barcode_writers: Option<Vec<BufWriter<Box<dyn Write>>>>,
 }
 
-impl SingleSampleWriters {
-    fn write_read_set(&mut self, read_set: &ReadSet) -> Result<()> {
-        for (writer, segment) in
-            self.template_writers.iter_mut().zip(read_set.template_segments.iter())
-        {
-            write_to(writer, &read_set.name, &segment.seq, &segment.quals)?;
-        }
-        if let Some(ref mut sample_writers) = self.sample_barcode_writers {
-            if let Some(sample_barcode_segments) = &read_set.sample_barcode_segments {
-                for (writer, segment) in
-                    sample_writers.iter_mut().zip(sample_barcode_segments.iter())
-                {
-                    write_to(writer, &read_set.name, &segment.seq, &segment.quals)?;
-                }
-            }
-        }
-        if let Some(ref mut mol_writers) = self.molecular_barcode_writers {
-            if let Some(mol_barcode_segments) = &read_set.molecular_barcode_segments {
-                for (writer, segment) in mol_writers.iter_mut().zip(mol_barcode_segments.iter()) {
+impl SampleWriters {
+    fn write(&mut self, read_set: &ReadSet) -> Result<()> {
+        for (writers_opt, segments_opt) in [
+            (&mut self.template_writers, &read_set.template_segments),
+            (&mut self.sample_barcode_writers, &read_set.sample_barcode_segments),
+            (&mut self.molecular_barcode_writers, &read_set.molecular_barcode_segments),
+        ] {
+            if let (Some(writers), Some(segments)) = (writers_opt, segments_opt) {
+                for (writer, segment) in writers.iter_mut().zip(segments.iter()) {
                     write_to(writer, &read_set.name, &segment.seq, &segment.quals)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn num_template_writers(&self) -> usize {
+        if let Some(v) = &self.template_writers {
+            v.len()
+        } else {
+            0
+        }
+    }
+    fn num_sample_writers(&self) -> usize {
+        if let Some(v) = &self.sample_barcode_writers {
+            v.len()
+        } else {
+            0
+        }
+    }
+    fn num_molecular_writers(&self) -> usize {
+        if let Some(v) = &self.molecular_barcode_writers {
+            v.len()
+        } else {
+            0
+        }
     }
 }
 
@@ -257,19 +313,18 @@ impl Demux {
     /// requested output type.
     /// # Errors:
     ///     - Will error if opening the output fails for any reason.
-    ///     - Will error if no template segments were found in the read structures on this object.
-    fn create_single_sample_writers(
-        &self,
-        prefix: &String,
-        output_types: &[SegmentType],
-    ) -> Result<SingleSampleWriters> {
+    fn create_sample_writers(
+        read_structures: &[ReadStructure],
+        prefix: &str,
+        output_types: &HashSet<SegmentType>,
+        output_dir: &Path,
+    ) -> Result<SampleWriters> {
         let fg_io = Io::default();
-        let mut template_writers = vec![];
+        let mut template_writers = None;
         let mut sample_barcode_writers = None;
         let mut molecular_barcode_writers = None;
         for output_type in output_types {
             let mut output_type_writers = Vec::new();
-            let mut output_counter = 1usize;
 
             let file_type_code = match output_type {
                 SegmentType::Template => 'R',
@@ -278,25 +333,16 @@ impl Demux {
                 _ => 'S',
             };
 
-            for read_structure in &self.read_structures {
-                let output_type_in_structure_count =
-                    read_structure.segments_by_type(*output_type).count();
-                for type_index in output_counter..(output_counter + output_type_in_structure_count)
-                {
-                    output_type_writers.push(
-                        fg_io.new_writer(
-                            &self
-                                .output
-                                .join(
-                                    format!("{}.{}{}.fq.gz", prefix, file_type_code, type_index,),
-                                ),
-                        )?,
-                    );
-                }
-                output_counter += output_type_in_structure_count;
+            let segment_count: usize =
+                read_structures.iter().map(|s| s.segments_by_type(*output_type).count()).sum();
+
+            for idx in 1..=segment_count {
+                output_type_writers.push(fg_io.new_writer(
+                    &output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
+                )?);
             }
             match output_type {
-                SegmentType::Template => template_writers = output_type_writers,
+                SegmentType::Template => template_writers = Some(output_type_writers),
                 SegmentType::SampleBarcode => {
                     sample_barcode_writers = Some(output_type_writers);
                 }
@@ -306,41 +352,38 @@ impl Demux {
                 _ => {}
             }
         }
-        if template_writers.is_empty() {
-            return Err(anyhow!(
-                "No templates found in read structures, must be at least 1 template."
-            ));
-        }
-        Ok(SingleSampleWriters {
-            template_writers,
-            sample_barcode_writers,
-            molecular_barcode_writers,
-        })
+
+        Ok(SampleWriters { template_writers, sample_barcode_writers, molecular_barcode_writers })
     }
 
-    /// Creates one writer per sample per read segment in the provided read structures per
+    /// Creates one writer per sample per read segment in the provided read structures for
     /// requested output type.
     /// # Errors:
     ///     - Will error if opening the output fails for any reason.
     fn create_writers(
-        &self,
+        read_structures: &[ReadStructure],
         sample_group: &SampleGroup,
-        output_types: &[SegmentType],
-    ) -> Result<Vec<SingleSampleWriters>> {
+        output_types: &HashSet<SegmentType>,
+        output_dir: &Path,
+    ) -> Result<Vec<SampleWriters>> {
         let mut samples_writers = Vec::with_capacity(sample_group.samples.len());
         for sample in &sample_group.samples {
-            samples_writers.push(self.create_single_sample_writers(&sample.name, output_types)?);
+            samples_writers.push(Demux::create_sample_writers(
+                read_structures,
+                &sample.name,
+                output_types,
+                output_dir,
+            )?);
         }
         Ok(samples_writers)
     }
-
     /// Checks that inputs to demux are valid and returns open file handles for the inputs.
     /// Checks:
     ///     - That the number of input files and number of read structs provided are the same
     ///     - That the output directory is not read-only
     ///     - That the input files exist
     ///     - That the input files have read permissions.
-    fn validate_and_prepare_inputs(&self) -> Result<(ReaderVec, Vec<SegmentType>)> {
+    fn validate_and_prepare_inputs(&self) -> Result<(VecOfReaders, HashSet<SegmentType>)> {
         let mut constraint_errors = vec![];
 
         if self.inputs.len() != self.read_structures.len() {
@@ -367,7 +410,10 @@ impl Demux {
             .output_types
             .iter()
             .map(|&c| SegmentType::try_from(c))
-            .collect::<Result<Vec<_>, ReadStructureError>>();
+            .collect::<Result<HashSet<_>, ReadStructureError>>();
+        if let Err(e) = &output_segment_types_result {
+            constraint_errors.push(format!("Error parsing segment types to report: {}", e));
+        }
 
         for input in &self.inputs {
             if !input.exists() {
@@ -391,14 +437,21 @@ impl Demux {
         }
 
         if constraint_errors.is_empty() {
-            Ok((fq_readers_result?, output_segment_types_result?))
-        } else {
-            let mut details = "Inputs failed validation!\n".to_owned();
-            for error_reason in constraint_errors {
-                details.push_str(&format!("    - {}\n", error_reason));
+            let output_segment_types = output_segment_types_result?;
+            if output_segment_types.is_empty() {
+                constraint_errors.push(
+                    "No output types requested, must request at least one output segment type."
+                        .to_owned(),
+                );
+            } else {
+                return Ok((fq_readers_result?, output_segment_types));
             }
-            Err(anyhow!("The following errors with the input(s) were detected:\n{}", details))
         }
+        let mut details = "Inputs failed validation!\n".to_owned();
+        for error_reason in constraint_errors {
+            details.push_str(&format!("    - {}\n", error_reason));
+        }
+        Err(anyhow!("The following errors with the input(s) were detected:\n{}", details))
     }
 }
 
@@ -418,9 +471,18 @@ impl Command for Demux {
             .map(|fq| FastqReader::new(fq).into_records())
             .collect::<Vec<_>>();
 
-        let mut unassigned_writers =
-            self.create_single_sample_writers(&self.unmatched_prefix, &output_segment_types)?;
-        let mut sample_writers = self.create_writers(&sample_group, &output_segment_types)?;
+        let mut unassigned_writers = Demux::create_sample_writers(
+            &self.read_structures,
+            &self.unmatched_prefix,
+            &output_segment_types,
+            &self.output,
+        )?;
+        let mut sample_writers = Demux::create_writers(
+            &self.read_structures,
+            &sample_group,
+            &output_segment_types,
+            &self.output,
+        )?;
         info!("Created sample (and unassigned) writers");
 
         let barcode_matcher = BarcodeMatcher::new(
@@ -429,11 +491,16 @@ impl Command for Demux {
             u8::try_from(self.min_mismatch_delta)?,
         );
 
-        let fq_iterator = FastqIterator {
+        let fq_iterator = ReadSetIterator {
             read_structures: self.read_structures.clone(),
             sources: fq_sources,
-            generate_sample_barcodes: output_segment_types.contains(&SegmentType::SampleBarcode),
-            generate_molecular_barcodes: output_segment_types
+            num_templates: unassigned_writers.num_template_writers(),
+            num_sample_barcodes: unassigned_writers.num_sample_writers(),
+            num_molecular_barcodes: unassigned_writers.num_molecular_writers(),
+            generate_template_segments: output_segment_types.contains(&SegmentType::Template),
+            generate_sample_barcode_segments: output_segment_types
+                .contains(&SegmentType::SampleBarcode),
+            generate_molecular_barcode_segments: output_segment_types
                 .contains(&SegmentType::MolecularBarcode),
         };
 
@@ -445,20 +512,13 @@ impl Command for Demux {
             .level(log::Level::Info)
             .build();
 
-        let mut previous_time_stamp = Instant::now();
-        let mut time_delta = 0;
-        for (read_no, read_set) in fq_iterator.enumerate() {
+        for read_set in fq_iterator {
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
-                sample_writers[barcode_match.best_match].write_read_set(&read_set)?;
+                sample_writers[barcode_match.best_match].write(&read_set)?;
             } else {
-                unassigned_writers.write_read_set(&read_set)?;
+                unassigned_writers.write(&read_set)?;
             }
-
-            if read_no % 1_000_000 == 999_999 {
-                time_delta = previous_time_stamp.elapsed().as_millis();
-                previous_time_stamp = Instant::now();
-            }
-            logger.record_with(|| format!("{} ms elapsed in last 1,000,000 reads.", time_delta));
+            logger.record();
         }
 
         Ok(())
@@ -529,15 +589,13 @@ mod tests {
         metadata_file(tmpdir, &[SAMPLE1_BARCODE])
     }
 
-    fn get_reads_from_file(file_path: &PathBuf) -> Vec<OwnedRecord> {
+    fn read_fastq(file_path: &PathBuf) -> Vec<OwnedRecord> {
         let fg_io = Io::default();
 
-        FastqReader::new(
-            fg_io.new_reader(file_path).expect("Error opening expected outfile for reading."),
-        )
-        .into_records()
-        .collect::<Result<Vec<_>, seq_io::fastq::Error>>()
-        .expect("Error parsing records from expected outfile.")
+        FastqReader::new(fg_io.new_reader(file_path).unwrap())
+            .into_records()
+            .collect::<Result<Vec<_>, seq_io::fastq::Error>>()
+            .unwrap()
     }
 
     // ############################################################################################
@@ -545,14 +603,14 @@ mod tests {
     // ############################################################################################
     #[test]
     fn validate_inputs_can_succeed() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
@@ -566,7 +624,7 @@ mod tests {
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -593,21 +651,21 @@ mod tests {
     fn test_different_number_of_read_structs_and_inputs_fails(
         #[case] read_structures: Vec<ReadStructure>,
     ) {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -619,7 +677,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot be read-only")]
     fn test_read_only_output_dir_fails() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
             ReadStructure::from_str("+T").unwrap(),
@@ -628,22 +686,22 @@ mod tests {
         ];
 
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
-        let mut permissions = tmpdir.path().metadata().unwrap().permissions();
+        let sample_metadata = metadata(&tmp);
+        let mut permissions = tmp.path().metadata().unwrap().permissions();
         permissions.set_readonly(true);
-        fs::set_permissions(tmpdir.path(), permissions.clone()).unwrap();
+        fs::set_permissions(tmp.path(), permissions.clone()).unwrap();
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -651,14 +709,14 @@ mod tests {
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
-        fs::set_permissions(tmpdir.path(), permissions).unwrap();
+        fs::set_permissions(tmp.path(), permissions).unwrap();
         demux_result.unwrap();
     }
 
     #[test]
     #[should_panic(expected = "doesn't exist")]
     fn test_inputs_doesnt_exist_fails() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
             ReadStructure::from_str("+T").unwrap(),
@@ -667,19 +725,19 @@ mod tests {
         ];
 
         let input_files = vec![
-            tmpdir.path().join("this_file_does_not_exist.fq"),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            tmp.path().join("this_file_does_not_exist.fq"),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -691,7 +749,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Threads provided 2 was too low!")]
     fn test_too_few_threads_fails() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
             ReadStructure::from_str("+T").unwrap(),
@@ -700,19 +758,19 @@ mod tests {
         ];
 
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let demux_inputs = Demux {
             inputs: input_files,
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -723,21 +781,17 @@ mod tests {
 
     #[test]
     fn test_demux_fragment_reads() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![ReadStructure::from_str("17B100T").unwrap()];
-        let sample1_barcode = "AAAAAAAAGATTACAGA";
+        let s1_barcode = "AAAAAAAAGATTACAGA";
         let sample_metadata = metadata_file(
-            &tmpdir,
-            &[sample1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
+            &tmp,
+            &[s1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
         );
-        let input_files = vec![fastq_file(
-            &tmpdir,
-            "example",
-            "example",
-            &[&(sample1_barcode.to_owned() + &"A".repeat(100))],
-        )];
+        let input_files =
+            vec![fastq_file(&tmp, "ex", "ex", &[&(s1_barcode.to_owned() + &"A".repeat(100))])];
 
-        let output_dir = tmpdir.path().to_path_buf().join("output");
+        let output_dir = tmp.path().to_path_buf().join("output");
 
         let demux_inputs = Demux {
             inputs: input_files,
@@ -753,18 +807,13 @@ mod tests {
         demux_inputs.execute().unwrap();
 
         let expected_output = output_dir.join("Sample0000.R1.fq.gz");
-        let fq_reads = get_reads_from_file(&expected_output);
+        let fq_reads = read_fastq(&expected_output);
 
-        assert_eq!(
-            fq_reads.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads.len()
-        );
+        assert_eq!(fq_reads.len(), 1);
         assert_eq!(
             fq_reads[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
@@ -773,32 +822,22 @@ mod tests {
 
     #[test]
     fn test_demux_paired_reads_with_in_line_sample_barcodes() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("8B100T").unwrap(),
             ReadStructure::from_str("9B100T").unwrap(),
         ];
-        let sample1_barcode = "AAAAAAAAGATTACAGA";
+        let s1_barcode = "AAAAAAAAGATTACAGA";
         let sample_metadata = metadata_file(
-            &tmpdir,
-            &[sample1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
+            &tmp,
+            &[s1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
         );
         let input_files = vec![
-            fastq_file(
-                &tmpdir,
-                "example_R1",
-                "example",
-                &[&(sample1_barcode[..8].to_owned() + &"A".repeat(100))],
-            ),
-            fastq_file(
-                &tmpdir,
-                "example_R2",
-                "example",
-                &[&(sample1_barcode[8..].to_owned() + &"T".repeat(100))],
-            ),
+            fastq_file(&tmp, "ex_R1", "ex", &[&(s1_barcode[..8].to_owned() + &"A".repeat(100))]),
+            fastq_file(&tmp, "ex_R2", "ex", &[&(s1_barcode[8..].to_owned() + &"T".repeat(100))]),
         ];
 
-        let output_dir = tmpdir.path().to_path_buf().join("output");
+        let output_dir = tmp.path().to_path_buf().join("output");
 
         let demux_inputs = Demux {
             inputs: input_files,
@@ -814,35 +853,25 @@ mod tests {
         demux_inputs.execute().unwrap();
 
         let expected_output1 = output_dir.join("Sample0000.R1.fq.gz");
-        let fq_reads1 = get_reads_from_file(&expected_output1);
+        let fq_reads1 = read_fastq(&expected_output1);
 
-        assert_eq!(
-            fq_reads1.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads1.len()
-        );
+        assert_eq!(fq_reads1.len(), 1);
         assert_eq!(
             fq_reads1[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
         );
         let expected_output2 = output_dir.join("Sample0000.R2.fq.gz");
-        let fq_reads2 = get_reads_from_file(&expected_output2);
+        let fq_reads2 = read_fastq(&expected_output2);
 
-        assert_eq!(
-            fq_reads2.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads2.len()
-        );
+        assert_eq!(fq_reads2.len(), 1);
         assert_eq!(
             fq_reads2[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "T".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
@@ -851,26 +880,26 @@ mod tests {
 
     #[test]
     fn test_demux_dual_indexed_paired_end_reads() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("8B").unwrap(),
             ReadStructure::from_str("100T").unwrap(),
             ReadStructure::from_str("100T").unwrap(),
             ReadStructure::from_str("9B").unwrap(),
         ];
-        let sample1_barcode = "AAAAAAAAGATTACAGA";
+        let s1_barcode = "AAAAAAAAGATTACAGA";
         let sample_metadata = metadata_file(
-            &tmpdir,
-            &[sample1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
+            &tmp,
+            &[s1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
         );
         let input_files = vec![
-            fastq_file(&tmpdir, "example_I1", "example", &[&sample1_barcode[..8]]),
-            fastq_file(&tmpdir, "example_R1", "example", &[&"A".repeat(100)]),
-            fastq_file(&tmpdir, "example_R2", "example", &[&"T".repeat(100)]),
-            fastq_file(&tmpdir, "example_I2", "example", &[&sample1_barcode[8..]]),
+            fastq_file(&tmp, "ex_I1", "ex", &[&s1_barcode[..8]]),
+            fastq_file(&tmp, "ex_R1", "ex", &[&"A".repeat(100)]),
+            fastq_file(&tmp, "ex_R2", "ex", &[&"T".repeat(100)]),
+            fastq_file(&tmp, "ex_I2", "ex", &[&s1_barcode[8..]]),
         ];
 
-        let output_dir = tmpdir.path().to_path_buf().join("output");
+        let output_dir = tmp.path().to_path_buf().join("output");
 
         let demux_inputs = Demux {
             inputs: input_files,
@@ -886,35 +915,25 @@ mod tests {
         demux_inputs.execute().unwrap();
 
         let expected_output1 = output_dir.join("Sample0000.R1.fq.gz");
-        let fq_reads1 = get_reads_from_file(&expected_output1);
+        let fq_reads1 = read_fastq(&expected_output1);
 
-        assert_eq!(
-            fq_reads1.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads1.len()
-        );
+        assert_eq!(fq_reads1.len(), 1);
         assert_eq!(
             fq_reads1[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
         );
         let expected_output2 = output_dir.join("Sample0000.R2.fq.gz");
-        let fq_reads2 = get_reads_from_file(&expected_output2);
+        let fq_reads2 = read_fastq(&expected_output2);
 
-        assert_eq!(
-            fq_reads2.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads2.len()
-        );
+        assert_eq!(fq_reads2.len(), 1);
         assert_eq!(
             fq_reads2[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "T".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
@@ -925,7 +944,7 @@ mod tests {
     // of this test.
     #[test]
     fn test_demux_a_wierd_set_of_reads() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("4B4M8S").unwrap(),
             ReadStructure::from_str("4B100T").unwrap(),
@@ -934,17 +953,17 @@ mod tests {
         ];
         let sample1_barcode = "AAAAAAAAGATTACAGA";
         let sample_metadata = metadata_file(
-            &tmpdir,
+            &tmp,
             &[sample1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
         );
         let input_files = vec![
-            fastq_file(&tmpdir, "example_1", "example", &["AAAACCCCGGGGTTTT"]),
-            fastq_file(&tmpdir, "example_2", "example", &[&"A".repeat(104)]),
-            fastq_file(&tmpdir, "example_3", "example", &[&("T".repeat(100) + "GAT")]),
-            fastq_file(&tmpdir, "example_4", "example", &["TACAGAAAT"]),
+            fastq_file(&tmp, "example_1", "ex", &["AAAACCCCGGGGTTTT"]),
+            fastq_file(&tmp, "example_2", "ex", &[&"A".repeat(104)]),
+            fastq_file(&tmp, "example_3", "ex", &[&("T".repeat(100) + "GAT")]),
+            fastq_file(&tmp, "example_4", "ex", &["TACAGAAAT"]),
         ];
 
-        let output_dir = tmpdir.path().to_path_buf().join("output");
+        let output_dir = tmp.path().to_path_buf().join("output");
 
         let demux_inputs = Demux {
             inputs: input_files,
@@ -960,35 +979,25 @@ mod tests {
         demux_inputs.execute().unwrap();
 
         let expected_output1 = output_dir.join("Sample0000.R1.fq.gz");
-        let fq_reads1 = get_reads_from_file(&expected_output1);
+        let fq_reads1 = read_fastq(&expected_output1);
 
-        assert_eq!(
-            fq_reads1.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads1.len()
-        );
+        assert_eq!(fq_reads1.len(), 1);
         assert_eq!(
             fq_reads1[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             }
         );
         let expected_output2 = output_dir.join("Sample0000.R2.fq.gz");
-        let fq_reads2 = get_reads_from_file(&expected_output2);
+        let fq_reads2 = read_fastq(&expected_output2);
 
-        assert_eq!(
-            fq_reads2.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads2.len()
-        );
+        assert_eq!(fq_reads2.len(), 1);
         assert_eq!(
             fq_reads2[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "T".as_bytes().to_vec(),
                 qual: ";".as_bytes().to_vec(),
             }
@@ -997,18 +1006,18 @@ mod tests {
 
     #[test]
     fn test_demux_a_read_structure_with_multiple_templates_in_one_read() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let read_structures = vec![ReadStructure::from_str("17B20T20S20T20S20T").unwrap()];
-        let sample1_barcode = "AAAAAAAAGATTACAGA";
+        let s1_barcode = "AAAAAAAAGATTACAGA";
         let sample_metadata = metadata_file(
-            &tmpdir,
-            &[sample1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
+            &tmp,
+            &[s1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
         );
         let input_files = vec![fastq_file(
-            &tmpdir,
-            "example",
-            "example",
-            &[&(sample1_barcode.to_owned()
+            &tmp,
+            "ex",
+            "ex",
+            &[&(s1_barcode.to_owned()
                 + &"A".repeat(20)
                 + &"C".repeat(20)
                 + &"T".repeat(20)
@@ -1016,7 +1025,7 @@ mod tests {
                 + &"G".repeat(20))],
         )];
 
-        let output_dir = tmpdir.path().to_path_buf().join("output");
+        let output_dir = tmp.path().to_path_buf().join("output");
 
         let demux_inputs = Demux {
             inputs: input_files,
@@ -1032,52 +1041,37 @@ mod tests {
         demux_inputs.execute().unwrap();
 
         let expected_output1 = output_dir.join("Sample0000.R1.fq.gz");
-        let fq_reads1 = get_reads_from_file(&expected_output1);
+        let fq_reads1 = read_fastq(&expected_output1);
 
-        assert_eq!(
-            fq_reads1.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads1.len()
-        );
+        assert_eq!(fq_reads1.len(), 1);
         assert_eq!(
             fq_reads1[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "A".repeat(20).as_bytes().to_vec(),
                 qual: ";".repeat(20).as_bytes().to_vec(),
             }
         );
         let expected_output2 = output_dir.join("Sample0000.R2.fq.gz");
-        let fq_reads2 = get_reads_from_file(&expected_output2);
+        let fq_reads2 = read_fastq(&expected_output2);
 
-        assert_eq!(
-            fq_reads2.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads2.len()
-        );
+        assert_eq!(fq_reads2.len(), 1);
         assert_eq!(
             fq_reads2[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "T".repeat(20).as_bytes().to_vec(),
                 qual: ";".repeat(20).as_bytes().to_vec(),
             }
         );
         let expected_output2 = output_dir.join("Sample0000.R3.fq.gz");
-        let fq_reads2 = get_reads_from_file(&expected_output2);
+        let fq_reads2 = read_fastq(&expected_output2);
 
-        assert_eq!(
-            fq_reads2.len(),
-            1,
-            "Number of FASTQ records {} did not match expectation (1).",
-            fq_reads2.len()
-        );
+        assert_eq!(fq_reads2.len(), 1);
         assert_eq!(
             fq_reads2[0],
             OwnedRecord {
-                head: b"example_0".to_vec(),
+                head: b"ex_0".to_vec(),
                 seq: "G".repeat(20).as_bytes().to_vec(),
                 qual: ";".repeat(20).as_bytes().to_vec(),
             }
@@ -1086,17 +1080,17 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "No templates found in read structures, must be at least 1 template."
+        expected = "No output types requested, must request at least one output segment type."
     )]
     fn test_fails_if_zero_read_structures_have_template_bases() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let read_structures = vec![
             ReadStructure::from_str("+M").unwrap(),
@@ -1109,8 +1103,8 @@ mod tests {
             inputs: input_files,
             read_structures,
             sample_metadata,
-            output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output_types: vec![],
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -1122,13 +1116,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "The same number of read structures should be given as FASTQs")]
     fn test_fails_if_not_enough_fastq_records_are_passed() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
@@ -1142,7 +1136,7 @@ mod tests {
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
@@ -1154,14 +1148,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "The same number of read structures should be given as FASTQs")]
     fn test_fails_if_too_many_fastq_records_are_passed() {
-        let tmpdir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let input_files = vec![
-            fastq_file(&tmpdir, "read1", "read1", &["GATTACA"]),
-            fastq_file(&tmpdir, "index1", "index1", &[&SAMPLE1_BARCODE[0..3]]),
-            fastq_file(&tmpdir, "index2", "index2", &[&SAMPLE1_BARCODE[3..]]),
-            fastq_file(&tmpdir, "read2", "read2", &["TAGGATTA"]),
+            fastq_file(&tmp, "read1", "ex", &["GATTACA"]),
+            fastq_file(&tmp, "index1", "ex", &[&SAMPLE1_BARCODE[0..3]]),
+            fastq_file(&tmp, "index2", "ex", &[&SAMPLE1_BARCODE[3..]]),
+            fastq_file(&tmp, "read2", "ex", &["TAGGATTA"]),
         ];
-        let sample_metadata = metadata(&tmpdir);
+        let sample_metadata = metadata(&tmp);
 
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
@@ -1174,7 +1168,7 @@ mod tests {
             read_structures,
             sample_metadata,
             output_types: vec!['T'],
-            output: tmpdir.path().to_path_buf(),
+            output: tmp.path().to_path_buf(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
