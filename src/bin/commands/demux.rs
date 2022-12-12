@@ -625,8 +625,7 @@ impl Command for Demux {
             &sample_group.samples.iter().map(|s| s.barcode.as_str()).collect::<Vec<_>>(),
             u8::try_from(self.max_mismatches)?,
             u8::try_from(self.min_mismatch_delta)?,
-            self.no_cache,
-            1_000_000,
+            !self.no_cache,
         );
 
         let fq_iterator =
