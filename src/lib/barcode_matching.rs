@@ -22,7 +22,7 @@ pub struct BarcodeMatch {
 
 /// The struct responsible for matching barcodes to a ``Vec`` of sample barcodes.
 #[derive(Clone, Debug)]
-pub struct BarcodeMatcher<K, V> {
+pub struct BarcodeMatcher {
     /// Vec of the barcodes for each sample
     /// Note - this is to be replaced by a sample struct in task 3. For now we're keeping things
     /// very simple.
@@ -35,10 +35,10 @@ pub struct BarcodeMatcher<K, V> {
     /// If true will not attempt to use the cache when matching, otherwise will use the cache.
     no_cache: bool,
     /// Caching struct for storing results of previous matches
-    cache: AHashMap<K, V>,
+    cache: AHashMap<Vec<u8>, BarcodeMatch>,
 }
 
-impl BarcodeMatcher<Vec<u8>, BarcodeMatch> {
+impl BarcodeMatcher {
     /// Instantiates a new ``BarcodeMatcher`` struct. Checks that the sample barcodes vector is not
     /// empty and that none of the barcodes provided are the empty string.
     ///
@@ -92,7 +92,7 @@ impl BarcodeMatcher<Vec<u8>, BarcodeMatch> {
 
     /// Assigns the barcode that best matches the provided ``read_bases``.
     #[must_use]
-    pub fn assign_internal(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
+    fn assign_internal(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
@@ -130,14 +130,14 @@ impl BarcodeMatcher<Vec<u8>, BarcodeMatch> {
             None
         } else if self.no_cache {
             self.assign_internal(read_bases)
-        } else if let Some(return_val) = self.cache.get(read_bases) {
-            Some(*return_val)
+        } else if let Some(cached_match) = self.cache.get(read_bases) {
+            Some(*cached_match)
         } else {
-            let return_val = self.assign_internal(read_bases);
-            if let Some(internal_val) = return_val {
+            let maybe_match = self.assign_internal(read_bases);
+            if let Some(internal_val) = maybe_match {
                 self.cache.insert(read_bases.to_vec(), internal_val);
             };
-            return_val
+            maybe_match
         }
     }
 }
