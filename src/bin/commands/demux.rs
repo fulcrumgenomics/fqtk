@@ -4,6 +4,8 @@ use clap::Parser;
 use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
+use gzp::BUFSIZE;
+use itertools::Itertools;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::ProgLogBuilder;
@@ -25,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-type VecOfReaders = Vec<BufReader<Box<dyn Read>>>;
+type VecOfReaders = Vec<Box<dyn Read>>;
 
 /// The bases and qualities associated with a segment of a FASTQ record.
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ struct ReadSet {
 
 /// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
 /// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
+#[allow(clippy::type_complexity)]
 struct ReadSetIterator {
     /// Read structure objects describing the structure of the reads to be demultiplexed, one per
     /// input file.
@@ -67,7 +70,7 @@ struct ReadSetIterator {
     /// number of sample barcode segments per set of FASTQ records
     num_sample_barcodes: usize,
     /// Iterators over the files containing FASTQ records, one per input file.
-    sources: Vec<RecordsIntoIter<BufReader<Box<dyn Read>>>>,
+    sources: Vec<RecordsIntoIter<Box<dyn Read>>>,
     /// If true this iterator will populate the template segments field of the ReadSet object it
     /// returns
     generate_template_segments: bool,
@@ -168,9 +171,10 @@ impl Iterator for ReadSetIterator {
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
     /// structures
+    #[allow(clippy::type_complexity)]
     pub fn new(
         read_structures: Vec<ReadStructure>,
-        fq_sources: Vec<RecordsIntoIter<BufReader<Box<dyn Read>>>>,
+        fq_sources: Vec<RecordsIntoIter<Box<dyn Read>>>,
         output_segment_types: &HashSet<SegmentType>,
     ) -> Self {
         let sample_barcode_length: usize = read_structures
@@ -556,12 +560,13 @@ impl Demux {
                 constraint_errors.push(format!("Provided input file {:#?} doesn't exist", input));
             }
         }
-        // Attempt to open the files for reading.
         let io = Io::default();
+        // Attempt to open the files for reading.
         let fq_readers_result = self
             .inputs
             .iter()
-            .map(|p| io.new_reader(p))
+            .map(|p| io.new_reader(&p))
+            .map_ok(BufReader::into_inner)
             .collect::<Result<Vec<_>, fgoxide::FgError>>();
         if let Err(e) = &fq_readers_result {
             constraint_errors.push(format!("Error opening input files for reading: {}", e));
@@ -604,7 +609,7 @@ impl Command for Demux {
         );
         let fq_sources = fq_readers
             .into_iter()
-            .map(|fq| FastqReader::new(fq).into_records())
+            .map(|fq| FastqReader::with_capacity(fq, BUFSIZE).into_records())
             .collect::<Vec<_>>();
 
         let (mut sample_writers, mut pool) = build_pool(
@@ -658,6 +663,7 @@ impl Command for Demux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgoxide::io::Io;
     use fqtk_lib::samples::Sample;
     use rstest::rstest;
     use seq_io::fastq::OwnedRecord;
