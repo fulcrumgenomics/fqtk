@@ -4,8 +4,9 @@
 use crate::commands::command::Command;
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use fgoxide::io::Io;
+use fgoxide::io::{DelimFile, Io};
 use fqtk_lib::barcode_matching::BarcodeMatcher;
+use fqtk_lib::samples::Sample;
 use fqtk_lib::samples::SampleGroup;
 use gzp::BUFSIZE;
 use log::info;
@@ -17,6 +18,7 @@ use read_structure::ReadStructureError;
 use read_structure::SegmentType;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -58,6 +60,41 @@ fn write_fastq_record_to_writer<W: Write>(
     writer.write_all(b"\n+\n")?;
     writer.write_all(quals)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DemuxMetrics {
+    sample_name: String,
+    sample_barcode: String,
+    number_reads: usize,
+}
+
+impl DemuxMetrics {
+    pub fn get_metrics(
+        number_reads: &[usize],
+        samples: &[Sample],
+        unmatched_name: String,
+    ) -> Vec<Self> {
+        let mut result = Vec::with_capacity(number_reads.len());
+        assert_eq!(
+            number_reads.len(),
+            samples.len() + 1,
+            "Number of samples with metrics being tracked differed from expected!"
+        );
+        for (sample, &number_sample_reads) in samples.iter().zip(number_reads.iter()) {
+            result.push(Self {
+                sample_name: sample.name.clone(),
+                sample_barcode: sample.barcode.clone(),
+                number_reads: number_sample_reads,
+            });
+        }
+        result.push(Self {
+            sample_name: unmatched_name,
+            sample_barcode: "N/A".to_string(),
+            number_reads: number_reads[number_reads.len() - 1],
+        });
+        result
+    }
 }
 
 /// The bases and qualities associated with a segment of a FASTQ record.
@@ -686,6 +723,15 @@ pub(crate) struct Demux {
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
 
+    /// The filename and extension to use for the generated metrics file (will be placed in
+    /// ``output`` directory)
+    #[clap(long, default_value = "fqtk-demux-metrics.tsv")]
+    metrics_filename: String,
+
+    /// If true, will not output metrics file
+    #[clap(long)]
+    no_metrics: bool,
+
     /// If true, caching of barcodes will be disabled
     #[clap(long, hide = true)]
     no_cache: bool,
@@ -916,7 +962,7 @@ impl Command for Demux {
             .unit(1_000_000)
             .level(log::Level::Info)
             .build();
-
+        let mut number_reads: Vec<usize> = vec![0; sample_writers.len()];
         for read_set in fq_iterator {
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
                 sample_writers[barcode_match.best_match].write(
@@ -924,12 +970,14 @@ impl Command for Demux {
                     !self.no_molecular_barcode_in_header,
                     !self.no_sample_barcode_in_header,
                 )?;
+                number_reads[barcode_match.best_match] += 1;
             } else {
                 sample_writers[unmatched_index].write(
                     &read_set,
                     !self.no_molecular_barcode_in_header,
                     !self.no_sample_barcode_in_header,
                 )?;
+                number_reads[unmatched_index] += 1;
             }
             logger.record();
         }
@@ -937,6 +985,18 @@ impl Command for Demux {
         sample_writers.into_iter().map(SampleWriters::close).collect::<Result<Vec<_>>>()?;
         pool.stop_pool()?;
         info!("Output FASTQ writing complete.");
+        if !self.no_metrics {
+            let delim_file = DelimFile::default();
+            let metrics_output = self.output.join(&self.metrics_filename);
+            delim_file.write_tsv(
+                &metrics_output,
+                DemuxMetrics::get_metrics(
+                    &number_reads,
+                    &sample_group.samples,
+                    self.unmatched_prefix.clone(),
+                ),
+            )?;
+        }
         Ok(())
     }
 }
@@ -1053,6 +1113,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1098,6 +1160,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1138,6 +1202,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1178,6 +1244,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1215,6 +1283,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1249,6 +1319,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1301,6 +1373,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1369,6 +1443,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1441,6 +1517,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1511,6 +1589,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1589,6 +1669,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1625,6 +1707,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1661,6 +1745,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_cache: false,
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
@@ -1757,6 +1843,8 @@ mod tests {
             threads: 3,
             compression_level: 5,
             no_cache: false,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: false,
         };
@@ -1788,6 +1876,8 @@ mod tests {
             threads: 3,
             compression_level: 5,
             no_cache: false,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_molecular_barcode_in_header: false,
             no_sample_barcode_in_header: true,
         };
@@ -1820,6 +1910,8 @@ mod tests {
             threads: 3,
             compression_level: 5,
             no_cache: false,
+            no_metrics: true,
+            metrics_filename: "fqtk-demux-metrics.tsv".to_string(),
             no_molecular_barcode_in_header: true,
             no_sample_barcode_in_header: false,
         };
