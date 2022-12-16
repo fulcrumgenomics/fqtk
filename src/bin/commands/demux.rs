@@ -15,6 +15,7 @@ use read_structure::SegmentType;
 use seq_io::fastq::write_to;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
+use seq_io::fastq::RefRecord;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -52,7 +53,7 @@ struct ReadSet {
 
 /// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
 /// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
-struct ReadSetIterator {
+struct ReadSetIterator<'a> {
     /// Read structure objects describing the structure of the reads to be demultiplexed, one per
     /// input file.
     read_structures: Vec<ReadStructure>,
@@ -75,14 +76,19 @@ struct ReadSetIterator {
     /// If true this iterator will populate the molecular barcode segments field of the ReadSet
     /// objects it returns
     generate_molecular_barcode_segments: bool,
+    /// Next FASTQ records (Used to be )
+    next_fq_recs: Vec<RefRecord<'a>>,
 }
 
-impl Iterator for ReadSetIterator {
+impl<'a> Iterator for ReadSetIterator<'a> {
     type Item = ReadSet;
 
     fn next(&mut self) -> Option<Self::Item> {
         let source_len = self.sources.len();
-        let mut next_fq_recs = Vec::with_capacity(source_len);
+
+        let next_fq_recs: &mut Vec<RefRecord> =
+            unsafe { std::mem::transmute(&mut self.next_fq_recs) };
+
         for source in &mut self.sources {
             if let Some(rec) = source.next() {
                 next_fq_recs.push(rec.expect("Unexpected error parsing FASTQs"));
@@ -154,6 +160,8 @@ impl Iterator for ReadSetIterator {
             }
         }
 
+        next_fq_recs.clear();
+
         Some(ReadSet {
             name: read_name,
             sample_barcode_sequence: sample_barcode,
@@ -164,7 +172,7 @@ impl Iterator for ReadSetIterator {
     }
 }
 
-impl ReadSetIterator {
+impl<'a> ReadSetIterator<'a> {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
     /// structures
     pub fn new(
@@ -193,6 +201,8 @@ impl ReadSetIterator {
             .map(|rs| rs.segments_by_type(SegmentType::SampleBarcode).count())
             .sum();
 
+        let next_fq_recs = Vec::with_capacity(fq_sources.len());
+
         Self {
             read_structures,
             sources: fq_sources,
@@ -205,6 +215,7 @@ impl ReadSetIterator {
                 .contains(&SegmentType::SampleBarcode),
             generate_molecular_barcode_segments: output_segment_types
                 .contains(&SegmentType::MolecularBarcode),
+            next_fq_recs,
         }
     }
 }
