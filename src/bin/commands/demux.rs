@@ -289,7 +289,7 @@ fn build_pool(
     threads: usize,
 ) -> Result<(Vec<SampleWriters<PooledWriter>>, Pool)> {
     let mut new_sample_writers = Vec::with_capacity(sample_writers.len());
-    let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new(threads * 2, threads)
+    let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new(threads * 50, threads)
         .compression_level(u8::try_from(compression_level)?)?;
     for sample in sample_writers {
         let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();

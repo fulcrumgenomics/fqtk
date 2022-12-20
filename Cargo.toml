@@ -9,6 +9,10 @@ publish = false
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [lib]
 name = "fqtk_lib"
 path = "src/lib/mod.rs"
@@ -30,6 +34,7 @@ fgoxide = "0.1.4"
 gzp = "*"
 itertools = "0.10.5"
 log = "0.4.17"
+mimalloc = { version = "0.1.32", default-features = false }
 pooled-writer={ git = "https://github.com/fulcrumgenomics/pooled-writer", rev = "181179ad5f060b2ac6c543f372665c0c6a7d24e1"}
 read-structure = "0.1.0"
 rstest="0.15.0"

@@ -7,6 +7,9 @@ use commands::demux::Demux;
 use enum_dispatch::enum_dispatch;
 use env_logger::Env;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(subcommand)]
