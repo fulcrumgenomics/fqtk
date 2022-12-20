@@ -7,7 +7,7 @@ use fqtk_lib::samples::SampleGroup;
 use gzp::BUFSIZE;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
-use proglog::ProgLogBuilder;
+use proglog::{CountFormatterKind, ProgLogBuilder};
 use read_structure::ReadSegment;
 use read_structure::ReadStructure;
 use read_structure::ReadStructureError;
@@ -635,6 +635,7 @@ impl Command for Demux {
             .noun("records")
             .verb("demultiplexed")
             .unit(1_000_000)
+            .count_formatter(CountFormatterKind::Comma)
             .level(log::Level::Info)
             .build();
 

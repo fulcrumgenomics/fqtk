@@ -42,7 +42,7 @@ serde = { version = "1.0.147", features = ["derive"] }
 serde-aux="4.1.2"
 seq_io="0.3.1"
 thiserror = "1.0.37"
-proglog = "0.3.0"
+proglog = {version = "0.3.0", features = ["pretty_counts"] }
 
 [dev-dependencies]
 csv = "1.1.6"
