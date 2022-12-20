@@ -2,9 +2,10 @@ use crate::commands::command::Command;
 use anyhow::{anyhow, ensure, Result};
 use bstr::ByteSlice;
 use clap::Parser;
-use fgoxide::io::Io;
+use fgoxide::io::{DelimFile, Io};
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
+use itertools::Itertools;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::{CountFormatterKind, ProgLogBuilder};
@@ -14,6 +15,7 @@ use read_structure::ReadStructureError;
 use read_structure::SegmentType;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
@@ -389,6 +391,68 @@ impl SampleWriters<PooledWriter> {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// DemuxMetric and it's impls
+////////////////////////////////////////////////////////////////////////////////
+
+/// A set of metrics for a single sample from demultiplexing.  "Template" in this context
+/// refers to the set of reads that share a read name - i.e. a set of one read each from all
+/// of the input FASTQ files.
+///
+/// The `ratio_*` fields are calculated using the mean and max template counts across all samples
+/// *excluding* the unmatched pseudo-sample.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DemuxMetric {
+    /// The ID of the sample being reported on.
+    sample_id: String,
+    /// The expected barcode sequence associated with the sample.
+    barcode: String,
+    /// The number of templates (querynames, inserts) assigned to the sample.
+    templates: usize,
+    /// The fraction of all templates in the input that were assigned to the sample.
+    frac_templates: f64,
+    /// The ratio of this sample's `templates` to the mean across all samples.
+    ratio_to_mean: f64,
+    /// The ratio of this sample's `templates` to the best (max) across all samples.
+    ratio_to_best: f64,
+}
+
+impl DemuxMetric {
+    /// Create a new DemuxMetric with the given sample id and barcode.
+    fn new(sample: &str, barcode: &str) -> DemuxMetric {
+        DemuxMetric {
+            sample_id: sample.to_string(),
+            barcode: barcode.to_string(),
+            templates: 0,
+            frac_templates: 0.0,
+            ratio_to_mean: 0.0,
+            ratio_to_best: 0.0,
+        }
+    }
+
+    /// Update all the derived fields in all the provided metrics objects.
+    fn update(samples: &mut [DemuxMetric], unmatched: &mut DemuxMetric) {
+        let sample_total: f64 = samples.iter().map(|s| s.templates as f64).sum();
+        let total = sample_total + unmatched.templates as f64;
+        let mean = sample_total / samples.len() as f64;
+        let best = samples.iter().map(|s| s.templates).max().unwrap_or(0) as f64;
+
+        for sample in samples {
+            sample.frac_templates = sample.templates as f64 / total;
+            sample.ratio_to_mean = sample.templates as f64 / mean;
+            sample.ratio_to_best = sample.templates as f64 / best;
+        }
+
+        unmatched.frac_templates = unmatched.templates as f64 / total;
+        unmatched.ratio_to_mean = unmatched.templates as f64 / mean;
+        unmatched.ratio_to_best = unmatched.templates as f64 / best;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Demux (main class) and it's impls
+////////////////////////////////////////////////////////////////////////////////
+
 /// Performs sample demultiplexing on FASTQs.
 ///
 /// The sample barcode for each sample in the metadata TSV will be compared against the sample
@@ -424,21 +488,40 @@ impl SampleWriters<PooledWriter> {
 /// tag.
 ///
 /// Metadata about the samples should be given as a headered metadata TSV file with two columns
-/// 1. name - the name of the sample.
-/// 2. barcode - the expected barcode sequence for that sample.
+/// 1. sample_id - the id of the sample or library.
+/// 2. barcode - the expected barcode sequence associated with the sample_id.
 ///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
 /// sample barcodes extracted from the bases in the sample metadata and associated read structures.
+///
+/// ## Outputs
+///
+/// All outputs are generated in the provided `--output` directory.  For each sample plus the
+/// unmatched reads, FASTQ files are written for each read segment (specified in the read
+/// structures) of one of the types supplied to `--output-types`.  FASTQ files have names
+/// of the format:
+///
+/// ```
+/// {sample_id}.{segment_type}{read_num}.fq.gz
+/// ```
+///
+/// where `segment_type` is one of `R`, `I`, and `U` (for template, barcode/index and molecular
+/// barcode/UMI reads respectively) and `read_num` is a number starting at 1 for each segment
+/// type.
+///
+/// In addition a `demux-metrics.txt` file is written that is a tab-delimited file with counts
+/// of how many reads were assigned to each sample and derived metrics.
+///
 /// ## Example Command Line
 ///
 /// As an example, if the sequencing run was 2x100bp (paired end) with two 8bp index reads both
 /// reading a sample barcode, as well as an in-line 8bp sample barcode in read one, the command
-/// line would be
+/// line would be:
 ///
 /// ```
 /// fqtk demux \
-///     --inputs r1.fq i1.fq i2.fq r2.fq \
+///     --inputs r1.fq.gz i1.fq.gz i2.fq.gz r2.fq.gz \
 ///     --read-structures 8B92T 8B 8B 100T \
 ///     --sample-metadata metadata.tsv \
 ///     --output output_folder
@@ -563,7 +646,7 @@ impl Demux {
         for sample in &sample_group.samples {
             samples_writers.push(Self::create_sample_writers(
                 read_structures,
-                &sample.name,
+                &sample.sample_id,
                 output_types,
                 output_dir,
             )?);
@@ -720,6 +803,7 @@ impl Command for Demux {
             .map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE))
             .collect::<Vec<_>>();
 
+        // Create the writers as a Vec that is index sync'd with the sample_group
         let (mut sample_writers, mut pool) = Self::build_writer_pool(
             Self::create_writers(
                 &self.read_structures,
@@ -732,8 +816,17 @@ impl Command for Demux {
             self.threads - 1,
         )?;
         let unmatched_index = sample_writers.len() - 1;
-        info!("Created sample (and unassigned) writers");
+        info!("Created sample and {} writers.", self.unmatched_prefix);
 
+        // Create the metrics as a Vec that is index sync'd with the sample group
+        let mut sample_metrics = sample_group
+            .samples
+            .iter()
+            .map(|s| DemuxMetric::new(s.sample_id.as_str(), s.barcode.as_str()))
+            .collect_vec();
+        let mut unmatched_metric = DemuxMetric::new(self.unmatched_prefix.as_str(), ".");
+
+        // Setup the barcode matcher - the primary return from here is the index of the samp
         let mut barcode_matcher = BarcodeMatcher::new(
             &sample_group.samples.iter().map(|s| s.barcode.as_str()).collect::<Vec<_>>(),
             u8::try_from(self.max_mismatches)?,
@@ -755,15 +848,26 @@ impl Command for Demux {
         for read_set in fq_iterator {
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
+                sample_metrics[barcode_match.best_match].templates += 1;
             } else {
                 sample_writers[unmatched_index].write(&read_set)?;
+                unmatched_metric.templates += 1;
             }
             logger.record();
         }
+
+        // Shut down the pool
         info!("Finished reading input FASTQs.");
         sample_writers.into_iter().map(SampleWriters::close).collect::<Result<Vec<_>>>()?;
         pool.stop_pool()?;
         info!("Output FASTQ writing complete.");
+
+        // Write out the metrics
+        let metrics_path = self.output.join("demux-metrics.txt");
+        DemuxMetric::update(sample_metrics.as_mut_slice(), &mut unmatched_metric);
+        sample_metrics.push(unmatched_metric);
+        DelimFile::default().write_tsv(&metrics_path, sample_metrics)?;
+
         Ok(())
     }
 }
