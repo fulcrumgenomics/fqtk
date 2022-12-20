@@ -30,17 +30,17 @@ bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
-fgoxide = "0.1.4"
-gzp = "*"
+fgoxide = { git = "https://github.com/fulcrumgenomics/fgoxide", rev = "4c2b4d970f98c34a11835852cc9fda0be7888529"}
+flate2 = { version = "1.0.25", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
 itertools = "0.10.5"
 log = "0.4.17"
 mimalloc = { version = "0.1.32", default-features = false }
-pooled-writer={ git = "https://github.com/fulcrumgenomics/pooled-writer", rev = "181179ad5f060b2ac6c543f372665c0c6a7d24e1"}
+pooled-writer = { git = "https://github.com/fulcrumgenomics/pooled-writer", rev = "181179ad5f060b2ac6c543f372665c0c6a7d24e1"}
 read-structure = "0.1.0"
 rstest="0.15.0"
 serde = { version = "1.0.147", features = ["derive"] }
-serde-aux="4.1.2"
-seq_io="0.3.1"
+serde-aux = "4.1.2"
+seq_io = "0.3.1"
 thiserror = "1.0.37"
 proglog = {version = "0.3.0", features = ["pretty_counts"] }
 

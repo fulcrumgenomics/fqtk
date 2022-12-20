@@ -4,7 +4,6 @@ use clap::Parser;
 use fgoxide::io::Io;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
-use gzp::BUFSIZE;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::{CountFormatterKind, ProgLogBuilder};
@@ -17,13 +16,15 @@ use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-type VecOfReaders = Vec<Box<dyn Read>>;
+type VecOfReaders = Vec<Box<dyn BufRead>>;
+
+const BUFFER_SIZE: usize = 1024 * 1024;
 
 /// The bases and qualities associated with a segment of a FASTQ record.
 #[derive(Debug, Clone)]
@@ -65,7 +66,7 @@ struct ReadSetIterator {
     /// number of sample barcode segments per set of FASTQ records
     num_sample_barcodes: usize,
     /// Iterators over the files containing FASTQ records, one per input file.
-    sources: Vec<FastqReader<Box<dyn Read>>>,
+    sources: Vec<FastqReader<Box<dyn BufRead>>>,
     /// If true this iterator will populate the template segments field of the ReadSet object it
     /// returns
     generate_template_segments: bool,
@@ -169,7 +170,7 @@ impl ReadSetIterator {
     /// structures
     pub fn new(
         read_structures: Vec<ReadStructure>,
-        fq_sources: Vec<FastqReader<Box<dyn Read>>>,
+        fq_sources: Vec<FastqReader<Box<dyn BufRead>>>,
         output_segment_types: &HashSet<SegmentType>,
     ) -> Self {
         let sample_barcode_length: usize = read_structures
@@ -553,14 +554,11 @@ impl Demux {
             }
         }
         // Attempt to open the files for reading.
-        let io = Io::default();
+        let fgio = Io::new(5, BUFFER_SIZE);
         let fq_readers_result = self
             .inputs
             .iter()
-            .map(|p| {
-                let inner: Box<dyn Read> = Box::new(io.new_reader(p)?);
-                Ok(inner)
-            })
+            .map(|p|fgio.new_reader(p))
             .collect::<Result<VecOfReaders, fgoxide::FgError>>();
         if let Err(e) = &fq_readers_result {
             constraint_errors.push(format!("Error opening input files for reading: {}", e));
@@ -603,7 +601,7 @@ impl Command for Demux {
         );
         let fq_sources = fq_readers
             .into_iter()
-            .map(|fq| FastqReader::with_capacity(fq, BUFSIZE))
+            .map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE))
             .collect::<Vec<_>>();
 
         let (mut sample_writers, mut pool) = build_pool(
