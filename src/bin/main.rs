@@ -1,3 +1,5 @@
+extern crate core;
+
 pub mod commands;
 
 use anyhow::Result;
