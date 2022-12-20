@@ -18,8 +18,8 @@ fn is_valid_base(byte: u8) -> bool {
 /// Struct for describing a single sample and metadata associated with that sample.
 #[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
 pub struct Sample {
-    /// name of the sample
-    pub name: String,
+    /// ID of the sample or library
+    pub sample_id: String,
     /// DNA barcode associated with the sample
     pub barcode: String,
     /// index of the sample in the [`SampleGroup`] object, used for syncing indices across
@@ -36,7 +36,7 @@ impl Display for Sample {
         write!(
             f,
             "Sample({:04}) - {{ name: {}\tbarcode: {} }}",
-            self.ordinal, self.name, self.barcode
+            self.ordinal, self.sample_id, self.barcode
         )
     }
 }
@@ -56,7 +56,7 @@ impl Sample {
             barcode.as_bytes().iter().all(|&b| is_valid_base(b)),
             "All sample barcode bases must be one of A, C, G, or T"
         );
-        Self { name, barcode, ordinal }
+        Self { sample_id: name, barcode, ordinal }
     }
 
     /// Returns the header line expected by serde when deserializing
@@ -107,7 +107,7 @@ impl SampleGroup {
 
         // Validate that all the sample names are unique
         assert!(
-            samples.iter().map(|s| &s.name).all_unique(),
+            samples.iter().map(|s| &s.sample_id).all_unique(),
             "Each sample name must be unique, duplicate identified"
         );
 
@@ -129,7 +129,7 @@ impl SampleGroup {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, sample)| {
-                    Sample::new(ordinal, sample.name.clone(), sample.barcode.clone())
+                    Sample::new(ordinal, sample.sample_id.clone(), sample.barcode.clone())
                 })
                 .collect(),
         }
@@ -179,8 +179,8 @@ mod tests {
         io.write_lines(&f1, &lines).unwrap();
         let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
-        assert!(samples_metadata.samples[0].name == "sample1");
-        assert!(samples_metadata.samples[1].name == "sample2");
+        assert!(samples_metadata.samples[0].sample_id == "sample1");
+        assert!(samples_metadata.samples[1].sample_id == "sample2");
         assert!(samples_metadata.samples[0].barcode == "GATTACA");
         assert!(samples_metadata.samples[1].barcode == "CATGCTA");
     }
@@ -201,8 +201,8 @@ mod tests {
         io.write_lines(&f1, &lines).unwrap();
         let samples_metadata = SampleGroup::from_file(&f1).unwrap();
 
-        assert!(samples_metadata.samples[0].name == "sample1");
-        assert!(samples_metadata.samples[1].name == "sample2");
+        assert!(samples_metadata.samples[0].sample_id == "sample1");
+        assert!(samples_metadata.samples[1].sample_id == "sample2");
         assert!(samples_metadata.samples[0].barcode == "GATTACA");
         assert!(samples_metadata.samples[1].barcode == "CATGCTA");
     }
@@ -223,7 +223,7 @@ mod tests {
             if let CsvErrorEnum::Deserialize { pos: _, err: csv_de_err } = csv_e.into_kind() {
                 if let CsvDeserializeErrorEnum::Message(s) = csv_de_err.kind() {
                     to_panic = false;
-                    assert_eq!(s, &SerdeError::missing_field("name").to_string());
+                    assert_eq!(s, &SerdeError::missing_field("sample_id").to_string());
                 }
             }
         }
@@ -292,7 +292,11 @@ mod tests {
         let barcode = "GATTACA".to_owned();
         let ordinal = 0;
         let sample = Sample::new(ordinal, name.clone(), barcode.clone());
-        assert_eq!(Sample { name, barcode, ordinal }, sample, "Sample differed from expectation");
+        assert_eq!(
+            Sample { sample_id: name, barcode, ordinal },
+            sample,
+            "Sample differed from expectation"
+        );
     }
 
     // ############################################################################################
