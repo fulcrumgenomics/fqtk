@@ -422,8 +422,9 @@ dependencies = [
 
 [[package]]
 name = "fgoxide"
-version = "0.1.5-alpha.0"
-source = "git+https://github.com/fulcrumgenomics/fgoxide?rev=4c2b4d970f98c34a11835852cc9fda0be7888529#4c2b4d970f98c34a11835852cc9fda0be7888529"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278fdeeea5d5e6cc58ac0ccaf8bbf76b2f6dfda8647a911655a06f91d5c593a5"
 dependencies = [
  "csv",
  "flate2",
@@ -919,8 +920,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pooled-writer"
-version = "0.2.1-alpha.0"
-source = "git+https://github.com/fulcrumgenomics/pooled-writer?rev=181179ad5f060b2ac6c543f372665c0c6a7d24e1#181179ad5f060b2ac6c543f372665c0c6a7d24e1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a86234f6691c3658634c5ec1dc4a14e779a81e103c7d33825858a7eafa09d22"
 dependencies = [
  "bgzf",
  "bytes",

@@ -675,10 +675,13 @@ impl Demux {
         sample_writers: Vec<SampleWriters<BufWriter<File>>>,
         compression_level: usize,
         threads: usize,
-    ) -> Result<(Vec<SampleWriters<PooledWriter>>, Pool)> {
+    ) -> Result<(Pool, Vec<SampleWriters<PooledWriter>>)> {
         let mut new_sample_writers = Vec::with_capacity(sample_writers.len());
-        let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new(threads * 50, threads)
+        let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
+            .threads(threads)
+            .queue_size(threads * 50)
             .compression_level(u8::try_from(compression_level)?)?;
+
         for sample in sample_writers {
             let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
             let mut new_template_writers = None;
@@ -706,7 +709,7 @@ impl Demux {
             });
         }
         let pool = pool_builder.build()?;
-        Ok((new_sample_writers, pool))
+        Ok((pool, new_sample_writers))
     }
 
     /// Checks that inputs to demux are valid and returns open file handles for the inputs.
@@ -803,8 +806,7 @@ impl Command for Demux {
             .map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE))
             .collect::<Vec<_>>();
 
-        // Create the writers as a Vec that is index sync'd with the sample_group
-        let (mut sample_writers, mut pool) = Self::build_writer_pool(
+        let (mut pool, mut sample_writers) = Self::build_writer_pool(
             Self::create_writers(
                 &self.read_structures,
                 &sample_group,

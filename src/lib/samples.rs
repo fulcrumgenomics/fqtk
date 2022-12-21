@@ -292,7 +292,11 @@ mod tests {
         let barcode = "GATTACA".to_owned();
         let ordinal = 0;
         let sample = Sample::new(ordinal, name.clone(), barcode.clone());
-        assert_eq!(Sample { sample_id: name, barcode, ordinal }, sample, "Sample differed from expectation");
+        assert_eq!(
+            Sample { sample_id: name, barcode, ordinal },
+            sample,
+            "Sample differed from expectation"
+        );
     }
 
     // ############################################################################################
