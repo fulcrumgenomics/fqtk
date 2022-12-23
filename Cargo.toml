@@ -8,6 +8,13 @@ name = "fqtk"
 publish = false
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/fulcrumgenomics/fqtk"
+repository = "https://github.com/fulcrumgenomics/fqtk"
+description = "A toolkit for working with FASTQ files."
+keywords = ["bioinformatics", "genomic"]
+categories = ["science"]
 
 [profile.release]
 lto = "fat"
