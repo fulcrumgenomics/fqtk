@@ -47,7 +47,7 @@ Install [`cargo-release`][cargo-release-link]
 cargo install cargo-release
 ```
 
-### Prior to any release
+### Prior to Any Release
 
 Create a release that will not try to push to `crates.io` and verify the command:
 
@@ -77,7 +77,9 @@ cargo release major --execute
 
 This will remove any pre-release extension, create a new tag and push it to github, and push the release to creates.io.
 
-Upon success, move the version to the [next candidate release](#release-candidate)
+Upon success, move the version to the [next candidate release](#release-candidate).
+
+Finally, make sure to [create a new release][new-release-link] on GitHub.
 
 ### Minor and Patch Release
 
@@ -101,3 +103,4 @@ If you would like to tag the release candidate on github, remove `--no-tag` to c
 
 [cargo-release-link]:      https://github.com/crate-ci/cargo-release
 [cargo-release-docs-link]: https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
+[new-release-link]:        https://github.com/fulcrumgenomics/fqtk/releases/new
