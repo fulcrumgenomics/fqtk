@@ -86,7 +86,7 @@ Finally, make sure to [create a new release][new-release-link] on GitHub.
 To create a _minor_ (_patch_) release, follow the [Major Release](#major-release) instructions substituting `major` with `minor` (`patch`):
 
 ```console
-cargo release minor --no-publish --execute
+cargo release minor --execute
 ```
 
 ### Release Candidate
