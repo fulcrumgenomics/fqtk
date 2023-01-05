@@ -35,6 +35,8 @@ struct FastqSegment {
     seq: Vec<u8>,
     /// qualities of the FASTQ subsection
     quals: Vec<u8>,
+    /// the type of segment being stored
+    segment_type: SegmentType,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -46,15 +48,8 @@ struct FastqSegment {
 struct ReadSet {
     /// Header of the FASTQ record
     header: Vec<u8>,
-    /// The full sample barcode for this record (concatenated bases from individual sample barcode
-    /// segments)
-    sample_barcode_sequence: Vec<u8>,
-    /// The template segments for this set of reads.
-    template_segments: Vec<FastqSegment>,
-    /// The sample barcode segments ofr this set of reads (if being output, otherwise None).
-    sample_barcode_segments: Vec<FastqSegment>,
-    /// The molecular barcode segments of this set of reads (if being ouput, otherwise None).
-    molecular_barcode_segments: Vec<FastqSegment>,
+    /// Segments of reads
+    segments: Vec<FastqSegment>,
 }
 
 impl ReadSet {
@@ -62,6 +57,43 @@ impl ReadSet {
     const SPACE: u8 = b' ';
     const COLON: u8 = b':';
     const PLUS: u8 = b'+';
+
+    /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
+    fn template_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::Template))
+    }
+    /// Produces an iterator over references to the sample barcode segments stored in this
+    /// ``ReadSet``.
+    fn sample_barcode_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode))
+    }
+    /// Produces an iterator over references to the molecular barcode segments stored in this
+    /// ``ReadSet``.
+    fn molecular_barcode_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode))
+    }
+
+    /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
+    fn sample_barcode_sequence(&self, sample_barcode_length: usize) -> Vec<u8> {
+        let mut sample_barcode = Vec::with_capacity(sample_barcode_length);
+        for segment in self.sample_barcode_segments() {
+            sample_barcode.extend(segment.seq.clone());
+        }
+        sample_barcode
+    }
+
+    /// Combines ``ReadSet`` structs together into a single ``ReadSet``
+    fn combine_readsets(readsets: Vec<Self>) -> Self {
+        let mut readset_iter = readsets.into_iter();
+        if let Some(mut result) = readset_iter.next() {
+            for next_readset in readset_iter {
+                result.segments.extend(next_readset.segments);
+            }
+            result
+        } else {
+            panic!("Cannot call combine readsets on an empty vec!")
+        }
+    }
 
     /// Writes the FASTQ header to the given writer.  Substitutes in the given read number into
     /// the comment section.  Also adds in the UMI(s) from the UMI segments and the sample barcodes
@@ -88,8 +120,9 @@ impl ReadSet {
             writer,
             read_num,
             self.header.as_slice(),
-            self.sample_barcode_segments.as_slice(),
-            self.molecular_barcode_segments.as_slice(),
+            // TODO - see if we can't just pass the iterators around here without too much additional complication
+            self.sample_barcode_segments().cloned().collect::<Vec<_>>().as_slice(),
+            self.molecular_barcode_segments().cloned().collect::<Vec<_>>().as_slice(),
         )
     }
 
@@ -195,124 +228,48 @@ impl ReadSet {
 struct ReadSetIterator {
     /// Read structure objects describing the structure of the reads to be demultiplexed, one per
     /// input file.
-    read_structures: Vec<ReadStructure>,
-    /// expected length of the sample barcode given the read structures
-    sample_barcode_length: usize,
-    /// number of template segments per set of FASTQ records
-    num_templates: usize,
-    /// number of molecular barcode segments per set of FASTQ records
-    num_molecular_barcodes: usize,
-    /// number of sample barcode segments per set of FASTQ records
-    num_sample_barcodes: usize,
+    read_structure: ReadStructure,
     /// Iterators over the files containing FASTQ records, one per input file.
-    sources: Vec<FastqReader<Box<dyn BufRead>>>,
+    source: FastqReader<Box<dyn BufRead>>,
 }
 
 impl Iterator for ReadSetIterator {
     type Item = ReadSet;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let source_len = self.sources.len();
-        let mut next_fq_recs = Vec::with_capacity(source_len);
-        for source in &mut self.sources {
-            if let Some(rec) = source.next() {
-                next_fq_recs.push(rec.expect("Unexpected error parsing FASTQs"));
-            }
-        }
+        if let Some(rec) = self.source.next() {
+            let mut segments = Vec::with_capacity(self.read_structure.number_of_segments());
+            let next_fq_rec = rec.expect("Unexpected error parsing FASTQs");
+            let read_name = next_fq_rec.head().to_vec();
 
-        if next_fq_recs.is_empty() {
-            return None;
-        }
-        assert_eq!(
-            next_fq_recs.len(),
-            source_len,
-            "FASTQ sources out of sync at records: {:?}",
-            next_fq_recs
-        );
-
-        let read_name = next_fq_recs[0].head().to_vec();
-
-        let mut sample_barcode = Vec::with_capacity(self.sample_barcode_length);
-        let mut template_segments = Vec::with_capacity(self.num_templates);
-        let mut sample_barcode_segments = Vec::with_capacity(self.num_sample_barcodes);
-        let mut molecular_barcode_segments = Vec::with_capacity(self.num_molecular_barcodes);
-
-        for (read_structure, fastq_record) in self.read_structures.iter().zip(next_fq_recs.iter()) {
-            for read_segment in read_structure.iter() {
+            for read_segment in self.read_structure.iter() {
                 let (seq, quals) = read_segment
-                    .extract_bases_and_quals(fastq_record.seq(), fastq_record.qual())
+                    .extract_bases_and_quals(next_fq_rec.seq(), next_fq_rec.qual())
                     .unwrap_or_else(|e| {
                         panic!(
                             "Error extracting read segment bases or quals from FASTQ record {}; {}",
-                            String::from_utf8(fastq_record.head().to_vec()).unwrap(),
+                            String::from_utf8(next_fq_rec.head().to_vec()).unwrap(),
                             e
                         )
                     });
-                match read_segment.kind {
-                    SegmentType::Template => {
-                        template_segments
-                            .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
-                    }
-                    SegmentType::SampleBarcode => {
-                        sample_barcode_segments
-                            .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
-                        sample_barcode.extend(seq.iter());
-                    }
-                    SegmentType::MolecularBarcode => {
-                        molecular_barcode_segments
-                            .push(FastqSegment { seq: seq.to_vec(), quals: quals.to_vec() });
-                    }
-                    _ => continue,
-                }
+                segments.push(FastqSegment {
+                    seq: seq.to_vec(),
+                    quals: quals.to_vec(),
+                    segment_type: read_segment.kind,
+                });
             }
+            Some(ReadSet { header: read_name, segments })
+        } else {
+            None
         }
-
-        Some(ReadSet {
-            header: read_name,
-            sample_barcode_sequence: sample_barcode,
-            template_segments,
-            sample_barcode_segments,
-            molecular_barcode_segments,
-        })
     }
 }
 
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
     /// structures
-    pub fn new(
-        read_structures: Vec<ReadStructure>,
-        fq_sources: Vec<FastqReader<Box<dyn BufRead>>>,
-    ) -> Self {
-        let sample_barcode_length: usize = read_structures
-            .iter()
-            .map(|rs| {
-                rs.segments_by_type(SegmentType::SampleBarcode)
-                    .filter_map(ReadSegment::length)
-                    .sum::<usize>()
-            })
-            .sum();
-        let num_templates: usize = read_structures
-            .iter()
-            .map(|rs| rs.segments_by_type(SegmentType::SampleBarcode).count())
-            .sum();
-        let num_sample_barcodes: usize = read_structures
-            .iter()
-            .map(|rs| rs.segments_by_type(SegmentType::SampleBarcode).count())
-            .sum();
-        let num_molecular_barcodes: usize = read_structures
-            .iter()
-            .map(|rs| rs.segments_by_type(SegmentType::SampleBarcode).count())
-            .sum();
-
-        Self {
-            read_structures,
-            sources: fq_sources,
-            sample_barcode_length,
-            num_templates,
-            num_sample_barcodes,
-            num_molecular_barcodes,
-        }
+    pub fn new(read_structure: ReadStructure, source: FastqReader<Box<dyn BufRead>>) -> Self {
+        Self { read_structure, source }
     }
 }
 
@@ -352,14 +309,12 @@ impl<W: Write> SampleWriters<W> {
     /// checked at runtime as doing so substantially slows demulitplexing.
     fn write(&mut self, read_set: &ReadSet) -> Result<()> {
         for (writers_opt, segments) in [
-            (&mut self.template_writers, &read_set.template_segments),
-            (&mut self.sample_barcode_writers, &read_set.sample_barcode_segments),
-            (&mut self.molecular_barcode_writers, &read_set.molecular_barcode_segments),
+            (&mut self.template_writers, &mut read_set.template_segments()),
+            (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
+            (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
         ] {
             if let Some(writers) = writers_opt {
-                for (read_idx, (writer, segment)) in
-                    writers.iter_mut().zip(segments.iter()).enumerate()
-                {
+                for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
                     read_set.write_header(writer, read_idx + 1)?;
                     writer.write_all(b"\n")?;
                     writer.write_all(segment.seq.as_slice())?;
@@ -401,6 +356,7 @@ impl SampleWriters<PooledWriter> {
 ///
 /// The `ratio_*` fields are calculated using the mean and max template counts across all samples
 /// *excluding* the unmatched pseudo-sample.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DemuxMetric {
     /// The ID of the sample being reported on.
@@ -418,7 +374,7 @@ pub struct DemuxMetric {
 }
 
 impl DemuxMetric {
-    /// Create a new DemuxMetric with the given sample id and barcode.
+    /// Create a new ``DemuxMetric`` with the given sample id and barcode.
     fn new(sample: &str, barcode: &str) -> DemuxMetric {
         DemuxMetric {
             sample_id: sample.to_string(),
@@ -488,8 +444,8 @@ impl DemuxMetric {
 /// tag.
 ///
 /// Metadata about the samples should be given as a headered metadata TSV file with two columns
-/// 1. sample_id - the id of the sample or library.
-/// 2. barcode - the expected barcode sequence associated with the sample_id.
+/// 1. `sample_id` - the id of the sample or library.
+/// 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
 ///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
@@ -577,6 +533,17 @@ pub(crate) struct Demux {
 }
 
 impl Demux {
+    fn get_sample_barcode_len(&self) -> usize {
+        self.read_structures
+            .iter()
+            .map(|rs| {
+                rs.segments_by_type(SegmentType::SampleBarcode)
+                    .filter_map(ReadSegment::length)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Creates one writer per read segment in the read structures on this object, restricted by
     /// requested output type.
     /// # Errors:
@@ -801,10 +768,8 @@ impl Command for Demux {
             sample_group.samples.len(),
             &self.sample_metadata
         );
-        let fq_sources = fq_readers
-            .into_iter()
-            .map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE))
-            .collect::<Vec<_>>();
+        let fq_sources =
+            fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE));
 
         let (mut pool, mut sample_writers) = Self::build_writer_pool(
             Self::create_writers(
@@ -836,7 +801,10 @@ impl Command for Demux {
             !self.no_cache,
         );
 
-        let fq_iterator = ReadSetIterator::new(self.read_structures.clone(), fq_sources);
+        let mut fq_iterators = fq_sources
+            .zip(self.read_structures.clone().into_iter())
+            .map(|(source, read_structure)| ReadSetIterator::new(read_structure, source))
+            .collect::<Vec<_>>();
 
         let logger = ProgLogBuilder::new()
             .name("fqtk")
@@ -847,8 +815,28 @@ impl Command for Demux {
             .level(log::Level::Info)
             .build();
 
-        for read_set in fq_iterator {
-            if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence) {
+        let sample_barcode_length = self.get_sample_barcode_len();
+
+        loop {
+            let mut next_records = Vec::with_capacity(fq_iterators.len());
+            for iter in &mut fq_iterators {
+                if let Some(rec) = iter.next() {
+                    next_records.push(rec);
+                }
+            }
+            if next_records.is_empty() {
+                break;
+            }
+            assert_eq!(
+                next_records.len(),
+                fq_iterators.len(),
+                "FASTQ sources out of sync at records: {:?}",
+                next_records
+            );
+            let read_set = ReadSet::combine_readsets(next_records);
+            if let Some(barcode_match) =
+                barcode_matcher.assign(&read_set.sample_barcode_sequence(sample_barcode_length))
+            {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
                 sample_metrics[barcode_match.best_match].templates += 1;
             } else {
@@ -1586,16 +1574,17 @@ mod tests {
     // Tests for ReadSet::write_header_internal
     ////////////////////////////////////////////////////////////////////////////
 
-    fn seg(bases: &[u8]) -> FastqSegment {
+    fn seg(bases: &[u8], segment_type: SegmentType) -> FastqSegment {
         let quals = vec![b'#'; bases.len()];
-        FastqSegment { seq: bases.to_vec(), quals }
+        FastqSegment { seq: bases.to_vec(), quals, segment_type }
     }
 
     #[test]
     fn test_write_header_standard_no_umi() {
         let mut out = Vec::new();
         let header = b"inst:123:ABCDE:1:204:1022:2108 1:N:0:0";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [];
         let expected = "@inst:123:ABCDE:1:204:1022:2108 1:N:0:ACGT+GGTT".to_string();
         ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
@@ -1606,8 +1595,9 @@ mod tests {
     fn test_write_header_standard_with_umi() {
         let mut out = Vec::new();
         let header = b"inst:123:ABCDE:1:204:1022:2108 1:Y:0:0";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
-        let umi_segs = [seg(b"AACCGGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@inst:123:ABCDE:1:204:1022:2108:AACCGGTT 2:Y:0:ACGT+GGTT".to_string();
         ReadSet::write_header_internal(&mut out, 2, header, &barcode_segs, &umi_segs).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -1617,8 +1607,9 @@ mod tests {
     fn test_write_header_append_barcode_and_umi() {
         let mut out = Vec::new();
         let header = b"inst:123:ABCDE:1:204:1022:2108:AAAA 1:Y:0:TTTT";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
-        let umi_segs = [seg(b"AACCGGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected =
             "@inst:123:ABCDE:1:204:1022:2108:AAAA+AACCGGTT 2:Y:0:TTTT+ACGT+GGTT".to_string();
         ReadSet::write_header_internal(&mut out, 2, header, &barcode_segs, &umi_segs).unwrap();
@@ -1629,8 +1620,9 @@ mod tests {
     fn test_write_header_short_name_no_comment() {
         let mut out = Vec::new();
         let header = b"q1";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
-        let umi_segs = [seg(b"AACCGGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@q1:AACCGGTT 1:N:0:ACGT+GGTT".to_string();
         ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -1641,8 +1633,9 @@ mod tests {
     fn test_write_header_name_too_many_parts() {
         let mut out = Vec::new();
         let header = b"q1:1:2:3:4:5:6:7:8:9:10";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
-        let umi_segs = [seg(b"AACCGGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
     }
 
@@ -1651,8 +1644,9 @@ mod tests {
     fn test_write_header_comment_too_few_parts() {
         let mut out = Vec::new();
         let header = b"q1 0:0";
-        let barcode_segs = [seg(b"ACGT"), seg(b"GGTT")];
-        let umi_segs = [seg(b"AACCGGTT")];
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
     }
 }
