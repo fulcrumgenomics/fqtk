@@ -3,7 +3,7 @@ use anyhow::{anyhow, ensure, Result};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgoxide::io::{DelimFile, Io};
-use fgoxide::iterators::chunked_read_ahead_iterator::IntoChunkedReadAheadIterator;
+use fgoxide::iter::IntoChunkedReadAheadIterator;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use itertools::Itertools;
@@ -75,16 +75,13 @@ impl ReadSet {
     }
 
     /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
-    fn sample_barcode_sequence(&self, sample_barcode_length: usize) -> Vec<u8> {
-        let mut sample_barcode = Vec::with_capacity(sample_barcode_length);
-        for segment in self.sample_barcode_segments() {
-            sample_barcode.extend(segment.seq.clone());
-        }
-        sample_barcode
+    fn sample_barcode_sequence(&self) -> Vec<u8> {
+        self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
     }
 
     /// Combines ``ReadSet`` structs together into a single ``ReadSet``
     fn combine_readsets(readsets: Vec<Self>) -> Self {
+        assert!(!readsets.is_empty(), "Cannot call combine readsets on an empty vec!");
         let mut readset_iter = readsets.into_iter();
         if let Some(mut result) = readset_iter.next() {
             for next_readset in readset_iter {
@@ -92,7 +89,7 @@ impl ReadSet {
             }
             result
         } else {
-            panic!("Cannot call combine readsets on an empty vec!")
+            panic!("Non empty vector was empty upon being converted to iterator.")
         }
     }
 
@@ -546,18 +543,6 @@ pub(crate) struct Demux {
 }
 
 impl Demux {
-    /// Gets the sample barcode length for the set of read structures on ``Self``
-    fn get_sample_barcode_len(&self) -> usize {
-        self.read_structures
-            .iter()
-            .map(|rs| {
-                rs.segments_by_type(SegmentType::SampleBarcode)
-                    .filter_map(ReadSegment::length)
-                    .sum::<usize>()
-            })
-            .sum()
-    }
-
     /// Creates one writer per read segment in the read structures on this object, restricted by
     /// requested output type.
     /// # Errors:
@@ -749,7 +734,7 @@ impl Demux {
 
         if self.threads < 5 {
             constraint_errors
-                .push(format!("Threads provided {} was too low! Must be 3 or more.", self.threads));
+                .push(format!("Threads provided {} was too low! Must be 5 or more.", self.threads));
         }
 
         if constraint_errors.is_empty() {
@@ -794,7 +779,8 @@ impl Command for Demux {
                 &self.output,
             )?,
             self.compression_level,
-            self.threads - 1,
+            // reserve 1 for main thread and 2 for read ahead, remaining on writing.
+            self.threads - 3,
         )?;
         let unmatched_index = sample_writers.len() - 1;
         info!("Created sample and {} writers.", self.unmatched_prefix);
@@ -832,8 +818,6 @@ impl Command for Demux {
             .level(log::Level::Info)
             .build();
 
-        let sample_barcode_length = self.get_sample_barcode_len();
-
         loop {
             let mut next_records = Vec::with_capacity(fq_iterators.len());
             for iter in &mut fq_iterators {
@@ -851,8 +835,7 @@ impl Command for Demux {
                 next_records
             );
             let read_set = ReadSet::combine_readsets(next_records);
-            if let Some(barcode_match) =
-                barcode_matcher.assign(&read_set.sample_barcode_sequence(sample_barcode_length))
+            if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
             {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
                 sample_metrics[barcode_match.best_match].templates += 1;

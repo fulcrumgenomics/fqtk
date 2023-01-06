@@ -423,7 +423,7 @@ dependencies = [
 [[package]]
 name = "fgoxide"
 version = "0.2.1-dev"
-source = "git+https://github.com/fulcrumgenomics/fgoxide?rev=c776fb11d917403c2745c646eb2ee50fa4043214#c776fb11d917403c2745c646eb2ee50fa4043214"
+source = "git+https://github.com/fulcrumgenomics/fgoxide?rev=5724c953cc74ea3f17af9f86762d5996fec2593d#5724c953cc74ea3f17af9f86762d5996fec2593d"
 dependencies = [
  "csv",
  "flate2",
