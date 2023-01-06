@@ -60,17 +60,19 @@ impl ReadSet {
     const PLUS: u8 = b'+';
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
-    fn template_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+    fn template_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
         Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::Template))
     }
+
     /// Produces an iterator over references to the sample barcode segments stored in this
     /// ``ReadSet``.
-    fn sample_barcode_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+    fn sample_barcode_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
         Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode))
     }
+
     /// Produces an iterator over references to the molecular barcode segments stored in this
     /// ``ReadSet``.
-    fn molecular_barcode_segments(&self) -> Box<dyn Iterator<Item = &FastqSegment> + '_> {
+    fn molecular_barcode_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
         Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode))
     }
 
@@ -118,18 +120,17 @@ impl ReadSet {
             writer,
             read_num,
             self.header.as_slice(),
-            // TODO - see if we can't just pass the iterators around here without too much additional complication
-            self.sample_barcode_segments().cloned().collect::<Vec<_>>().as_slice(),
-            self.molecular_barcode_segments().cloned().collect::<Vec<_>>().as_slice(),
+            self.sample_barcode_segments(),
+            self.molecular_barcode_segments(),
         )
     }
 
-    fn write_header_internal<W: Write>(
+    fn write_header_internal<'a, W: Write>(
         writer: &mut W,
         read_num: usize,
         header: &[u8],
-        sample_barcode_segments: &[FastqSegment],
-        molecular_barcode_segments: &[FastqSegment],
+        sample_barcode_segments: impl Iterator<Item = &'a FastqSegment>,
+        mut molecular_barcode_segments: impl Iterator<Item = &'a FastqSegment>,
     ) -> Result<()> {
         // Extract the name and optionally the comment
         let (name, comment) = match header.find_byte(Self::SPACE) {
@@ -141,9 +142,7 @@ impl ReadSet {
 
         // Handle the 'name' component of the header.  If we don't have any UMI segments
         // we can emit the name part as is.  Otherwise we need to append the UMIs to the name.
-        if molecular_barcode_segments.is_empty() {
-            writer.write_all(name)?;
-        } else {
+        if let Some(first_seg) = molecular_barcode_segments.next() {
             let sep_count = name.iter().filter(|c| **c == Self::COLON).count();
             ensure!(
                 sep_count <= 7,
@@ -160,13 +159,14 @@ impl ReadSet {
                 writer.write_all(&[Self::COLON])?;
             }
 
+            writer.write_all(first_seg.seq.as_slice())?;
             // Append all the UMI segments with pluses in between.
-            for (idx, seg) in molecular_barcode_segments.iter().enumerate() {
-                if idx > 0 {
-                    writer.write_all(&[Self::PLUS])?;
-                }
+            for seg in molecular_barcode_segments {
+                writer.write_all(&[Self::PLUS])?;
                 writer.write_all(seg.seq.as_slice())?;
             }
+        } else {
+            writer.write_all(name)?;
         }
 
         writer.write_all(&[Self::SPACE])?;
@@ -206,7 +206,7 @@ impl ReadSet {
         }
 
         // Append all the sample barcode segments to the new comment
-        for (idx, seg) in sample_barcode_segments.iter().enumerate() {
+        for (idx, seg) in sample_barcode_segments.enumerate() {
             if idx > 0 {
                 writer.write_all(&[Self::PLUS])?;
             }
@@ -308,10 +308,19 @@ impl<W: Write> SampleWriters<W> {
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
     /// checked at runtime as doing so substantially slows demulitplexing.
     fn write(&mut self, read_set: &ReadSet) -> Result<()> {
+        // We need to box these here because types declared as impl are treated as distinct types
+        // even if they have the same signature.
+        let mut boxed_templates: Box<dyn Iterator<Item = &FastqSegment>> =
+            Box::new(read_set.template_segments());
+        let mut boxed_samples: Box<dyn Iterator<Item = &FastqSegment>> =
+            Box::new(read_set.template_segments());
+        let mut boxed_moleculars: Box<dyn Iterator<Item = &FastqSegment>> =
+            Box::new(read_set.template_segments());
+
         for (writers_opt, segments) in [
-            (&mut self.template_writers, &mut read_set.template_segments()),
-            (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
-            (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
+            (&mut self.template_writers, &mut boxed_templates),
+            (&mut self.sample_barcode_writers, &mut boxed_samples),
+            (&mut self.molecular_barcode_writers, &mut boxed_moleculars),
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
@@ -1613,7 +1622,8 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [];
         let expected = "@inst:123:ABCDE:1:204:1022:2108 1:N:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1625,7 +1635,8 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@inst:123:ABCDE:1:204:1022:2108:AACCGGTT 2:Y:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 2, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 2, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1638,7 +1649,8 @@ mod tests {
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected =
             "@inst:123:ABCDE:1:204:1022:2108:AAAA+AACCGGTT 2:Y:0:TTTT+ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 2, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 2, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1650,7 +1662,8 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@q1:AACCGGTT 1:N:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1662,7 +1675,8 @@ mod tests {
         let barcode_segs =
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
-        ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
     }
 
     #[test]
@@ -1673,6 +1687,7 @@ mod tests {
         let barcode_segs =
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
-        ReadSet::write_header_internal(&mut out, 1, header, &barcode_segs, &umi_segs).unwrap();
+        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
+            .unwrap();
     }
 }
