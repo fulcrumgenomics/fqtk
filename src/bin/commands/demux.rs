@@ -36,7 +36,7 @@ type SegmentTypeIter<'a> = Filter<Iter<'a, FastqSegment>, fn(&&FastqSegment) -> 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
 /// The bases and qualities associated with a segment of a FASTQ record.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 struct FastqSegment {
     /// bases of the FASTQ subsection
     seq: Vec<u8>,
@@ -51,7 +51,7 @@ struct FastqSegment {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// One unit of FASTQ records separated into their component read segments.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 struct ReadSet {
     /// Header of the FASTQ record
     header: Vec<u8>,
@@ -1338,8 +1338,6 @@ mod tests {
         );
     }
 
-    // TODO - expand this test to test molecular barcode once we add that info a la fgbio version
-    // of this test.
     #[rstest]
     #[case(true)]
     #[case(false)]
@@ -1719,5 +1717,119 @@ mod tests {
             umi_segs.iter().filter(|_| true),
         )
         .unwrap();
+    }
+
+    // ############################################################################################
+    // Test other ``ReadSet`` functions
+    // ############################################################################################
+
+    #[test]
+    fn test_sample_barcode_sequence() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATA".as_bytes(), SegmentType::SampleBarcode),
+            seg("CAC".as_bytes(), SegmentType::SampleBarcode),
+            seg("GACCCC".as_bytes(), SegmentType::MolecularBarcode),
+        ];
+
+        let read_set = ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments };
+
+        assert_eq!(read_set.sample_barcode_sequence(), "GATACAC".as_bytes().to_owned());
+    }
+    #[test]
+    fn test_template_segments() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::SampleBarcode),
+            seg("GATA".as_bytes(), SegmentType::Template),
+            seg("CAC".as_bytes(), SegmentType::Template),
+            seg("GACCCC".as_bytes(), SegmentType::MolecularBarcode),
+        ];
+        let expected = vec![
+            seg("GATA".as_bytes(), SegmentType::Template),
+            seg("CAC".as_bytes(), SegmentType::Template),
+        ];
+
+        let read_set = ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments };
+
+        assert_eq!(expected, read_set.template_segments().cloned().collect::<Vec<_>>());
+    }
+    #[test]
+    fn test_sample_barcode_segments() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATA".as_bytes(), SegmentType::SampleBarcode),
+            seg("CAC".as_bytes(), SegmentType::SampleBarcode),
+            seg("GACCCC".as_bytes(), SegmentType::MolecularBarcode),
+        ];
+        let expected = vec![
+            seg("GATA".as_bytes(), SegmentType::SampleBarcode),
+            seg("CAC".as_bytes(), SegmentType::SampleBarcode),
+        ];
+
+        let read_set = ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments };
+
+        assert_eq!(expected, read_set.sample_barcode_segments().cloned().collect::<Vec<_>>());
+    }
+    #[test]
+    fn test_molecular_barcode_segments() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATA".as_bytes(), SegmentType::MolecularBarcode),
+            seg("CAC".as_bytes(), SegmentType::MolecularBarcode),
+            seg("GACCCC".as_bytes(), SegmentType::SampleBarcode),
+        ];
+        let expected = vec![
+            seg("GATA".as_bytes(), SegmentType::MolecularBarcode),
+            seg("CAC".as_bytes(), SegmentType::MolecularBarcode),
+        ];
+
+        let read_set = ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments };
+
+        assert_eq!(expected, read_set.molecular_barcode_segments().cloned().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_combine_readsets() {
+        let segments1 = vec![
+            seg("A".as_bytes(), SegmentType::Template),
+            seg("G".as_bytes(), SegmentType::Template),
+            seg("C".as_bytes(), SegmentType::MolecularBarcode),
+            seg("T".as_bytes(), SegmentType::SampleBarcode),
+        ];
+        let read_set1 =
+            ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments: segments1.clone() };
+        let segments2 = vec![
+            seg("AA".as_bytes(), SegmentType::Template),
+            seg("AG".as_bytes(), SegmentType::Template),
+            seg("AC".as_bytes(), SegmentType::MolecularBarcode),
+            seg("AT".as_bytes(), SegmentType::SampleBarcode),
+        ];
+        let read_set2 =
+            ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments: segments2.clone() };
+        let segments3 = vec![
+            seg("AAA".as_bytes(), SegmentType::Template),
+            seg("AAG".as_bytes(), SegmentType::Template),
+            seg("AAC".as_bytes(), SegmentType::MolecularBarcode),
+            seg("AAT".as_bytes(), SegmentType::SampleBarcode),
+        ];
+        let read_set3 =
+            ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments: segments3.clone() };
+
+        let mut expected_segments = Vec::new();
+        expected_segments.extend(segments1);
+        expected_segments.extend(segments2);
+        expected_segments.extend(segments3);
+        let expected =
+            ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments: expected_segments };
+
+        let result = ReadSet::combine_readsets(vec![read_set1, read_set2, read_set3]);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot call combine readsets on an empty vec!")]
+    fn test_combine_readsets_fails_on_empty_vector() {
+        let _result = ReadSet::combine_readsets(Vec::new());
     }
 }
