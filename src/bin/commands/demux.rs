@@ -19,12 +19,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
+use std::iter::Filter;
+use std::slice::Iter;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
+/// Type alias to prevent clippy complaining about type complexity
 type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
+
+/// Type alias for segment type iter functions, which iterate over the segments of a ``ReadSet``
+/// filtering for a specific type.
+type SegmentTypeIter<'a> = Filter<Iter<'a, FastqSegment>, fn(&&FastqSegment) -> bool>;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -59,20 +66,20 @@ impl ReadSet {
     const PLUS: u8 = b'+';
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
-    fn template_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
-        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::Template))
+    fn template_segments(&self) -> SegmentTypeIter {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::Template)
     }
 
     /// Produces an iterator over references to the sample barcode segments stored in this
     /// ``ReadSet``.
-    fn sample_barcode_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
-        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode))
+    fn sample_barcode_segments(&self) -> SegmentTypeIter {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode)
     }
 
     /// Produces an iterator over references to the molecular barcode segments stored in this
     /// ``ReadSet``.
-    fn molecular_barcode_segments(&self) -> impl Iterator<Item = &'_ FastqSegment> {
-        Box::new(self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode))
+    fn molecular_barcode_segments(&self) -> SegmentTypeIter {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
     }
 
     /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
@@ -84,14 +91,11 @@ impl ReadSet {
     fn combine_readsets(readsets: Vec<Self>) -> Self {
         assert!(!readsets.is_empty(), "Cannot call combine readsets on an empty vec!");
         let mut readset_iter = readsets.into_iter();
-        if let Some(mut result) = readset_iter.next() {
-            for next_readset in readset_iter {
-                result.segments.extend(next_readset.segments);
-            }
-            result
-        } else {
-            panic!("Non empty vector was empty upon being converted to iterator.")
+        let mut first = readset_iter.next().expect("Cannot call combine readsets on an empty vec!");
+        for next_readset in readset_iter {
+            first.segments.extend(next_readset.segments);
         }
+        first
     }
 
     /// Writes the FASTQ header to the given writer.  Substitutes in the given read number into
@@ -124,12 +128,12 @@ impl ReadSet {
         )
     }
 
-    fn write_header_internal<'a, W: Write>(
+    fn write_header_internal<W: Write>(
         writer: &mut W,
         read_num: usize,
         header: &[u8],
-        sample_barcode_segments: impl Iterator<Item = &'a FastqSegment>,
-        mut molecular_barcode_segments: impl Iterator<Item = &'a FastqSegment>,
+        sample_barcode_segments: SegmentTypeIter,
+        mut molecular_barcode_segments: SegmentTypeIter,
     ) -> Result<()> {
         // Extract the name and optionally the comment
         let (name, comment) = match header.find_byte(Self::SPACE) {
@@ -307,19 +311,10 @@ impl<W: Write> SampleWriters<W> {
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
     /// checked at runtime as doing so substantially slows demulitplexing.
     fn write(&mut self, read_set: &ReadSet) -> Result<()> {
-        // We need to box these here because types declared as impl are treated as distinct types
-        // even if they have the same signature.
-        let mut boxed_templates: Box<dyn Iterator<Item = &FastqSegment>> =
-            Box::new(read_set.template_segments());
-        let mut boxed_samples: Box<dyn Iterator<Item = &FastqSegment>> =
-            Box::new(read_set.template_segments());
-        let mut boxed_moleculars: Box<dyn Iterator<Item = &FastqSegment>> =
-            Box::new(read_set.template_segments());
-
         for (writers_opt, segments) in [
-            (&mut self.template_writers, &mut boxed_templates),
-            (&mut self.sample_barcode_writers, &mut boxed_samples),
-            (&mut self.molecular_barcode_writers, &mut boxed_moleculars),
+            (&mut self.template_writers, &mut read_set.template_segments()),
+            (&mut self.sample_barcode_writers, &mut read_set.template_segments()),
+            (&mut self.molecular_barcode_writers, &mut read_set.template_segments()),
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
@@ -827,22 +822,22 @@ impl Command for Demux {
             .build();
 
         loop {
-            let mut next_records = Vec::with_capacity(fq_iterators.len());
+            let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
             for iter in &mut fq_iterators {
                 if let Some(rec) = iter.next() {
-                    next_records.push(rec);
+                    next_read_sets.push(rec);
                 }
             }
-            if next_records.is_empty() {
+            if next_read_sets.is_empty() {
                 break;
             }
             assert_eq!(
-                next_records.len(),
+                next_read_sets.len(),
                 fq_iterators.len(),
                 "FASTQ sources out of sync at records: {:?}",
-                next_records
+                next_read_sets
             );
-            let read_set = ReadSet::combine_readsets(next_records);
+            let read_set = ReadSet::combine_readsets(next_read_sets);
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
             {
                 sample_writers[barcode_match.best_match].write(&read_set)?;
@@ -1621,8 +1616,14 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [];
         let expected = "@inst:123:ABCDE:1:204:1022:2108 1:N:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1634,8 +1635,14 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@inst:123:ABCDE:1:204:1022:2108:AACCGGTT 2:Y:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 2, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            2,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1648,8 +1655,14 @@ mod tests {
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected =
             "@inst:123:ABCDE:1:204:1022:2108:AAAA+AACCGGTT 2:Y:0:TTTT+ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 2, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            2,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1661,8 +1674,14 @@ mod tests {
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
         let expected = "@q1:AACCGGTT 1:N:0:ACGT+GGTT".to_string();
-        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
@@ -1674,8 +1693,14 @@ mod tests {
         let barcode_segs =
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
-        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1686,7 +1711,13 @@ mod tests {
         let barcode_segs =
             [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
         let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
-        ReadSet::write_header_internal(&mut out, 1, header, barcode_segs.iter(), umi_segs.iter())
-            .unwrap();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+        )
+        .unwrap();
     }
 }
