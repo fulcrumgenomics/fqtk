@@ -3,6 +3,7 @@ use anyhow::{anyhow, ensure, Result};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgoxide::io::{DelimFile, Io};
+use fgoxide::iterators::chunked_read_ahead_iterator::IntoChunkedReadAheadIterator;
 use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use itertools::Itertools;
@@ -24,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-type VecOfReaders = Vec<Box<dyn BufRead>>;
+type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -226,11 +227,10 @@ impl ReadSet {
 /// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
 /// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
 struct ReadSetIterator {
-    /// Read structure objects describing the structure of the reads to be demultiplexed, one per
-    /// input file.
+    /// Read structure object describing the structure of the reads in this file.
     read_structure: ReadStructure,
-    /// Iterators over the files containing FASTQ records, one per input file.
-    source: FastqReader<Box<dyn BufRead>>,
+    /// The file containing FASTQ records.
+    source: FastqReader<Box<dyn BufRead + Send>>,
 }
 
 impl Iterator for ReadSetIterator {
@@ -268,7 +268,10 @@ impl Iterator for ReadSetIterator {
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
     /// structures
-    pub fn new(read_structure: ReadStructure, source: FastqReader<Box<dyn BufRead>>) -> Self {
+    pub fn new(
+        read_structure: ReadStructure,
+        source: FastqReader<Box<dyn BufRead + Send>>,
+    ) -> Self {
         Self { read_structure, source }
     }
 }
@@ -527,12 +530,23 @@ pub(crate) struct Demux {
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
 
+    /// The chunk size to use when reading FASTQ files
+    // TODO remove me when we've figured out good defaults
+    #[clap(long, default_value = "1000")]
+    chunk_size: usize,
+
+    /// The buffer size to use when reading ahead on FASTQ files
+    // TODO remove me when we've figured out good defaults
+    #[clap(long, default_value = "1000")]
+    buffer_size: usize,
+
     /// If true, caching of barcodes will be disabled
     #[clap(long, hide = true)]
     no_cache: bool,
 }
 
 impl Demux {
+    /// Gets the sample barcode length for the set of read structures on ``Self``
     fn get_sample_barcode_len(&self) -> usize {
         self.read_structures
             .iter()
@@ -803,7 +817,10 @@ impl Command for Demux {
 
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone().into_iter())
-            .map(|(source, read_structure)| ReadSetIterator::new(read_structure, source))
+            .map(|(source, read_structure)| {
+                ReadSetIterator::new(read_structure, source)
+                    .read_ahead(self.chunk_size, self.buffer_size)
+            })
             .collect::<Vec<_>>();
 
         let logger = ProgLogBuilder::new()
@@ -986,6 +1003,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1029,6 +1048,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1067,6 +1088,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         let demux_result = demux_inputs.execute();
@@ -1105,6 +1128,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1140,6 +1165,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 2,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1172,6 +1199,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache,
         };
         demux_inputs.execute().unwrap();
@@ -1222,6 +1251,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache,
         };
         demux_inputs.execute().unwrap();
@@ -1289,6 +1320,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache,
         };
         demux.execute().unwrap();
@@ -1357,6 +1390,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache,
         };
         demux.execute().unwrap();
@@ -1423,6 +1458,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache,
         };
         demux_inputs.execute().unwrap();
@@ -1497,6 +1534,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1531,6 +1570,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
@@ -1565,6 +1606,8 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 3,
             compression_level: 5,
+            chunk_size: 1000,
+            buffer_size: 1000,
             no_cache: false,
         };
         demux_inputs.execute().unwrap();
