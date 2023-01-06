@@ -13,12 +13,22 @@ A toolkit for working with FASTQ files, written in Rust.
 ## Installing
 
 ### Installing with `conda`
+To install with conda you must first [install conda](https://conda.io/projects/conda/en/latest/user-guide/install/index.html#installation).
+Then, in your command line (and with the environment you wish to install fqtk active) run:
 
 ```console
 conda install -c bioconda fqtk
 ```
 
 ### Installing with `cargo`
+To install with cargo you must first [install rust](https://doc.rust-lang.org/cargo/getting-started/installation.html).
+Which (On Mac OS and Linux) can be done with the command:
+
+```console
+curl https://sh.rustup.rs -sSf | sh
+```
+
+Then, to install `fqtk` run:
 
 ```console
 cargo install fqtk
