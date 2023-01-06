@@ -14,7 +14,7 @@ A toolkit for working with FASTQ files, written in Rust.
 
 ### Installing with `conda`
 To install with conda you must first [install conda](https://conda.io/projects/conda/en/latest/user-guide/install/index.html#installation).
-Then, in your command line (and with the environment you wish to install fqtk active) run:
+Then, in your command line (and with the environment you wish to install fqtk into active) run:
 
 ```console
 conda install -c bioconda fqtk
