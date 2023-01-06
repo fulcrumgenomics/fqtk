@@ -10,7 +10,6 @@ use itertools::Itertools;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::{CountFormatterKind, ProgLogBuilder};
-use read_structure::ReadSegment;
 use read_structure::ReadStructure;
 use read_structure::ReadStructureError;
 use read_structure::SegmentType;
