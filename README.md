@@ -2,13 +2,37 @@
 
 <p align="center">
   <a href="https://github.com/fulcrumgenomics/fqtk/actions?query=workflow%3ACheck"><img src="https://github.com/fulcrumgenomics/fqtk/actions/workflows/build_and_test.yml/badge.svg" alt="Build Status"></a>
+  <img src="https://img.shields.io/crates/l/fqtk.svg" alt="license">
+  <a href="https://crates.io/crates/fqtk"><img src="https://img.shields.io/crates/v/fqtk.svg?colorB=319e8c" alt="Version info"></a>
+  <a href="http://bioconda.github.io/recipes/fqtk/README.html"><img src="https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat" alt="Install with bioconda"></a>
+  <br>
 </p>
 
 A toolkit for working with FASTQ files, written in Rust.
 
 ## Installing
 
-Until the first public release, the only way to install the tool is by checking out the git repository and building with cargo.
+### Installing with `conda`
+To install with conda you must first [install conda](https://conda.io/projects/conda/en/latest/user-guide/install/index.html#installation).
+Then, in your command line (and with the environment you wish to install fqtk into active) run:
+
+```console
+conda install -c bioconda fqtk
+```
+
+### Installing with `cargo`
+To install with cargo you must first [install rust](https://doc.rust-lang.org/cargo/getting-started/installation.html).
+Which (On Mac OS and Linux) can be done with the command:
+
+```console
+curl https://sh.rustup.rs -sSf | sh
+```
+
+Then, to install `fqtk` run:
+
+```console
+cargo install fqtk
+```
 
 ### Building From Source
 
