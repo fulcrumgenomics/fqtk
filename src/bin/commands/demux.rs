@@ -523,7 +523,7 @@ pub(crate) struct Demux {
     min_mismatch_delta: usize,
 
     /// The number of threads to use. Cannot be less than 3.
-    #[clap(long, short = 't', default_value = "3")]
+    #[clap(long, short = 't', default_value = "5")]
     threads: usize,
 
     /// The level of compression to use to compress outputs.
@@ -747,7 +747,7 @@ impl Demux {
             constraint_errors.push(format!("Error opening input files for reading: {}", e));
         }
 
-        if self.threads < 3 {
+        if self.threads < 5 {
             constraint_errors
                 .push(format!("Threads provided {} was too low! Must be 3 or more.", self.threads));
         }
@@ -1001,7 +1001,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1046,7 +1046,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1086,7 +1086,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1197,7 +1197,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1249,7 +1249,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1318,7 +1318,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1388,7 +1388,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1456,7 +1456,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1532,7 +1532,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1568,7 +1568,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
@@ -1604,7 +1604,7 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 3,
+            threads: 5,
             compression_level: 5,
             chunk_size: 1000,
             buffer_size: 1000,
