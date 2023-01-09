@@ -89,12 +89,17 @@ impl ReadSet {
 
     /// Combines ``ReadSet`` structs together into a single ``ReadSet``
     fn combine_readsets(readsets: Vec<Self>) -> Self {
-        assert!(!readsets.is_empty(), "Cannot call combine readsets on an empty vec!");
+        let total_segments: usize = readsets.iter().map(|s| s.segments.len()).sum();
+        assert!(total_segments > 0, "Cannot call combine readsets on an empty vec!");
+
         let mut readset_iter = readsets.into_iter();
         let mut first = readset_iter.next().expect("Cannot call combine readsets on an empty vec!");
+        first.segments.reserve_exact(total_segments - first.segments.len());
+
         for next_readset in readset_iter {
             first.segments.extend(next_readset.segments);
         }
+
         first
     }
 
