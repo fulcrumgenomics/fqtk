@@ -31,7 +31,7 @@ type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 
 /// Type alias for segment type iter functions, which iterate over the segments of a ``ReadSet``
 /// filtering for a specific type.
-type SegmentTypeIter<'a> = Filter<Iter<'a, FastqSegment>, fn(&&FastqSegment) -> bool>;
+type SegmentIter<'a> = Filter<Iter<'a, FastqSegment>, fn(&&FastqSegment) -> bool>;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -66,19 +66,19 @@ impl ReadSet {
     const PLUS: u8 = b'+';
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
-    fn template_segments(&self) -> SegmentTypeIter {
+    fn template_segments(&self) -> SegmentIter {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::Template)
     }
 
     /// Produces an iterator over references to the sample barcode segments stored in this
     /// ``ReadSet``.
-    fn sample_barcode_segments(&self) -> SegmentTypeIter {
+    fn sample_barcode_segments(&self) -> SegmentIter {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode)
     }
 
     /// Produces an iterator over references to the molecular barcode segments stored in this
     /// ``ReadSet``.
-    fn molecular_barcode_segments(&self) -> SegmentTypeIter {
+    fn molecular_barcode_segments(&self) -> SegmentIter {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
     }
 
@@ -132,8 +132,8 @@ impl ReadSet {
         writer: &mut W,
         read_num: usize,
         header: &[u8],
-        sample_barcode_segments: SegmentTypeIter,
-        mut molecular_barcode_segments: SegmentTypeIter,
+        sample_barcode_segments: SegmentIter,
+        mut molecular_barcode_segments: SegmentIter,
     ) -> Result<()> {
         // Extract the name and optionally the comment
         let (name, comment) = match header.find_byte(Self::SPACE) {
