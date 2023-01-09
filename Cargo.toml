@@ -36,7 +36,7 @@ bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
-fgoxide = { git = "https://github.com/fulcrumgenomics/fgoxide", rev = "5724c953cc74ea3f17af9f86762d5996fec2593d"}
+fgoxide = "0.3.0"
 flate2 = { version = "1.0.25", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
 itertools = "0.10.5"
 log = "0.4.17"

@@ -422,8 +422,9 @@ dependencies = [
 
 [[package]]
 name = "fgoxide"
-version = "0.2.1-dev"
-source = "git+https://github.com/fulcrumgenomics/fgoxide?rev=5724c953cc74ea3f17af9f86762d5996fec2593d#5724c953cc74ea3f17af9f86762d5996fec2593d"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de2a7105842bc5c341acb1013dca3b50bd0a9f8d8850987ee30d6b7e05185f19"
 dependencies = [
  "csv",
  "flate2",
