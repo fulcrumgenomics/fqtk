@@ -523,7 +523,7 @@ pub(crate) struct Demux {
     min_mismatch_delta: usize,
 
     /// The number of threads to use. Cannot be less than 3.
-    #[clap(long, short = 't', default_value = "5")]
+    #[clap(long, short = 't', default_value = "8")]
     threads: usize,
 
     /// The level of compression to use to compress outputs.
@@ -773,6 +773,11 @@ impl Command for Demux {
         let fq_sources =
             fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE));
 
+        // reserve 1 for main thread and 2 for read ahead, remaining on writing.
+        let reader_threads = if self.threads <= 6 { 1 } else { 2 };
+        let main_thread = 1;
+        let writer_threads = self.threads - main_thread - reader_threads;
+
         let (mut pool, mut sample_writers) = Self::build_writer_pool(
             Self::create_writers(
                 &self.read_structures,
@@ -782,8 +787,7 @@ impl Command for Demux {
                 &self.output,
             )?,
             self.compression_level,
-            // reserve 1 for main thread and 2 for read ahead, remaining on writing.
-            self.threads - 3,
+            writer_threads,
         )?;
         let unmatched_index = sample_writers.len() - 1;
         info!("Created sample and {} writers.", self.unmatched_prefix);
