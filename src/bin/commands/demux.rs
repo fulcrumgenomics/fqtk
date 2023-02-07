@@ -492,6 +492,7 @@ impl DemuxMetric {
 /// ```
 ///
 #[derive(Parser, Debug)]
+#[command(version)]
 pub(crate) struct Demux {
     /// One or more input fastq files each corresponding to a sequencing (e.g. R1, I1).
     #[clap(long, short = 'i', required = true, num_args = 1..)]
