@@ -16,8 +16,11 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v2
 
-      - name: Setup rust toolchain
-        run: rustup show
+      - name: Install stable toolchain
+        uses: codota/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
