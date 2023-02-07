@@ -18,10 +18,6 @@ jobs:
 
       - name: Setup rust toolchain
         run: rustup show
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
