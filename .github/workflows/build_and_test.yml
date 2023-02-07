@@ -16,8 +16,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v2
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Setup rust toolchain
+        run: rustup show
         with:
           profile: minimal
           toolchain: stable
