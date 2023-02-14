@@ -20,6 +20,7 @@ struct Args {
 
 #[enum_dispatch(Command)]
 #[derive(Parser, Debug)]
+#[command(version)]
 enum Subcommand {
     Demux(Demux),
 }
