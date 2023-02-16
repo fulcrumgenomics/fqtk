@@ -11,7 +11,6 @@ use seq_io::fastq::Record;
 use fgoxide::iter::IntoChunkedReadAheadIterator;
 
 use seq_io::fastq::RefRecord;
-use std::cmp;
 use std::io::Write;
 use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
@@ -23,178 +22,65 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 
 struct TrimReadIterator {
     source: FastqReader<Box<dyn BufRead + Send>>,
-    run_eamss: bool,
-    back_to_front_window_size: usize,
-    front_to_back_window_size: usize,
+    deviation_window_size: usize,
+    average_deviation_threshold: usize,
 }
 impl TrimReadIterator {
-    // Adjust the thresholds to the ASCII bytes that seq_io returns.
-    const EAMSS_M2_GE_THRESHOLD: u8 = 30 + 33;
-    const EAMSS_S1_LT_THRESHOLD: u8 = 15 + 33;
-
-    // EAMSS is an Illumina Developed Algorithm for detecting reads whose quality has deteriorated towards
-    // their end and revising the quality to the masking quality (2) if this is the case.  This algorithm
-    // works as follows (with one exception):
-    //
-    //     Start at the end (high indices, at the right below) of the read and calculate an EAMSS
-    //     tally at each location as follow:
-    //     if(quality[i] < 15) tally += 1
-    //     if(quality[i] >= 15 and < 30) tally = tally
-    //     if(quality[i] >= 30) tally -= 2
-    //
-    //
-    // For each location, keep track of this tally (e.g.)
-    // Read Starts at <- this end
-    // Cycle:       1  2  3  4  5  6  7  8  9
-    // Bases:       A  C  T  G  G  G  T  C  A
-    // Qualities:   32 32 16 15 8  10 32 2  2
-    // Cycle Score: -2 -2 0  0  1  1  -2 1  1           //The EAMSS Score determined for this cycle alone
-    // EAMSS TALLY: 0  0  2  2  2  1  0  2  1
-    // X - Earliest instance of Max-Score
-    // <p/>
-    // You must keep track of the maximum EAMSS tally (in this case 2) and the earliest(lowest) cycle at which
-    // it occurs.  If and only if, the max EAMSS tally >= 1 then from there until the end(highest cycle) of the
-    // read reassign these qualities as 2 (the masking quality).  The output qualities would therefore be
-    // transformed from:
-    // <p/>
-    // Original Qualities: 32 32 16 15 8  10 32 2  2    to
-    // Final    Qualities: 32 32 2  2  2  2  2  2  2
-    // X - Earliest instance of max-tally/end of masking
-    // <p/>
-    // IMPORTANT:
-    // The one exception is: If the max EAMSS Tally is preceded by a long string of G basecalls (10 or more, with a single basecall exception per10 bases)
-    // then the masking continues to the beginning of that string of G's. E.g.:
-    // <p/>
-    // Cycle:       1  2  3  4  5  6  7  8   9  10 11 12 13 14 15 16 17 18
-    // Bases:       C  T  A  C  A  G  A  G   G  G  G  G  G  G  G  C  A  T
-    // Qualities:   30 22 26 27 28 30 7  34  20 19 38 15 32 32 10 4  2  5
-    // Cycle Score: -2  0  0  0  0 -2 1  -2  0  0  -2 0  -2 -2  1 1  1  1
-    // EAMSS TALLY: -2 -5 -5 -5 -5 -5 -3 -4 -2 -2  -2 0   0  2  4 3  2  1
-    // X- Earliest instance of Max-Tally
-    // <p/>
-    // Resulting Transformation:
-    // Bases:                C  T  A  C  A  G  A   G   G  G  G  G  G  G  G  C  A  T
-    // Original Qualities:   30 22 26 27 28 30 7  34  20 19 38 15 32 32 10  4  2  5
-    // Final    Qualities:   30 22 26 27 28  2 2   2   2  2  2  2  2  2  2  2  2  2
-    // X- Earliest instance of Max-Tally
-    // X - Start of EAMSS masking due to G-Run
-    // <p/>
-    // To further clarify the exception rule here are a few examples:
-    // A C G A C G G G G G G G G G G G G G G G G G G G G A C T
-    // X - Earliest instance of Max-Tally
-    // X - Start of EAMSS masking (with a two base call jump because we have 20 bases in the run already)
-    // <p/>
-    // T T G G A G G G G G G G G G G G G G G G G G G A G A C T
-    // X - Earliest instance of Max-Tally
-    // X - We can skip this A as well as the earlier A because we have 20 or more bases in the run already
-    // X - Start of EAMSS masking (with a two base call jump because we have 20 bases in the run)
-    // <p/>
-    // T T G G G A A G G G G G G G G G G G G G G G G G G T T A T
-    // X - Earliest instance of Max-Tally
-    // X X - WE can skip these bases because the first A counts as the first skip and as far as the length of the string of G's is
-    // concerned, these are both counted like G's
-    // X - This A is the 20th base in the string of G's and therefore can be skipped
-    // X - Note that the A's previous to the G's are only included because there are G's further on that are within the number
-    // of allowable exceptions away (i.e. 2 in this instance), if there were NO G's after the A's you CANNOT count the A's
-    // as part of the G strings (even if no exceptions have previously occured) In other words, the end of the string of G's
-    // MUST end in a G not an "exception"
-    // <p/>
-    // However, if the max-tally occurs to the right of the run of Gs then this is still part of the string of G's but does count towards
-    // the number of exceptions allowable
-    // (e.g.)
-    // T T G G G G G G G G G G A C G
-    // X - Earliest instance of Max-tally
-    // The first index CAN be considered as an exception, the above would be masked to
-    // the following point:
-    // T T G G G G G G G G G G A C G
-    // X - End of EAMSS masking due to G-Run
-    // <p/>
-    // To sum up the final points, a string of G's CAN START with an exception but CANNOT END in an exception.
-    pub fn run_eamss_on_read(r: &RefRecord) -> Option<usize> {
-        let mut eamss_tally: isize = 0isize;
-        let mut max_tally: isize = isize::MIN;
-        let mut index_of_max: Option<usize> = None;
-
-        for i in (0..r.seq().len()).rev() {
-            eamss_tally = match r.qual()[i] {
-                x if x >= Self::EAMSS_M2_GE_THRESHOLD => eamss_tally - 2,
-                x if x < Self::EAMSS_S1_LT_THRESHOLD => eamss_tally + 1,
-                _ => eamss_tally,
-            };
-            if eamss_tally >= max_tally {
-                index_of_max.replace(i);
-                max_tally = eamss_tally;
-            }
-        }
-
-        if max_tally >= 1 {
-            let mut num_gs = 0;
-            let mut exceptions = 0;
-
-            if let Some(mut i) = index_of_max {
-                loop {
-                    if r.seq()[i] == b'G' {
-                        num_gs += 1;
-                    } else if let Some(skip) = Self::skip_by(i, num_gs, exceptions, r.seq()) {
-                        exceptions += skip;
-                        num_gs += skip;
-                        i -= skip - 1;
-                    } else {
-                        break;
-                    }
-                    if i == 0 {
-                        break;
-                    }
-                    i -= 1;
-                }
-                if num_gs >= 10 {
-                    index_of_max = index_of_max.map(|index| index + 1 - num_gs);
-                }
-            }
-            index_of_max
-        } else {
-            None
-        }
-    }
-
-    pub fn skip_by(
-        index: usize,
-        num_gs: usize,
-        previous_exceptions: usize,
-        bases: &[u8],
+    pub fn left_to_right_quality_deviation_filter(
+        r: &RefRecord,
+        window_size: usize,
+        average_deviation_threshold: usize,
     ) -> Option<usize> {
-        let mut skip = None;
+        let qualities = r.qual();
+        if window_size > qualities.len() {
+            return None;
+        }
+        let mut deviations = Vec::with_capacity(qualities.len() - 1);
+        for i in 0..qualities.len() - 1 {
+            let j = i + 1;
+            deviations.push(u8::abs_diff(qualities[i], qualities[j]));
+        }
+        let maximum_sum = window_size * average_deviation_threshold;
+        let mut summed_deviations: usize =
+            deviations[0..window_size].iter().map(|&v| v as usize).sum();
 
-        for backup in 1..=index {
-            let exception_limit = cmp::max((num_gs + backup) / 10, 1);
-            if previous_exceptions + backup > exception_limit {
-                break;
+        for i in window_size..deviations.len() {
+            if summed_deviations > maximum_sum {
+                for (j, &d) in deviations.iter().enumerate().take(i).skip(i - window_size) {
+                    if d as usize > average_deviation_threshold {
+                        return Some(j + 1);
+                    }
+                }
             }
-            if bases[index - backup] == b'G' {
-                skip = Some(backup);
-                break;
+            if i != deviations.len() - 1 {
+                summed_deviations = summed_deviations + deviations[i + 1] as usize
+                    - deviations[i - window_size] as usize;
             }
         }
-        skip
+        None
     }
 }
 
 impl Iterator for TrimReadIterator {
-    type Item = (bool, OwnedRecord);
+    type Item = OwnedRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(rec) = self.source.next() {
             let next_fq_rec = rec.expect("Unexpected error parsing FASTQs.");
-            let eamss_result = Self::run_eamss_on_read(&next_fq_rec);
-            let mut output_rec = next_fq_rec.to_owned_record();
-            let mut eamss_filtered = false;
-            if let Some(mask_point) = eamss_result {
-                for i in mask_point..output_rec.seq.len() {
-                    output_rec.seq[i] = u8::to_ascii_lowercase(&output_rec.seq[i]);
-                }
-                eamss_filtered = true;
+            let deviation_result = Self::left_to_right_quality_deviation_filter(
+                &next_fq_rec,
+                self.deviation_window_size,
+                self.average_deviation_threshold,
+            );
+            if let Some(mask_point) = deviation_result {
+                Some(OwnedRecord {
+                    head: next_fq_rec.head().to_owned(),
+                    seq: next_fq_rec.seq()[0..mask_point].to_owned(),
+                    qual: next_fq_rec.qual()[0..mask_point].to_owned(),
+                })
+            } else {
+                Some(next_fq_rec.to_owned_record())
             }
-            Some((eamss_filtered, output_rec))
         } else {
             None
         }
@@ -211,29 +97,25 @@ impl Iterator for TrimReadIterator {
 pub(crate) struct QualTrim {
     /// One or two input FASTQ file paths. Number of files provided should match the number of
     /// output files provided.
-    #[clap(long, short = 'i', required = true, num_args = 1..2)]
+    #[clap(long, short = 'i', required = true, num_args = 1..=2)]
     inputs: Vec<PathBuf>,
 
     /// One or two output FASTQ file paths. Number of files provided should match the number of
     /// input files provided.
-    #[clap(long, short = 'o', required = true, num_args = 1..2)]
+    #[clap(long, short = 'o', required = true, num_args = 1..=2)]
     outputs: Vec<PathBuf>,
 
-    ///
-    #[clap(long)]
-    run_eamss: bool,
-
-    ///
-    #[clap(long, required = false)]
-    back_to_front_window_size: Option<usize>,
-
-    ///
-    #[clap(long, required = false)]
-    front_to_back_window_size: Option<usize>,
-
     /// Minimum read length of the output FASTQ reads in order for the reads to be output.
-    #[clap(long, default_value = "1")]
+    #[clap(long, default_value = "1", num_args = 1..=2)]
     min_read_lengths: Vec<usize>,
+
+    ///
+    #[clap(long, default_value = "15")]
+    deviation_window_size: usize,
+
+    ///
+    #[clap(long, default_value = "10")]
+    average_deviation_threshold: usize,
 }
 
 impl QualTrim {
@@ -287,6 +169,14 @@ impl Command for QualTrim {
             "Inputs and outputs should have the same length!"
         );
         assert!(self.inputs.len() <= 2, "Cannot provide more than 2 read files at this time.");
+
+        let mut read_length_mins_sorted = if self.min_read_lengths.len() == 1 {
+            vec![self.min_read_lengths[0]; self.inputs.len()]
+        } else {
+            self.min_read_lengths.clone()
+        };
+        read_length_mins_sorted.sort_unstable();
+
         let (inputs, mut outputs) = self.validate_and_prepare_inputs()?;
 
         let mut fq_sources = inputs
@@ -294,9 +184,8 @@ impl Command for QualTrim {
             .map(|fq| {
                 TrimReadIterator {
                     source: FastqReader::with_capacity(fq, BUFFER_SIZE),
-                    run_eamss: true,
-                    back_to_front_window_size: 5,
-                    front_to_back_window_size: 5,
+                    deviation_window_size: self.deviation_window_size,
+                    average_deviation_threshold: self.average_deviation_threshold,
                 }
                 .read_ahead(1000, 1000)
             })
@@ -317,10 +206,21 @@ impl Command for QualTrim {
                 fq_sources.len(),
                 "FASTQ sources out of sync at records {next_reads:?}"
             );
-            if next_reads.iter().any(|(is_filtered, _read)| *is_filtered) {
-                for (writer, (_is_filtered, read)) in outputs.iter_mut().zip(next_reads.iter()) {
-                    write_to(writer, &read.head, &read.seq, &read.qual)?;
-                }
+
+            let mut observed_read_lengths =
+                next_reads.iter().map(|r| r.seq.len()).collect::<Vec<_>>();
+            observed_read_lengths.sort_unstable();
+
+            if observed_read_lengths
+                .iter()
+                .zip(read_length_mins_sorted.iter())
+                .any(|(&observed, &minimum)| observed < minimum)
+            {
+                continue;
+            }
+
+            for (writer, read) in outputs.iter_mut().zip(next_reads.iter()) {
+                write_to(writer, &read.head, &read.seq, &read.qual)?;
             }
         }
         Ok(())
