@@ -15,37 +15,61 @@ use std::io::Write;
 use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
 
-/// Type alias to prevent clippy complaining about type complexity
+/// Type aliases to prevent clippy complaining about type complexity
 type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 type VecOfWriters = Vec<BufWriter<Box<dyn Write + Send>>>;
+/// The buffer size to use for readers and writers
 const BUFFER_SIZE: usize = 1024 * 1024;
 
 struct TrimReadIterator {
+    /// The FASTQ file that is being read from by ``Self``.
     source: FastqReader<Box<dyn BufRead + Send>>,
+    /// The window size over which to look for deviations in qualities.
     deviation_window_size: usize,
+    /// The average deviation threshold above which to begin trimming.
     average_deviation_threshold: usize,
+    /// The quality value below which transitions in quality of delta == 0 will be ignored when
+    /// calculating average deviations
+    lower_threshold_mask: usize,
 }
 impl TrimReadIterator {
+    /// Filters reads for large changes in quality scores that can occur towards the end of long
+    /// Illumina reads.
+    /// TODO - expand this documentation
     pub fn left_to_right_quality_deviation_filter(
         r: &RefRecord,
         window_size: usize,
         average_deviation_threshold: usize,
+        lower_threshold_mask: usize,
     ) -> Option<usize> {
         let qualities = r.qual();
         if window_size > qualities.len() {
             return None;
         }
         let mut deviations = Vec::with_capacity(qualities.len() - 1);
+        let mut deviation_masks = Vec::with_capacity(qualities.len() - 1);
         for i in 0..qualities.len() - 1 {
             let j = i + 1;
             deviations.push(u8::abs_diff(qualities[i], qualities[j]));
+            if deviations[i] == 0 && qualities[i] as usize <= lower_threshold_mask {
+                deviation_masks.push(0usize);
+            } else {
+                deviation_masks.push(1usize);
+            }
         }
-        let maximum_sum = window_size * average_deviation_threshold;
+        let mut maximum_sums = vec![0; window_size + 1];
+        for i in 0..=window_size {
+            maximum_sums.push(i * average_deviation_threshold);
+        }
+
         let mut summed_deviations: usize =
             deviations[0..window_size].iter().map(|&v| v as usize).sum();
+        let mut number_valid_transitions: usize = deviation_masks[0..window_size].iter().sum();
 
         for i in window_size..deviations.len() {
-            if summed_deviations > maximum_sum {
+            if number_valid_transitions > 0
+                && summed_deviations > maximum_sums[number_valid_transitions]
+            {
                 for (j, &d) in deviations.iter().enumerate().take(i).skip(i - window_size) {
                     if d as usize > average_deviation_threshold {
                         return Some(j + 1);
@@ -55,6 +79,8 @@ impl TrimReadIterator {
             if i != deviations.len() - 1 {
                 summed_deviations = summed_deviations + deviations[i + 1] as usize
                     - deviations[i - window_size] as usize;
+                number_valid_transitions = number_valid_transitions + deviation_masks[i + 1]
+                    - deviation_masks[i - window_size];
             }
         }
         None
@@ -71,6 +97,7 @@ impl Iterator for TrimReadIterator {
                 &next_fq_rec,
                 self.deviation_window_size,
                 self.average_deviation_threshold,
+                self.lower_threshold_mask,
             );
             if let Some(mask_point) = deviation_result {
                 Some(OwnedRecord {
@@ -92,6 +119,7 @@ impl Iterator for TrimReadIterator {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Performs quality trimming on FASTQs.
+/// TODO - flesh out this documentation
 #[derive(Parser, Debug)]
 #[command(version)]
 pub(crate) struct QualTrim {
@@ -109,13 +137,20 @@ pub(crate) struct QualTrim {
     #[clap(long, default_value = "1", num_args = 1..=2)]
     min_read_lengths: Vec<usize>,
 
-    ///
+    /// The window size to use when filtering based on quality score oscilations that occur in
+    /// longer illumina reads
     #[clap(long, default_value = "15")]
     deviation_window_size: usize,
 
-    ///
+    /// The average deviation at which a the sliding deviation window will be trimmed from the
+    /// output reads.
     #[clap(long, default_value = "10")]
     average_deviation_threshold: usize,
+
+    /// The quality score below which transitions between qualities that result in a quality score
+    /// deviation of zero will be masked when calculating average deviation.
+    #[clap(long, default_value = "2")]
+    lower_threshold_mask: usize,
 }
 
 impl QualTrim {
@@ -186,6 +221,7 @@ impl Command for QualTrim {
                     source: FastqReader::with_capacity(fq, BUFFER_SIZE),
                     deviation_window_size: self.deviation_window_size,
                     average_deviation_threshold: self.average_deviation_threshold,
+                    lower_threshold_mask: self.lower_threshold_mask,
                 }
                 .read_ahead(1000, 1000)
             })
