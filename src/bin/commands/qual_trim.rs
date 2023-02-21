@@ -20,6 +20,9 @@ type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 type VecOfWriters = Vec<BufWriter<Box<dyn Write + Send>>>;
 /// The buffer size to use for readers and writers
 const BUFFER_SIZE: usize = 1024 * 1024;
+/// Amount to subtract from quality reported by ``seq_io`` to get properly encoded PHRED scaled
+/// qualities, since ``seq_io`` doesn't adjust for this in their encodings.
+const QUALITY_SCORE_OFFSET: usize = 33;
 
 struct TrimReadIterator {
     /// The FASTQ file that is being read from by ``Self``.
@@ -42,6 +45,7 @@ impl TrimReadIterator {
         average_deviation_threshold: usize,
         lower_threshold_mask: usize,
     ) -> Option<usize> {
+        let qual_threshold = lower_threshold_mask + QUALITY_SCORE_OFFSET;
         let qualities = r.qual();
         if window_size > qualities.len() {
             return None;
@@ -51,7 +55,7 @@ impl TrimReadIterator {
         for i in 0..qualities.len() - 1 {
             let j = i + 1;
             deviations.push(u8::abs_diff(qualities[i], qualities[j]));
-            if deviations[i] == 0 && qualities[i] as usize <= lower_threshold_mask {
+            if deviations[i] == 0 && qualities[i] as usize <= qual_threshold {
                 deviation_masks.push(0usize);
             } else {
                 deviation_masks.push(1usize);
@@ -67,9 +71,7 @@ impl TrimReadIterator {
         let mut number_valid_transitions: usize = deviation_masks[0..window_size].iter().sum();
 
         for i in window_size..deviations.len() {
-            if number_valid_transitions > 0
-                && summed_deviations > maximum_sums[number_valid_transitions]
-            {
+            if summed_deviations > maximum_sums[number_valid_transitions] {
                 for (j, &d) in deviations.iter().enumerate().take(i).skip(i - window_size) {
                     if d as usize > average_deviation_threshold {
                         return Some(j + 1);
