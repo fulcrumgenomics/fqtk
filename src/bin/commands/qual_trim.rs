@@ -15,17 +15,24 @@ use std::io::Write;
 use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
 
-/// Type alias to prevent clippy complaining about type complexity
+/// Type aliases to prevent clippy complaining about type complexity
 type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 type VecOfWriters = Vec<BufWriter<Box<dyn Write + Send>>>;
+/// The buffer size to use for readers and writers
 const BUFFER_SIZE: usize = 1024 * 1024;
 
 struct TrimReadIterator {
+    /// The FASTQ file that is being read from by ``Self``.
     source: FastqReader<Box<dyn BufRead + Send>>,
+    /// The window size over which to look for deviations in qualities.
     deviation_window_size: usize,
+    /// The average deviation threshold above which to begin trimming.
     average_deviation_threshold: usize,
 }
 impl TrimReadIterator {
+    /// Filters reads for large changes in quality scores that can occur towards the end of long
+    /// Illumina reads.
+    /// TODO - expand this documentation
     pub fn left_to_right_quality_deviation_filter(
         r: &RefRecord,
         window_size: usize,
@@ -41,6 +48,7 @@ impl TrimReadIterator {
             deviations.push(u8::abs_diff(qualities[i], qualities[j]));
         }
         let maximum_sum = window_size * average_deviation_threshold;
+
         let mut summed_deviations: usize =
             deviations[0..window_size].iter().map(|&v| v as usize).sum();
 
@@ -92,6 +100,7 @@ impl Iterator for TrimReadIterator {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Performs quality trimming on FASTQs.
+/// TODO - flesh out this documentation
 #[derive(Parser, Debug)]
 #[command(version)]
 pub(crate) struct QualTrim {
@@ -109,11 +118,13 @@ pub(crate) struct QualTrim {
     #[clap(long, default_value = "1", num_args = 1..=2)]
     min_read_lengths: Vec<usize>,
 
-    ///
+    /// The window size to use when filtering based on quality score oscilations that occur in
+    /// longer illumina reads
     #[clap(long, default_value = "15")]
     deviation_window_size: usize,
 
-    ///
+    /// The average deviation at which a the sliding deviation window will be trimmed from the
+    /// output reads.
     #[clap(long, default_value = "10")]
     average_deviation_threshold: usize,
 }
