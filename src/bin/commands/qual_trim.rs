@@ -57,7 +57,7 @@ impl TrimReadIterator {
                 deviation_masks.push(1usize);
             }
         }
-        let mut maximum_sums = vec![0; window_size + 1];
+        let mut maximum_sums = Vec::with_capacity(window_size + 1);
         for i in 0..=window_size {
             maximum_sums.push(i * average_deviation_threshold);
         }
