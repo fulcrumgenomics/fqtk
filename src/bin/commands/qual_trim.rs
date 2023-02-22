@@ -21,6 +21,10 @@ type VecOfWriters = Vec<BufWriter<Box<dyn Write + Send>>>;
 /// The buffer size to use for readers and writers
 const BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Amount to subtract from quality reported by ``seq_io`` to get properly encoded PHRED scaled
+/// qualities, since ``seq_io`` doesn't adjust for this in their encodings.
+const QUALITY_SCORE_OFFSET: usize = 33;
+
 struct TrimReadIterator {
     /// The FASTQ file that is being read from by ``Self``.
     source: FastqReader<Box<dyn BufRead + Send>>,
