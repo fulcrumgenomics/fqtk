@@ -191,7 +191,7 @@ impl ReadSet {
                 // check to see if there's a real sample barcode on the back
                 let sep_count = chars.iter().filter(|c| **c == Self::COLON).count();
                 if sep_count != 3 {
-                    writer.write_all(chars);
+                    writer.write_all(chars)?;
                 } else {
                     let first_colon_idx = chars.iter().position(|ch| *ch == Self::COLON).unwrap();
 
