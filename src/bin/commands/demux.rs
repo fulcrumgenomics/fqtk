@@ -190,25 +190,24 @@ impl ReadSet {
                 // Else check it's a 4-part name... fix the read number at the front and
                 // check to see if there's a real sample barcode on the back
                 let sep_count = chars.iter().filter(|c| **c == Self::COLON).count();
-                ensure!(
-                    sep_count == 3,
-                    "Comment in did not have 4 segments: {}",
-                    String::from_utf8(header.to_vec())?
-                );
-                let first_colon_idx = chars.iter().position(|ch| *ch == Self::COLON).unwrap();
-
-                // Illumina, in the unmatched FASTQs, can place a "0" in the index position, sigh
-                let remainder = if chars.last().unwrap().is_ascii_digit() {
-                    &chars[first_colon_idx + 1..chars.len() - 1]
+                if sep_count != 3 {
+                    writer.write_all(chars);
                 } else {
-                    &chars[first_colon_idx + 1..chars.len()]
-                };
+                    let first_colon_idx = chars.iter().position(|ch| *ch == Self::COLON).unwrap();
 
-                write!(writer, "{}:", read_num)?;
-                writer.write_all(remainder)?;
+                    // Illumina, in the unmatched FASTQs, can place a "0" in the index position, sigh
+                    let remainder = if chars.last().unwrap().is_ascii_digit() {
+                        &chars[first_colon_idx + 1..chars.len() - 1]
+                    } else {
+                        &chars[first_colon_idx + 1..chars.len()]
+                    };
 
-                if *remainder.last().unwrap() != Self::COLON {
-                    writer.write_all(&[Self::PLUS])?;
+                    write!(writer, "{}:", read_num)?;
+                    writer.write_all(remainder)?;
+                    
+                    if *remainder.last().unwrap() != Self::COLON {
+                        writer.write_all(&[Self::PLUS])?;
+                    }
                 }
             }
         }
