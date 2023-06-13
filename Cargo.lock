@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "fqtk"
-version = "0.2.2-rc.1"
+version = "0.2.2"
 dependencies = [
  "ahash",
  "anyhow",
