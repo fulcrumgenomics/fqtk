@@ -1,13 +1,9 @@
+use super::byte_is_nocall;
 use ahash::HashMap as AHashMap;
 use ahash::HashMapExt;
 use bstr::{BString, ByteSlice};
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
-
-/// Checks whether a given u8 byte is a "No-call"-ed base, signified by the bytes 'N', 'n' and '.'
-fn byte_is_nocall(byte: u8) -> bool {
-    byte == b'N' || byte == b'n' || byte == b'.'
-}
 
 /// The struct that contains the info related to the best and next best sample barcode match.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -177,24 +173,6 @@ mod tests {
     fn test_barcode_matcher_fails_if_empty_sample_barcode_provided(#[case] use_cache: bool) {
         let sample_barcodes = vec!["AGCT", ""];
         let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1, use_cache);
-    }
-
-    // ############################################################################################
-    // Test byte_is_no_call
-    // ############################################################################################
-    #[test]
-    fn test_byte_is_no_call() {
-        assert!(byte_is_nocall(b'N'));
-        assert!(byte_is_nocall(b'n'));
-        assert!(byte_is_nocall(b'.'));
-        assert!(!byte_is_nocall(b'A'));
-        assert!(!byte_is_nocall(b'C'));
-        assert!(!byte_is_nocall(b'G'));
-        assert!(!byte_is_nocall(b'T'));
-        assert!(!byte_is_nocall(b'a'));
-        assert!(!byte_is_nocall(b'c'));
-        assert!(!byte_is_nocall(b'g'));
-        assert!(!byte_is_nocall(b't'));
     }
 
     // ############################################################################################
