@@ -468,7 +468,7 @@ impl DemuxMetric {
 ///
 /// An observed barcode matches an expected barcocde if all the following are true:
 /// 1. The number of mismatches (edits/substitutions) is less than or equal to the maximum 
-///.   mismatches (see `--max-mismatches`).
+///    mismatches (see `--max-mismatches`).
 /// 2. The difference between number of mismatches in the best and second best barcodes is greater
 ///    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
 /// The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
