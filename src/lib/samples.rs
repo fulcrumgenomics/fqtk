@@ -1,3 +1,4 @@
+use super::is_valid_base;
 use anyhow::Result;
 use fgoxide::io::DelimFile;
 use itertools::Itertools;
@@ -9,11 +10,6 @@ use std::fmt::{self, Display};
 use std::path::Path;
 
 const DEFAULT_FILE_DELIMETER: u8 = b'\t';
-
-/// Checks whether a provided byte is an A, G, C, or T.
-fn is_valid_base(byte: u8) -> bool {
-    byte == b'A' || byte == b'C' || byte == b'G' || byte == b'T'
-}
 
 /// Struct for describing a single sample and metadata associated with that sample.
 #[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
@@ -207,6 +203,14 @@ mod tests {
         assert!(samples_metadata.samples[1].barcode == "CATGCTA");
     }
 
+    #[test]
+    fn test_new_sample_non_agct_bases_in_barcode_allowed() {
+        let name = "s_1_example_name".to_owned();
+        let barcode = "GATTANN".to_owned();
+        let ordinal = 0;
+        let _sample = Sample::new(ordinal, name, barcode);
+    }
+
     // ############################################################################################
     // Test [`SampleGroup::from_file`] - Expected to panic
     // ############################################################################################
@@ -266,24 +270,6 @@ mod tests {
     }
 
     // ############################################################################################
-    // Test is_valid_base
-    // ############################################################################################
-    #[test]
-    fn test_is_valid_base() {
-        assert!(!is_valid_base(b'N'));
-        assert!(!is_valid_base(b'n'));
-        assert!(!is_valid_base(b'.'));
-        assert!(!is_valid_base(b'a'));
-        assert!(!is_valid_base(b'c'));
-        assert!(!is_valid_base(b'g'));
-        assert!(!is_valid_base(b't'));
-        assert!(is_valid_base(b'A'));
-        assert!(is_valid_base(b'C'));
-        assert!(is_valid_base(b'G'));
-        assert!(is_valid_base(b'T'));
-    }
-
-    // ############################################################################################
     // Test [`Sample::new`] - Expected to pass
     // ############################################################################################
     #[test]
@@ -317,15 +303,6 @@ mod tests {
     fn test_new_sample_fail2_empty_barcode() {
         let name = "s_1_example_name".to_owned();
         let barcode = String::new();
-        let ordinal = 0;
-        let _sample = Sample::new(ordinal, name, barcode);
-    }
-
-    #[test]
-    #[should_panic(expected = "All sample barcode bases must be one of A, C, G, or T")]
-    fn test_new_sample_fail3_non_agct_bases_in_barcode() {
-        let name = "s_1_example_name".to_owned();
-        let barcode = "GATTANN".to_owned();
         let ordinal = 0;
         let _sample = Sample::new(ordinal, name, barcode);
     }

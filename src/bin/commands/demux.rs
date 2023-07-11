@@ -466,6 +466,15 @@ impl DemuxMetric {
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
 /// sample barcodes extracted from the bases in the sample metadata and associated read structures.
 ///
+/// An observed barcode matches an expected barcocde if all the following are true:
+/// 1. The number of mismatches (edits/substitutions) is less than or equal to the maximum 
+///    mismatches (see `--max-mismatches`).
+/// 2. The difference between number of mismatches in the best and second best barcodes is greater
+///    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
+/// The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
+/// of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
+/// both the observed barcodes `AAA` and `AAN`).
+///
 /// ## Outputs
 ///
 /// All outputs are generated in the provided `--output` directory.  For each sample plus the
