@@ -325,8 +325,8 @@ impl<W: Write> SampleWriters<W> {
     fn write(&mut self, read_set: &ReadSet) -> Result<()> {
         for (writers_opt, segments) in [
             (&mut self.template_writers, &mut read_set.template_segments()),
-            (&mut self.sample_barcode_writers, &mut read_set.template_segments()),
-            (&mut self.molecular_barcode_writers, &mut read_set.template_segments()),
+            (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
+            (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
@@ -1183,6 +1183,83 @@ mod tests {
                 head: b"ex_0 1:N:0:AAAAAAAAGATTACAGA".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_output_type_reads() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("10M8B100T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let s1_umi = "ATCGATCGAT";
+        let sample_metadata = metadata_file(
+            &tmp,
+            &[s1_barcode, "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"],
+        );
+        let input_files =
+            vec![fastq_file(&tmp, "ex", "ex", &[&(s1_umi.to_owned() + &*s1_barcode.to_owned() + &"A".repeat(100))])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B', 'M'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let barcode_output_path = output_dir.join("Sample0000.I1.fq.gz");
+        let umi_output_path = output_dir.join("Sample0000.U1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        let barcode_fq_reads = read_fastq(&barcode_output_path);
+        let umi_fq_reads = read_fastq(&umi_output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: "A".repeat(100).as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+
+        assert_eq!(barcode_fq_reads.len(), 1);
+        assert_equal(
+            &barcode_fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: b"AAAAAAAA".to_vec(),
+                qual: ";".repeat(8).as_bytes().to_vec(),
+            },
+        );
+
+        assert_eq!(barcode_fq_reads.len(), 1);
+        assert_equal(
+            &barcode_fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: b"AAAAAAAA".to_vec(),
+                qual: ";".repeat(8).as_bytes().to_vec(),
+            },
+        );
+
+        assert_eq!(umi_fq_reads.len(), 1);
+        assert_equal(
+            &umi_fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: b"ATCGATCGAT".to_vec(),
+                qual: ";".repeat(10).as_bytes().to_vec(),
             },
         );
     }
