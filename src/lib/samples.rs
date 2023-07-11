@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_sample_non_agct_bases_in_barcode() {
+    fn test_new_sample_non_agct_bases_in_barcode_allowed() {
         let name = "s_1_example_name".to_owned();
         let barcode = "GATTANN".to_owned();
         let ordinal = 0;
