@@ -605,8 +605,8 @@ pub(crate) struct Demux {
     /// Skip demultiplexing reads for any of the following reasons, otherwise panic.
     ///
     /// 1. `too-few-bases`: there are too few bases or qualities to extract given the read
-    ///    structures.  For example, if the read is 8bp long but the read structure is `10B`, or
-    ///    if the read is empty and the read structure is `+T`.
+    ///    structures.  For example, if a read is 8bp long but the read structure is `10B`, or
+    ///    if a read is empty and the read structure is `+T`.
     #[clap(long, short = 'S')]
     skip_reasons: Vec<SkipReason>,
 }
