@@ -273,7 +273,7 @@ struct ReadSetIterator {
     /// The file containing FASTQ records.
     source: FastqReader<Box<dyn BufRead + Send>>,
     /// Valid reasons for skipping reads, otherwise panic!
-    skip_reasons: HashSet<SkipReason>,
+    skip_reasons: Vec<SkipReason>,
 }
 
 impl Iterator for ReadSetIterator {
@@ -286,18 +286,28 @@ impl Iterator for ReadSetIterator {
             let read_name = next_fq_rec.head();
             let bases = next_fq_rec.seq();
             let quals = next_fq_rec.qual();
-            for (read_segment_index, read_segment) in self.read_structure.iter().enumerate() {
-                // Check that we have enough bases for this segment. For variable length segments,
-                // we must have at least one base.
-                if self.skip_reasons.contains(&SkipReason::TooFewBases)
-                    && bases.len() < read_segment.length().unwrap_or(1)
-                {
+
+            // Check that we have enough bases for this segment. For variable length segments,
+            // we must have at least one base.
+            let min_len = self.read_structure.iter().map(|s| s.length().unwrap_or(1)).sum();
+            if bases.len() < min_len {
+                if self.skip_reasons.contains(&SkipReason::TooFewBases) {
                     return Some(ReadSet {
                         header: read_name.to_vec(),
                         segments: vec![],
                         skip_reason: Some(SkipReason::TooFewBases),
                     });
                 }
+                panic!(
+                    "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
+                    String::from_utf8(read_name.to_vec()).unwrap(),
+                    bases.len(),
+                    min_len,
+                    self.read_structure
+                );
+            }
+
+            for (read_segment_index, read_segment) in self.read_structure.iter().enumerate() {
                 // Extract the bases and qualities for this segment
                 let (seq, quals) =
                     read_segment.extract_bases_and_quals(bases, quals).unwrap_or_else(|e| {
@@ -332,7 +342,7 @@ impl ReadSetIterator {
     pub fn new(
         read_structure: ReadStructure,
         source: FastqReader<Box<dyn BufRead + Send>>,
-        skip_reasons: HashSet<SkipReason>,
+        skip_reasons: Vec<SkipReason>,
     ) -> Self {
         Self { read_structure, source, skip_reasons }
     }
@@ -878,12 +888,8 @@ impl Command for Demux {
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone().into_iter())
             .map(|(source, read_structure)| {
-                ReadSetIterator::new(
-                    read_structure,
-                    source,
-                    self.skip_reasons.iter().copied().collect::<HashSet<_>>(),
-                )
-                .read_ahead(1000, 1000)
+                ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
+                    .read_ahead(1000, 1000)
             })
             .collect::<Vec<_>>();
 
@@ -1725,6 +1731,45 @@ mod tests {
             sample_metadata,
             output_types: vec!['T'],
             output: tmp.path().to_path_buf(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Read ex_2 had too few bases to demux 0 vs. 1 needed in read structure +T."
+    )]
+    fn test_fails_if_reads_too_short() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures =
+            vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("7B").unwrap()];
+
+        let records = vec![
+            vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
+            vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
+            vec!["", SAMPLE1_BARCODE],               // template basese too short
+            vec!["G", SAMPLE1_BARCODE],              // barcode the correct length
+        ];
+
+        let input_files = vec![
+            fastq_file(&tmp, "read1", "ex", &[records[0][0], records[1][0], records[2][0]]),
+            fastq_file(&tmp, "index1", "ex", &[records[0][1], records[1][1], records[2][1]]),
+        ];
+        let sample_metadata = metadata(&tmp);
+        let output_dir: PathBuf = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B'],
+            output: output_dir.clone(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
