@@ -87,6 +87,11 @@ impl BarcodeMatcher {
         u8::try_from(count).expect("Overflow on number of mismatch bases")
     }
 
+    /// Returns the expected barcode length, assuming a fixed length for all samples.
+    fn expected_barcode_length(&self) -> usize {
+        self.sample_barcodes[0].len()
+    }
+
     /// Assigns the barcode that best matches the provided ``read_bases``.
     #[must_use]
     fn assign_internal(&self, read_bases: &[u8]) -> Option<BarcodeMatch> {
@@ -122,6 +127,10 @@ impl BarcodeMatcher {
     /// if configured to do so and skipping calculation for reads that cannot match any barcode (
     /// due to having too many no-called bases).
     pub fn assign(&mut self, read_bases: &[u8]) -> Option<BarcodeMatch> {
+        // do not try matching if there are not enough bases
+        if read_bases.len() < self.expected_barcode_length() {
+            return None;
+        }
         let num_no_calls = read_bases.iter().filter(|&&b| byte_is_nocall(b)).count();
         if num_no_calls > self.max_mismatches as usize {
             None
