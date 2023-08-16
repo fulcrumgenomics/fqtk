@@ -1,4 +1,5 @@
 pub mod barcode_matching;
+pub mod pair_overlap;
 pub mod samples;
 
 /// Checks whether a given u8 byte is a "No-call"-ed base, signified by the bytes 'N', 'n' and '.'
