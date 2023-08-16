@@ -38,7 +38,7 @@ impl PairOverlap {
         r1: &mut OwnedRecord,
         r2: &mut OwnedRecord,
         bq_delta: u8,
-        drop_adapter: bool,
+        clip_adapter: bool,
     ) {
         // NOTE: copying everything for now. This is not ideal but simplifies code.
         // Only applies to subset of reads that actually overlap.
@@ -76,11 +76,11 @@ impl PairOverlap {
         if self.adapter {
             std::mem::swap(&mut r1_seq, &mut r2_seq);
             std::mem::swap(&mut r1_quals, &mut r2_quals);
-            if drop_adapter {
-                // drop right end of r1
+            if clip_adapter {
+                // clip right end of r1
                 r1_seq = r1_seq[..r1_seq.len() - self.shift].to_vec();
                 r1_quals = r1_quals[..r1_quals.len() - self.shift].to_vec();
-                // we're still reversed here, so we also drop of left end of r2
+                // we're still reversed here, so we also clip of left end of r2
                 r2_seq = r2_seq[self.shift..].to_vec();
                 r2_quals = r2_quals[self.shift..].to_vec();
             }
