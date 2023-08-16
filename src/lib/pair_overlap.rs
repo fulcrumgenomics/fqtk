@@ -99,12 +99,12 @@ fn reverse_complement(s: &[u8]) -> Vec<u8> {
 }
 
 /// find overlap given the sequence of a pair of reads.
+/// max_overlap_error_rate of e.g. 0.1 means that we allow 1 error per 10 bases of overlap.
 pub fn find_overlap(
     s1: &[u8],
     s2: &[u8],
     min_overlap: usize,
-    // TODO: add max_overlap_error_rate param.
-    max_diffs: usize,
+    max_overlap_error_rate: f64,
 ) -> Option<PairOverlap> {
     // note that it's possible to do this without allocating, but then we must (re)complement many times.
     let s2 = s2.iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
@@ -112,6 +112,7 @@ pub fn find_overlap(
     'shift_loop: for shift in 0..s1.len() - min_overlap {
         let mut diffs = 0;
         let overlap_len = (s1.len() - shift).min(s2.len());
+        let max_diffs = (overlap_len as f64 * max_overlap_error_rate).floor() as usize;
         for i in 0..overlap_len {
             if s1[i + shift] != s2[i] {
                 diffs += 1;
@@ -129,6 +130,7 @@ pub fn find_overlap(
     'shift_loop: for shift in 0..s2.len() - min_overlap {
         let mut diffs = 0;
         let overlap_len = (s2.len() - shift).min(s1.len());
+        let max_diffs = (overlap_len as f64 * max_overlap_error_rate).floor() as usize;
         for i in 0..overlap_len {
             if s1[i] != s2[i + shift] {
                 diffs += 1;
@@ -161,7 +163,7 @@ mod tests {
         // s2:        AAAAAGGC
         let r1 = b"ACGAAAAA";
         let r2 = b"AAAAAGGC".iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
-        let overlap = find_overlap(r1, &r2, 4, 0);
+        let overlap = find_overlap(r1, &r2, 4, 0f64);
         assert_eq!(overlap, Some(PairOverlap { shift: 3, overlap: 5, diffs: 0, adapter: false }));
     }
 
@@ -178,7 +180,7 @@ mod tests {
         // s2:  ACGAAAAA
         let r1 = b"AAAAAGGC";
         let r2 = b"ACGAAAAA".iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
-        let overlap = find_overlap(r1, &r2, 4, 0);
+        let overlap = find_overlap(r1, &r2, 4, 0f64);
         assert_eq!(overlap, Some(PairOverlap { shift: 3, overlap: 5, diffs: 0, adapter: true }));
     }
 
