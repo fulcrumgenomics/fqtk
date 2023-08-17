@@ -4,7 +4,7 @@ use clap::Parser;
 use fgoxide::io::Io;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
-use seq_io::fastq::Reader as FastqReader;
+use seq_io::fastq::{OwnedRecord, Reader as FastqReader, Record};
 use std::fs::{self, File};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
@@ -60,7 +60,9 @@ struct TrimIO {
 }
 
 impl Trimmer {
-    fn prepare(&self) -> Result<TrimIO, Error> {
+    fn prepare(
+        &self,
+    ) -> Result<(Pool, Vec<PooledWriter>, Vec<FastqReader<Box<dyn BufRead + Send>>>), Error> {
         if !self.output.exists() {
             info!("Output directory {:#?} didn't exist, creating it.", self.output);
             fs::create_dir_all(&self.output)?;
@@ -96,19 +98,26 @@ impl Trimmer {
         // and https://github.com/fulcrumgenomics/fqtk/blob/ae91e90ecc86826fc632837bb982798a7e6b6f7a/src/bin/commands/demux.rs#L804
         // and https://github.com/fulcrumgenomics/fqtk/blob/ae91e90ecc86826fc632837bb982798a7e6b6f7a/src/bin/commands/demux.rs#L850-L851
         // for reader
-        Ok(TrimIO { pool, writers: pooled_writers, readers: fq_readers })
+        Ok((pool, pooled_writers, fq_readers))
     }
 }
 
 impl Command for Trimmer {
     fn execute(&self) -> Result<()> {
-        let mut trim_io = self.prepare()?;
+        let (mut pool, mut writers, mut readers) = self.prepare()?;
+        let f1 = readers.remove(0);
+        let f2 = readers.remove(0);
 
-        writeln!(trim_io.writers[0], "Hello, world!")?;
-        _ = trim_io.readers[0].next();
+        for (r1, r2) in f1.into_records().zip(f2.into_records()) {
+            let r1 = r1?;
+            let r2 = r2?;
+            r1.write(&mut writers[0])?;
+            r2.write(&mut writers[0])?;
+        }
 
-        trim_io.writers.into_iter().try_for_each(|w| w.close())?;
-        trim_io.pool.stop_pool()?;
+        writers.into_iter().try_for_each(|w| w.close())?;
+        pool.stop_pool()?;
+
         Ok(())
     }
 }
