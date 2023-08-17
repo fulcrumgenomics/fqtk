@@ -2,18 +2,19 @@ use crate::commands::command::Command;
 use anyhow::{Error, Result};
 use clap::Parser;
 use fgoxide::io::Io;
+use fqtk_lib::pair_overlap;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
-use seq_io::fastq::{OwnedRecord, Reader as FastqReader, Record};
+use seq_io::fastq::{Reader as FastqReader, Record};
 use std::fs::{self, File};
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufWriter};
 use std::path::Path;
 use std::path::PathBuf;
 
 /// Trimming and overlap correction of paired-end reads
 #[derive(Parser, Debug)]
 #[command(version)]
-pub(crate) struct Trimmer {
+pub(crate) struct TrimmerOpts {
     /// Reading/Writing threads
     #[clap(long, short = 't', default_value = "5")]
     threads: usize,
@@ -25,7 +26,7 @@ pub(crate) struct Trimmer {
     /// Minimum difference in base-quality for one read to correct an overlapping
     /// base from the other read.
     #[clap(long, short = 'd', default_value = "15")]
-    overlap_min_bq_delta: usize,
+    overlap_min_bq_delta: u8,
 
     /// Minimum pair overlap length to attempt correction.
     #[clap(long, short = 'l', default_value = "50")]
@@ -48,21 +49,14 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Type alias to prevent clippy complaining about type complexity
 type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
+type VecOfFqReaders = Vec<FastqReader<Box<dyn BufRead + Send>>>;
 
 fn create_writer<P: AsRef<Path>>(name: P) -> Result<BufWriter<File>, Error> {
     Ok(BufWriter::new(File::create(name)?))
 }
 
-struct TrimIO {
-    pool: Pool,
-    writers: Vec<PooledWriter>,
-    readers: Vec<FastqReader<Box<dyn BufRead + Send>>>,
-}
-
-impl Trimmer {
-    fn prepare(
-        &self,
-    ) -> Result<(Pool, Vec<PooledWriter>, Vec<FastqReader<Box<dyn BufRead + Send>>>), Error> {
+impl TrimmerOpts {
+    fn prepare(&self) -> Result<(Pool, Vec<PooledWriter>, VecOfFqReaders), Error> {
         if !self.output.exists() {
             info!("Output directory {:#?} didn't exist, creating it.", self.output);
             fs::create_dir_all(&self.output)?;
@@ -102,17 +96,28 @@ impl Trimmer {
     }
 }
 
-impl Command for Trimmer {
+impl Command for TrimmerOpts {
     fn execute(&self) -> Result<()> {
         let (mut pool, mut writers, mut readers) = self.prepare()?;
         let f1 = readers.remove(0);
         let f2 = readers.remove(0);
 
         for (r1, r2) in f1.into_records().zip(f2.into_records()) {
-            let r1 = r1?;
-            let r2 = r2?;
+            let mut r1 = r1?;
+            let mut r2 = r2?;
+
+            if let Some(overlap) = pair_overlap::find_overlap(
+                r1.seq(),
+                r2.seq(),
+                self.overlap_min_len,
+                self.overlap_max_error_rate,
+            ) {
+                // TODO: accept and modify stats.
+                overlap.correct(&mut r1, &mut r2, self.overlap_min_bq_delta, true);
+            }
+
             r1.write(&mut writers[0])?;
-            r2.write(&mut writers[0])?;
+            r2.write(&mut writers[1])?;
         }
 
         writers.into_iter().try_for_each(|w| w.close())?;
