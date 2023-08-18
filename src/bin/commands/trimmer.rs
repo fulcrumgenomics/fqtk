@@ -45,12 +45,12 @@ pub(crate) struct TrimmerOpts {
     overlap_max_error_rate: f64,
 
     /// The output directory into which to FASTQs.
-    #[clap(long, short = 'o', required = true)]
-    output: PathBuf,
+    #[clap(long, short = 'o', required = true, num_args = 2)]
+    output: Vec<PathBuf>,
 
-    /// Fastq file for Read1 and Read2
-    #[clap(required = true, num_args = 2)]
-    fastqs: Vec<PathBuf>,
+    /// Fastqs file for Read1 and Read2
+    #[clap(long, short = 'i', required = true, num_args = 2)]
+    input: Vec<PathBuf>,
 }
 
 const BUFFER_SIZE: usize = 1024 * 1024;
@@ -65,14 +65,9 @@ fn create_writer<P: AsRef<Path>>(name: P) -> Result<BufWriter<File>, Error> {
 
 impl TrimmerOpts {
     fn prepare(&self) -> Result<(Pool, Vec<PooledWriter>, VecOfFqReaders), Error> {
-        if !self.output.exists() {
-            info!("Output directory {:#?} didn't exist, creating it.", self.output);
-            fs::create_dir_all(&self.output)?;
-        }
-
         let fgio = Io::new(5, BUFFER_SIZE);
         let fq_readers = self
-            .fastqs
+            .input
             .iter()
             .map(|p| fgio.new_reader(p))
             .collect::<Result<VecOfReaders, fgoxide::FgError>>()?;
@@ -80,10 +75,7 @@ impl TrimmerOpts {
         let fq_readers =
             fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE)).collect();
 
-        let writers = vec![
-            create_writer(&self.output.join("reads_1.fq.gz"))?,
-            create_writer(&self.output.join("reads_2.fq.gz"))?,
-        ];
+        let writers = vec![create_writer(&self.output[0])?, create_writer(&self.output[1])?];
 
         let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
             .threads(self.threads)
