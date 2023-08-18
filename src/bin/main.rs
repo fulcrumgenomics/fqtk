@@ -5,7 +5,7 @@ pub mod commands;
 use anyhow::Result;
 use clap::Parser;
 use commands::command::Command;
-use commands::{demux::Demux, trimmer::Trimmer};
+use commands::{demux::Demux, trimmer::TrimmerOpts};
 use enum_dispatch::enum_dispatch;
 use env_logger::Env;
 
@@ -23,7 +23,7 @@ struct Args {
 #[command(version)]
 enum Subcommand {
     Demux(Demux),
-    Trimmer(Trimmer),
+    Trimmer(TrimmerOpts),
 }
 
 fn main() -> Result<()> {

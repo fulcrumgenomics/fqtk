@@ -1,4 +1,6 @@
 pub mod barcode_matching;
+pub mod base_quality;
+pub mod moving_average;
 pub mod pair_overlap;
 pub mod samples;
 

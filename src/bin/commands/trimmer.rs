@@ -19,6 +19,14 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 't', default_value = "5")]
     threads: usize,
 
+    /// Minimum base-quality to keep a base when trimming tails.
+    #[clap(long, short = 'q', default_value = "20")]
+    trim_tail_quality: u8,
+
+    /// Window size for moving average when trimming tails.
+    #[clap(long, short = 'w', default_value = "20")]
+    trim_tail_window: u8,
+
     /// Level of compression to use to compress outputs.
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
