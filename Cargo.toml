@@ -33,7 +33,7 @@ path = "src/bin/main.rs"
 ahash = "0.8.2"
 anyhow = "1.0.38"
 bstr = "1.0.1"
-clap = { version = "4.0.25", features = ["derive"] }
+clap = { version = "4.3.22", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
 fgoxide = "0.3.0"

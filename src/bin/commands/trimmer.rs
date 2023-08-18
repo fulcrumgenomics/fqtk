@@ -1,15 +1,23 @@
 use crate::commands::command::Command;
 use anyhow::{Error, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use fgoxide::io::Io;
 use fqtk_lib::pair_overlap;
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use seq_io::fastq::{Reader as FastqReader, Record};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufWriter};
 use std::path::Path;
 use std::path::PathBuf;
+
+#[derive(ValueEnum, Clone, Debug)]
+enum Operation {
+    TrimQual,
+    Overlap,
+    Osc,
+    LenFilter,
+}
 
 /// Trimming and overlap correction of paired-end reads
 #[derive(Parser, Debug)]
@@ -51,6 +59,10 @@ pub(crate) struct TrimmerOpts {
     /// Fastqs file for Read1 and Read2
     #[clap(long, short = 'i', required = true, num_args = 2)]
     input: Vec<PathBuf>,
+
+    /// Order of operations
+    #[clap(value_enum, short = 'p', default_value = "overlap", num_args = 1..)]
+    operations: Vec<Operation>,
 }
 
 const BUFFER_SIZE: usize = 1024 * 1024;
