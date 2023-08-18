@@ -2,7 +2,7 @@ use crate::commands::command::Command;
 use anyhow::{Error, Result};
 use clap::{Parser, ValueEnum};
 use fgoxide::io::Io;
-use fqtk_lib::pair_overlap;
+use fqtk_lib::{base_quality, pair_overlap};
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use seq_io::fastq::{Reader as FastqReader, Record};
@@ -31,6 +31,9 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 'q', default_value = "20")]
     trim_tail_quality: u8,
 
+    #[clap(value_enum)]
+    trim_tail_side: base_quality::Tail,
+
     /// Window size for moving average when trimming tails.
     #[clap(long, short = 'w', default_value = "20")]
     trim_tail_window: u8,
@@ -38,6 +41,14 @@ pub(crate) struct TrimmerOpts {
     /// Level of compression to use to compress outputs.
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
+
+    /// Length requirement of shorter read.
+    #[clap(long, short = 'S', default_value = "5")]
+    filter_shorter: usize,
+
+    /// Length requirement of shorter read.
+    #[clap(long, short = 'L', default_value = "15")]
+    filter_longer: usize,
 
     /// Minimum difference in base-quality for one read to correct an overlapping
     /// base from the other read.
@@ -99,11 +110,6 @@ impl TrimmerOpts {
 
         let pool = pool_builder.build()?;
 
-        // see here for pooled writer: https://docs.rs/pooled-writer/0.3.0/pooled_writer/
-        //
-        // and https://github.com/fulcrumgenomics/fqtk/blob/ae91e90ecc86826fc632837bb982798a7e6b6f7a/src/bin/commands/demux.rs#L804
-        // and https://github.com/fulcrumgenomics/fqtk/blob/ae91e90ecc86826fc632837bb982798a7e6b6f7a/src/bin/commands/demux.rs#L850-L851
-        // for reader
         Ok((pool, pooled_writers, fq_readers))
     }
 }
@@ -114,18 +120,46 @@ impl Command for TrimmerOpts {
         let f1 = readers.remove(0);
         let f2 = readers.remove(0);
 
-        for (r1, r2) in f1.into_records().zip(f2.into_records()) {
+        'pair: for (r1, r2) in f1.into_records().zip(f2.into_records()) {
             let mut r1 = r1?;
             let mut r2 = r2?;
 
-            if let Some(overlap) = pair_overlap::find_overlap(
-                r1.seq(),
-                r2.seq(),
-                self.overlap_min_len,
-                self.overlap_max_error_rate,
-            ) {
-                // TODO: accept and modify stats.
-                overlap.correct(&mut r1, &mut r2, self.overlap_min_bq_delta, true);
+            // TODO: implement qual-masking vs clipping with enum
+            for operation in &self.operations {
+                match operation {
+                    Operation::TrimQual => {
+                        for r in [&mut r1, &mut r2].iter_mut() {
+                            let hq_range = base_quality::find_high_quality_bases(
+                                r.qual(),
+                                self.trim_tail_quality,
+                                self.trim_tail_window,
+                                self.trim_tail_side,
+                            );
+                            base_quality::clip_read(r, hq_range);
+                        }
+                    }
+                    Operation::Overlap => {
+                        if let Some(overlap) = pair_overlap::find_overlap(
+                            r1.seq(),
+                            r2.seq(),
+                            self.overlap_min_len,
+                            self.overlap_max_error_rate,
+                        ) {
+                            overlap.correct(&mut r1, &mut r2, self.overlap_min_bq_delta, true);
+                        }
+                    }
+                    Operation::Osc => {
+                        unimplemented!("OSC not implemented")
+                    }
+                    Operation::LenFilter => {
+                        if r1.seq().len().min(r2.seq().len()) < self.filter_shorter
+                            || r1.seq().len().max(r2.seq().len()) < self.filter_longer
+                        {
+                            info!("Skipping pair with short read");
+                            break 'pair;
+                        }
+                    }
+                }
             }
 
             r1.write(&mut writers[0])?;

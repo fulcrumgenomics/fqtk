@@ -1,12 +1,15 @@
 use super::moving_average::MovingAverage;
+use seq_io::fastq::OwnedRecord;
 
 use std::ops::Range;
 
-pub(crate) fn find_oscillating_quals(bqs: &[u8]) -> Range<usize> {
-    return 0..0;
+pub fn find_oscillating_quals(_bqs: &[u8]) -> Range<usize> {
+    unimplemented!("find_oscillating_quals");
 }
 
-pub(crate) enum Tail {
+// Indicates which tail(s) to clip.
+#[derive(clap::ValueEnum, Debug, Copy, Clone)]
+pub enum Tail {
     Left,
     Right,
     Both,
@@ -14,7 +17,7 @@ pub(crate) enum Tail {
 
 /// Uses a moving average to return a range of high quality bases.
 /// If all bases are high-quality, the range is the full read.
-pub(crate) fn find_high_quality_bases(
+pub fn find_high_quality_bases(
     bqs: &[u8],
     min_quality: u8,
     window: u8,
@@ -43,6 +46,15 @@ pub(crate) fn find_high_quality_bases(
         }
     }
     left..right
+}
+
+/// Hard clip the Record to the given range.
+pub fn clip_read(record: &mut OwnedRecord, range: Range<usize>) {
+    if range.start == 0 && range.end == record.seq.len() {
+        return;
+    }
+    record.seq = record.seq[range.clone()].to_vec();
+    record.qual = record.qual[range].to_vec();
 }
 
 #[cfg(test)]
