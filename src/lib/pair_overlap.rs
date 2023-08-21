@@ -109,9 +109,9 @@ pub fn find_overlap(
     // note that it's possible to do this without allocating, but then we must (re)complement many times.
     let s2 = s2.iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
 
-    'shift_loop: for shift in 0..s1.len() - min_overlap {
+    'shift_loop: for shift in 0..s1.len().max(min_overlap) - min_overlap {
         let mut diffs = 0;
-        let overlap_len = (s1.len() - shift).min(s2.len());
+        let overlap_len = (s1.len().max(shift) - shift).min(s2.len());
         let max_diffs = (overlap_len as f64 * max_overlap_error_rate).floor() as usize;
         for i in 0..overlap_len {
             if s1[i + shift] != s2[i] {

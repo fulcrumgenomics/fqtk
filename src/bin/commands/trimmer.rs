@@ -75,7 +75,7 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 'e', default_value = "0.02")]
     overlap_max_error_rate: f64,
 
-    /// The output directory into which to FASTQs.
+    /// The paths for the 2 output FASTQs.
     #[clap(long, short = 'o', required = true, num_args = 2)]
     output: Vec<PathBuf>,
 
