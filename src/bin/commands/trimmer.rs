@@ -50,6 +50,18 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 'L', default_value = "15")]
     filter_longer: usize,
 
+    /// Size of window to look for oscillations.
+    #[clap(long, default_value = "15")]
+    osc_window: usize,
+
+    /// Number of oscillations in a window to trigger trimming/masking.
+    #[clap(long, default_value = "4")]
+    osc_max_oscillations: usize,
+
+    /// Difference between adjacent bases to be considered on oscilation.
+    #[clap(long, default_value = "10")]
+    osc_delta: usize,
+
     /// Minimum difference in base-quality for one read to correct an overlapping
     /// base from the other read.
     #[clap(long, short = 'd', default_value = "15")]
@@ -149,7 +161,24 @@ impl Command for TrimmerOpts {
                         }
                     }
                     Operation::Osc => {
-                        unimplemented!("OSC not implemented")
+                        if let Some(i) = base_quality::identify_trim_point(
+                            r1.qual(),
+                            self.osc_delta as i32,
+                            self.osc_window,
+                            self.osc_max_oscillations,
+                        ) {
+                            // TODO [Brent]: allow clip or mask with flag
+                            base_quality::clip_read(&mut r1, 0usize..i);
+                        }
+                        if let Some(i) = base_quality::identify_trim_point(
+                            r2.qual(),
+                            self.osc_delta as i32,
+                            self.osc_window,
+                            self.osc_max_oscillations,
+                        ) {
+                            // TODO [Brent]: allow clip or mask with flag
+                            base_quality::clip_read(&mut r2, 0usize..i);
+                        }
                     }
                     Operation::LenFilter => {
                         if r1.seq().len().min(r2.seq().len()) < self.filter_shorter
