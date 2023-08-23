@@ -33,13 +33,16 @@ impl PairOverlap {
     /// previously calculated overlap.
     /// Only bases where the base-quality difference between the reads is higher than `bq_delta` are corrected.
     /// (currently) Base-qualities are summed for bases that agree.
+    /// If mask_quality is None, bases are hard-clipped,
+    ///  otherwise, they are set to the given quality.
+    /// returns the number of corrections performed in read1 and read2 respectively.
     pub fn correct(
         &self,
         r1: &mut OwnedRecord,
         r2: &mut OwnedRecord,
         bq_delta: u8,
-        clip_adapter: bool,
-    ) {
+        mask_quality: Option<u8>,
+    ) -> (usize, usize) {
         // NOTE: copying everything for now. This is not ideal but simplifies code.
         // Only applies to subset of reads that actually overlap.
         let mut r1_seq = r1.seq.clone();
@@ -52,6 +55,7 @@ impl PairOverlap {
             std::mem::swap(&mut r1_seq, &mut r2_seq);
             std::mem::swap(&mut r1_quals, &mut r2_quals);
         }
+        let mut correction_counts = (0usize, 0);
 
         for i in 0..self.overlap {
             let agree = r1_seq[i + self.shift] == r2_seq[i];
@@ -66,9 +70,11 @@ impl PairOverlap {
                 if r1_quals[i + self.shift] >= r2_quals[i] + bq_delta {
                     r2_seq[i] = r1_seq[i + self.shift];
                     r2_quals[i] = r1_quals[i + self.shift];
+                    correction_counts.1 += 1;
                 } else if r2_quals[i] >= r1_quals[i + self.shift] + bq_delta {
                     r1_seq[i + self.shift] = r2_seq[i];
                     r1_quals[i + self.shift] = r2_quals[i];
+                    correction_counts.0 += 1;
                 }
             }
         }
@@ -76,7 +82,17 @@ impl PairOverlap {
         if self.adapter {
             std::mem::swap(&mut r1_seq, &mut r2_seq);
             std::mem::swap(&mut r1_quals, &mut r2_quals);
-            if clip_adapter {
+            correction_counts = (correction_counts.1, correction_counts.0);
+            if let Some(maskq) = mask_quality {
+                // mask qualities
+                let l = r1_quals.len();
+                for q in &mut r1_quals[l - self.shift..] {
+                    *q = maskq;
+                }
+                for q in &mut r2_quals[..self.shift] {
+                    *q = maskq;
+                }
+            } else {
                 // clip right end of r1
                 r1_seq = r1_seq[..r1_seq.len() - self.shift].to_vec();
                 r1_quals = r1_quals[..r1_quals.len() - self.shift].to_vec();
@@ -91,6 +107,7 @@ impl PairOverlap {
 
         r2.seq = reverse_complement(&r2_seq);
         r2.qual = r2_quals.iter().rev().copied().collect::<Vec<u8>>();
+        correction_counts
     }
 }
 
@@ -198,7 +215,7 @@ mod tests {
             qual: b"IIIIIIII".to_vec(),
         };
 
-        overlap.correct(&mut r1, &mut r2, 5, true);
+        overlap.correct(&mut r1, &mut r2, 5, None);
 
         // the sequences are different, but not corrected becase BQs are the same.
         assert_eq!(r1.seq, b"ACGAAATA".to_vec());
@@ -210,7 +227,7 @@ mod tests {
         //    IIIQIIII
 
         r2.qual = b"IIIQIIII".iter().rev().map(|b| *b).collect::<Vec<u8>>();
-        overlap.correct(&mut r1, &mut r2, 5, true);
+        overlap.correct(&mut r1, &mut r2, 5, None);
         assert_eq!(r1.seq, b"ACGAAAAA".to_vec());
     }
 
@@ -232,7 +249,7 @@ mod tests {
             qual: b"IIIIIIII".to_vec(),
         };
 
-        overlap.correct(&mut r1, &mut r2, 5, true);
+        overlap.correct(&mut r1, &mut r2, 5, None);
 
         // sequence 2 is corrected.
         assert_eq!(r2.seq, reverse_complement(b"AAAAA"));

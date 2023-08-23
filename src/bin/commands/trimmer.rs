@@ -2,12 +2,13 @@ use crate::commands::command::Command;
 use anyhow::{Error, Result};
 use clap::{Parser, ValueEnum};
 use fgoxide::io::Io;
+use fqtk_lib::fastq_stats as stats;
 use fqtk_lib::{base_quality, pair_overlap};
 use log::info;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use seq_io::fastq::{Reader as FastqReader, Record};
 use std::fs::File;
-use std::io::{BufRead, BufWriter};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -76,6 +77,11 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 'e', default_value = "0.02")]
     overlap_max_error_rate: f64,
 
+    /// Hard clip adapter sequences from the reads detected in overlap module.
+    /// If this is not specified, the adapter qualities are instead set to `mask_quality`
+    #[clap(long, default_value_t = false)]
+    overlap_hard_clip_adapters: bool,
+
     /// Quality value to use as a mask (should be lower than `clip_tail_quality`)
     #[clap(long, default_value = "0")]
     mask_quality: u8,
@@ -137,15 +143,20 @@ impl Command for TrimmerOpts {
         let f1 = readers.remove(0);
         let f2 = readers.remove(0);
 
+        let mut stats = stats::Stats::new();
+
         'pair: for (r1, r2) in f1.into_records().zip(f2.into_records()) {
             let mut r1 = r1?;
             let mut r2 = r2?;
+
+            stats.update_length(r1.seq.len(), stats::When::Pre, stats::ReadI::R1);
+            stats.update_length(r2.seq.len(), stats::When::Pre, stats::ReadI::R2);
 
             // TODO: implement qual-masking vs clipping with enum
             for operation in &self.operations {
                 match operation {
                     Operation::ClipQual => {
-                        for r in [&mut r1, &mut r2].iter_mut() {
+                        for (i, r) in [&mut r1, &mut r2].iter_mut().enumerate() {
                             let hq_range = base_quality::find_high_quality_bases(
                                 r.qual(),
                                 self.clip_tail_quality,
@@ -154,6 +165,11 @@ impl Command for TrimmerOpts {
                             );
                             // this is hard clip so we send None
                             base_quality::mask_read(r, hq_range, None);
+                            stats.update_length(
+                                r.seq.len(),
+                                stats::When::Post,
+                                stats::ReadI::from(i),
+                            );
                         }
                     }
                     Operation::Overlap => {
@@ -163,7 +179,19 @@ impl Command for TrimmerOpts {
                             self.overlap_min_length,
                             self.overlap_max_error_rate,
                         ) {
-                            overlap.correct(&mut r1, &mut r2, self.overlap_min_bq_delta, true);
+                            stats.overlap_stats.update(overlap);
+                            let corrections = overlap.correct(
+                                &mut r1,
+                                &mut r2,
+                                self.overlap_min_bq_delta,
+                                if self.overlap_hard_clip_adapters {
+                                    None
+                                } else {
+                                    Some(self.mask_quality)
+                                },
+                            );
+                            stats.overlap_stats.update_corrections(corrections.0, stats::ReadI::R1);
+                            stats.overlap_stats.update_corrections(corrections.1, stats::ReadI::R2);
                         }
                     }
                     Operation::Osc => {
@@ -174,6 +202,7 @@ impl Command for TrimmerOpts {
                             self.osc_max_oscillations,
                         ) {
                             base_quality::mask_read(&mut r1, 0usize..i, Some(self.mask_quality));
+                            stats.update_oscillations(1, stats::ReadI::R1);
                         }
                         if let Some(i) = base_quality::identify_trim_point(
                             r2.qual(),
@@ -181,7 +210,8 @@ impl Command for TrimmerOpts {
                             self.osc_window,
                             self.osc_max_oscillations,
                         ) {
-                            base_quality::mask_read(&mut r1, 0usize..i, Some(self.mask_quality));
+                            base_quality::mask_read(&mut r2, 0usize..i, Some(self.mask_quality));
+                            stats.update_oscillations(1, stats::ReadI::R2);
                         }
                     }
                     Operation::LenFilter => {
@@ -189,6 +219,7 @@ impl Command for TrimmerOpts {
                             || r1.seq().len().max(r2.seq().len()) < self.filter_longer
                         {
                             info!("Skipping pair with short read");
+                            stats.increment_length_filter();
                             break 'pair;
                         }
                     }
@@ -198,6 +229,8 @@ impl Command for TrimmerOpts {
             r1.write(&mut writers[0])?;
             r2.write(&mut writers[1])?;
         }
+
+        write!(std::io::stderr(), "{}\n", stats)?;
 
         writers.into_iter().try_for_each(|w| w.close())?;
         pool.stop_pool()?;
