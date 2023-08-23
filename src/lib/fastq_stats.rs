@@ -1,5 +1,4 @@
 use std::fmt;
-use std::ops::Index;
 pub struct Stat<T> {
     pub(crate) pre: T,
     pub(crate) post: T,
@@ -19,8 +18,16 @@ pub enum ReadI {
 pub struct Stats {
     // r1, r2
     pub(crate) length_hist: [Stat<Vec<usize>>; 2],
-    pub(crate) overlap_hist: Stat<Vec<usize>>,
+    pub(crate) overlap_hist: Vec<usize>,
     pub(crate) errors_corrected: [usize; 2],
+}
+
+const DEFAULT_LEN: usize = 400;
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Stats {
@@ -28,10 +35,10 @@ impl Stats {
     pub fn new() -> Self {
         Self {
             length_hist: [
-                Stat { pre: vec![0; 1000], post: vec![0; 1000] },
-                Stat { pre: vec![0; 1000], post: vec![0; 1000] },
+                Stat { pre: vec![0; DEFAULT_LEN], post: vec![0; DEFAULT_LEN] },
+                Stat { pre: vec![0; DEFAULT_LEN], post: vec![0; DEFAULT_LEN] },
             ],
-            overlap_hist: Stat { pre: vec![0; 1000], post: vec![0; 1000] },
+            overlap_hist: vec![0; DEFAULT_LEN],
             errors_corrected: [0, 0],
         }
     }
@@ -59,53 +66,41 @@ impl Stats {
         self.errors_corrected[read as usize] += n;
     }
 
-    pub fn update_bases_overlap(&mut self, overlap: usize, p: When) {
-        match p {
-            When::Pre => {
-                if overlap >= self.overlap_hist.pre.len() {
-                    self.overlap_hist.pre.resize(overlap + 1, 0);
-                }
-                self.overlap_hist.pre[overlap] += 1;
-            }
-            When::Post => {
-                if overlap >= self.overlap_hist.post.len() {
-                    self.overlap_hist.post.resize(overlap + 1, 0);
-                }
-                self.overlap_hist.post[overlap] += 1;
-            }
+    pub fn update_bases_overlap(&mut self, overlap: usize) {
+        if overlap >= self.overlap_hist.len() {
+            self.overlap_hist.resize(overlap + 1, 0);
         }
+        self.overlap_hist[overlap] += 1;
     }
 }
 
 impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Read 1 length histogram:\n")?;
-        for (i, (pre, post)) in
-            self.length_hist[0].pre.iter().zip(self.length_hist[0].post.iter()).enumerate()
-        {
-            if *pre > 0 || *post > 0 {
-                write!(f, "{}\t{}\t{}\n", i, pre, post)?;
+        writeln!(f, "Read-length histogram:")?;
+        writeln!(f, "length\tr1_pre\tr1_post\tr2_pre\tr2_post")?;
+        let max_len = self.length_hist[0]
+            .pre
+            .len()
+            .max(self.length_hist[0].post.len())
+            .max(self.length_hist[1].pre.len().max(self.length_hist[1].post.len()));
+
+        for i in 0..max_len {
+            let pre1 = self.length_hist[0].pre.get(i).unwrap_or(&0);
+            let post1 = self.length_hist[0].post.get(i).unwrap_or(&0);
+            let pre2 = self.length_hist[1].pre.get(i).unwrap_or(&0);
+            let post2 = self.length_hist[1].post.get(i).unwrap_or(&0);
+            writeln!(f, "{}\t{}\t{}\t{}\t{}", i, pre1, post1, pre2, post2)?;
+        }
+
+        writeln!(f, "Overlap length histogram:")?;
+        for (i, v) in self.overlap_hist.iter().enumerate() {
+            if *v > 0 {
+                writeln!(f, "{}\t{}", i, v)?;
             }
         }
-        write!(f, "Read 2 length histogram:\n")?;
-        for (i, (pre, post)) in
-            self.length_hist[1].pre.iter().zip(self.length_hist[1].post.iter()).enumerate()
-        {
-            if *pre > 0 || *post > 0 {
-                write!(f, "{}\t{}\t{}\n", i, pre, post)?;
-            }
-        }
-        write!(f, "Overlap length histogram:\n")?;
-        for (i, (pre, post)) in
-            self.overlap_hist.pre.iter().zip(self.overlap_hist.post.iter()).enumerate()
-        {
-            if *pre > 0 || *post > 0 {
-                write!(f, "{}\t{}\t{}\n", i, pre, post)?;
-            }
-        }
-        write!(f, "Errors corrected:\n")?;
-        write!(f, "Read 1: {}\n", self.errors_corrected[0])?;
-        write!(f, "Read 2: {}\n", self.errors_corrected[1])?;
+        writeln!(f, "Errors corrected:")?;
+        writeln!(f, "Read 1: {}", self.errors_corrected[0])?;
+        writeln!(f, "Read 2: {}", self.errors_corrected[1])?;
         Ok(())
     }
 }

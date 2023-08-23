@@ -18,6 +18,7 @@ pub fn identify_trim_point(
     max_oscillations: usize,
 ) -> Option<usize> {
     // collect indices of oscillations where quals[i] - quals[i-1] >= osc_delta
+    // TODO: benchmark this.
     let osc = quals
         .windows(2)
         .enumerate()
