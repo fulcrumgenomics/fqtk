@@ -17,7 +17,7 @@ enum Operation {
     ClipQual,
     Overlap,
     Osc,
-    LenFilter,
+    FilterLen,
 }
 
 /// Trimming and overlap correction of paired-end reads
@@ -214,13 +214,13 @@ impl Command for TrimmerOpts {
                             stats.update_oscillations(1, stats::ReadI::R2);
                         }
                     }
-                    Operation::LenFilter => {
+                    Operation::FilterLen => {
                         if r1.seq().len().min(r2.seq().len()) < self.filter_shorter
                             || r1.seq().len().max(r2.seq().len()) < self.filter_longer
                         {
                             info!("Skipping pair with short read");
                             stats.increment_length_filter();
-                            break 'pair;
+                            continue 'pair;
                         }
                     }
                 }

@@ -46,7 +46,7 @@ impl Default for OverlapStats {
 impl OverlapStats {
     /// create a new OverlapStats struct.
     pub fn new() -> Self {
-        Self { overlap_hist: vec![0, DEFAULT_LEN], bases: 0, differences: 0, corrections: [0, 0] }
+        Self { overlap_hist: vec![0; DEFAULT_LEN], bases: 0, differences: 0, corrections: [0, 0] }
     }
 
     /// update stats given the PairOverlap.
@@ -81,6 +81,7 @@ pub struct Stats {
 
     // number of reads filtered by length
     pub(crate) length_filtered: usize,
+    max_read_length: usize,
 }
 
 const DEFAULT_LEN: usize = 400;
@@ -103,6 +104,7 @@ impl Stats {
             errors_corrected: [0, 0],
             oscillations: [0, 0],
             length_filtered: 0,
+            max_read_length: 0,
         }
     }
     pub fn update_oscillations(&mut self, n: usize, read: ReadI) {
@@ -116,6 +118,7 @@ impl Stats {
     /// update length histogram for a read.
     pub fn update_length(&mut self, length: usize, p: When, read: ReadI) {
         let index = read as usize;
+        self.max_read_length = self.max_read_length.max(length);
         match p {
             When::Pre => {
                 if length >= self.length_hist[index].pre.len() {
@@ -139,7 +142,7 @@ impl Stats {
 
 impl fmt::Display for OverlapStats {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Overlap length histogram:")?;
+        writeln!(f, "Overlap length histogram:\noverlap\tcount")?;
         for (i, v) in self.overlap_hist.iter().enumerate() {
             if *v > 0 {
                 writeln!(f, "{}\t{}", i, v)?;
@@ -159,13 +162,7 @@ impl fmt::Display for Stats {
         writeln!(f, "Reads Filtered based on length: {}", self.length_filtered)?;
         writeln!(f, "Read-length histogram:")?;
         writeln!(f, "length\tr1_pre\tr1_post\tr2_pre\tr2_post")?;
-        let max_len = self.length_hist[0]
-            .pre
-            .len()
-            .max(self.length_hist[0].post.len())
-            .max(self.length_hist[1].pre.len().max(self.length_hist[1].post.len()));
-
-        for i in 0..max_len {
+        for i in 0..self.max_read_length + 1 {
             let pre1 = self.length_hist[0].pre.get(i).unwrap_or(&0);
             let post1 = self.length_hist[0].post.get(i).unwrap_or(&0);
             let pre2 = self.length_hist[1].pre.get(i).unwrap_or(&0);

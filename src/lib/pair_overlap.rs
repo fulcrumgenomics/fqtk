@@ -124,6 +124,10 @@ pub fn find_overlap(
     max_overlap_error_rate: f64,
 ) -> Option<PairOverlap> {
     // note that it's possible to do this without allocating, but then we must (re)complement many times.
+    if s1.len() < min_overlap || s2.len() < min_overlap {
+        return None;
+    }
+
     let s2 = s2.iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
 
     'shift_loop: for shift in 0..s1.len().max(min_overlap) - min_overlap {
