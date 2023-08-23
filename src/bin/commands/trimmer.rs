@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Operation {
-    TrimQual,
+    ClipQual,
     Overlap,
     Osc,
     LenFilter,
@@ -27,26 +27,27 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, short = 't', default_value = "5")]
     threads: usize,
 
-    /// Minimum base-quality to keep a base when trimming tails.
+    /// Clip bases with quality < this value.
     #[clap(long, short = 'q', default_value = "20")]
-    trim_tail_quality: u8,
+    clip_tail_quality: u8,
 
-    #[clap(value_enum)]
-    trim_tail_side: base_quality::Tail,
+    /// Which tail(s) to clip.
+    #[clap(long, value_enum, default_value = "end")]
+    clip_tail_side: base_quality::Tail,
 
-    /// Window size for moving average when trimming tails.
+    /// Window size for moving average when clipping tails.
     #[clap(long, short = 'w', default_value = "20")]
-    trim_tail_window: u8,
+    clip_tail_window: u8,
 
     /// Level of compression to use to compress outputs.
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
 
-    /// Length requirement of shorter read.
+    /// Length requirement of shorter read. Lengths below this are clipped.
     #[clap(long, short = 'S', default_value = "5")]
     filter_shorter: usize,
 
-    /// Length requirement of shorter read.
+    /// Length requirement of longer read. Lengths below this are clipped.
     #[clap(long, short = 'L', default_value = "15")]
     filter_longer: usize,
 
@@ -54,7 +55,7 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, default_value = "15")]
     osc_window: usize,
 
-    /// Number of oscillations in a window to trigger trimming/masking.
+    /// Required of oscillations in a window to trigger trimming/masking.
     #[clap(long, default_value = "4")]
     osc_max_oscillations: usize,
 
@@ -69,11 +70,19 @@ pub(crate) struct TrimmerOpts {
 
     /// Minimum pair overlap length to attempt correction.
     #[clap(long, short = 'l', default_value = "50")]
-    overlap_min_len: usize,
+    overlap_min_length: usize,
 
     /// Maximum error-rate allowed in the overlap.
     #[clap(long, short = 'e', default_value = "0.02")]
     overlap_max_error_rate: f64,
+
+    /// Quality value to use as a mask (should be lower than `clip_tail_quality`)
+    #[clap(long, default_value = "0")]
+    mask_quality: u8,
+
+    /// Order of operations
+    #[clap(value_enum, short = 'p', default_value = "overlap", num_args = 1..)]
+    operations: Vec<Operation>,
 
     /// The paths for the 2 output FASTQs.
     #[clap(long, short = 'o', required = true, num_args = 2)]
@@ -82,10 +91,6 @@ pub(crate) struct TrimmerOpts {
     /// Fastqs file for Read1 and Read2
     #[clap(long, short = 'i', required = true, num_args = 2)]
     input: Vec<PathBuf>,
-
-    /// Order of operations
-    #[clap(value_enum, short = 'p', default_value = "overlap", num_args = 1..)]
-    operations: Vec<Operation>,
 }
 
 const BUFFER_SIZE: usize = 1024 * 1024;
@@ -139,22 +144,23 @@ impl Command for TrimmerOpts {
             // TODO: implement qual-masking vs clipping with enum
             for operation in &self.operations {
                 match operation {
-                    Operation::TrimQual => {
+                    Operation::ClipQual => {
                         for r in [&mut r1, &mut r2].iter_mut() {
                             let hq_range = base_quality::find_high_quality_bases(
                                 r.qual(),
-                                self.trim_tail_quality,
-                                self.trim_tail_window,
-                                self.trim_tail_side,
+                                self.clip_tail_quality,
+                                self.clip_tail_window,
+                                self.clip_tail_side,
                             );
-                            base_quality::clip_read(r, hq_range);
+                            // this is hard clip so we send None
+                            base_quality::mask_read(r, hq_range, None);
                         }
                     }
                     Operation::Overlap => {
                         if let Some(overlap) = pair_overlap::find_overlap(
                             r1.seq(),
                             r2.seq(),
-                            self.overlap_min_len,
+                            self.overlap_min_length,
                             self.overlap_max_error_rate,
                         ) {
                             overlap.correct(&mut r1, &mut r2, self.overlap_min_bq_delta, true);
@@ -167,8 +173,7 @@ impl Command for TrimmerOpts {
                             self.osc_window,
                             self.osc_max_oscillations,
                         ) {
-                            // TODO [Brent]: allow clip or mask with flag
-                            base_quality::clip_read(&mut r1, 0usize..i);
+                            base_quality::mask_read(&mut r1, 0usize..i, Some(self.mask_quality));
                         }
                         if let Some(i) = base_quality::identify_trim_point(
                             r2.qual(),
@@ -176,8 +181,7 @@ impl Command for TrimmerOpts {
                             self.osc_window,
                             self.osc_max_oscillations,
                         ) {
-                            // TODO [Brent]: allow clip or mask with flag
-                            base_quality::clip_read(&mut r2, 0usize..i);
+                            base_quality::mask_read(&mut r1, 0usize..i, Some(self.mask_quality));
                         }
                     }
                     Operation::LenFilter => {

@@ -41,8 +41,8 @@ pub fn identify_trim_point(
 // Indicates which tail(s) to clip.
 #[derive(clap::ValueEnum, Debug, Copy, Clone)]
 pub enum Tail {
-    Left,
-    Right,
+    Start,
+    End,
     Both,
 }
 
@@ -56,7 +56,7 @@ pub fn find_high_quality_bases(
 ) -> Range<usize> {
     let mut left = 0;
     let mut right = bqs.len();
-    if matches!(tail, Tail::Left | Tail::Both) {
+    if matches!(tail, Tail::Start | Tail::Both) {
         let mut ma = MovingAverage::<u8>::new(window as usize);
         for &bq in bqs {
             let mean = ma.push(bq);
@@ -66,7 +66,7 @@ pub fn find_high_quality_bases(
             left += 1;
         }
     }
-    if matches!(tail, Tail::Right | Tail::Both) {
+    if matches!(tail, Tail::End | Tail::Both) {
         let mut ma = MovingAverage::<u8>::new(window as usize);
         for &bq in bqs.iter().rev() {
             let mean = ma.push(bq);
@@ -79,13 +79,23 @@ pub fn find_high_quality_bases(
     left..right
 }
 
-/// Hard clip the Record to the given range.
-pub fn clip_read(record: &mut OwnedRecord, range: Range<usize>) {
+/// Mask or clip the Record to the given range.
+/// if `mask_quality` is None, the read is hard-clipped.
+pub fn mask_read(record: &mut OwnedRecord, range: Range<usize>, mask_quality: Option<u8>) {
     if range.start == 0 && range.end == record.seq.len() {
         return;
     }
-    record.seq = record.seq[range.clone()].to_vec();
-    record.qual = record.qual[range].to_vec();
+    if let Some(mask_quality) = mask_quality {
+        for q in &mut record.qual[0..range.start] {
+            *q = mask_quality;
+        }
+        for q in &mut record.qual[range.end..] {
+            *q = mask_quality;
+        }
+    } else {
+        record.seq = record.seq[range.clone()].to_vec();
+        record.qual = record.qual[range].to_vec();
+    }
 }
 
 #[cfg(test)]
@@ -106,11 +116,11 @@ mod tests {
         assert_eq!(range, 1..bqs.len() - 1);
 
         let bqs = b"EIIIIIIE";
-        let range = find_high_quality_bases(bqs, 'I' as u8, 1, Tail::Left);
+        let range = find_high_quality_bases(bqs, 'I' as u8, 1, Tail::Start);
         assert_eq!(range, 1..bqs.len());
 
         let bqs = b"EIIIIIIE";
-        let range = find_high_quality_bases(bqs, 'I' as u8, 1, Tail::Right);
+        let range = find_high_quality_bases(bqs, 'I' as u8, 1, Tail::End);
         assert_eq!(range, 0..bqs.len() - 1);
     }
 
