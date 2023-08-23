@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Operation {
-    ClipQual,
+    Clip,
     Overlap,
     Osc,
     FilterLen,
@@ -60,7 +60,7 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, default_value = "4")]
     osc_max_oscillations: usize,
 
-    /// Difference between adjacent bases to be considered on oscilation.
+    /// Difference between adjacent bases to be considered on oscillation.
     #[clap(long, default_value = "10")]
     osc_delta: usize,
 
@@ -152,11 +152,10 @@ impl Command for TrimmerOpts {
             stats.update_length(r1.seq.len(), stats::When::Pre, stats::ReadI::R1);
             stats.update_length(r2.seq.len(), stats::When::Pre, stats::ReadI::R2);
 
-            // TODO: implement qual-masking vs clipping with enum
             for operation in &self.operations {
                 match operation {
-                    Operation::ClipQual => {
-                        for (i, r) in [&mut r1, &mut r2].iter_mut().enumerate() {
+                    Operation::Clip => {
+                        for r in [&mut r1, &mut r2].iter_mut() {
                             let hq_range = base_quality::find_high_quality_bases(
                                 r.qual(),
                                 self.clip_tail_quality,
@@ -165,11 +164,6 @@ impl Command for TrimmerOpts {
                             );
                             // this is hard clip so we send None
                             base_quality::mask_read(r, hq_range, None);
-                            stats.update_length(
-                                r.seq.len(),
-                                stats::When::Post,
-                                stats::ReadI::from(i),
-                            );
                         }
                     }
                     Operation::Overlap => {
@@ -226,11 +220,14 @@ impl Command for TrimmerOpts {
                 }
             }
 
+            stats.update_length(r1.seq.len(), stats::When::Post, stats::ReadI::R1);
+            stats.update_length(r2.seq.len(), stats::When::Post, stats::ReadI::R2);
+
             r1.write(&mut writers[0])?;
             r2.write(&mut writers[1])?;
         }
 
-        write!(std::io::stderr(), "{}\n", stats)?;
+        writeln!(std::io::stderr(), "{}", stats)?;
 
         writers.into_iter().try_for_each(|w| w.close())?;
         pool.stop_pool()?;
