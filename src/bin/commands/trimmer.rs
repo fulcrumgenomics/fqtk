@@ -56,7 +56,7 @@ pub(crate) struct TrimmerOpts {
     #[clap(long, default_value = "15")]
     osc_window: usize,
 
-    /// Required of oscillations in a window to trigger trimming/masking.
+    /// Required number of oscillations in a window to trigger trimming/masking.
     #[clap(long, default_value = "4")]
     osc_max_oscillations: usize,
 
@@ -173,6 +173,13 @@ impl Command for TrimmerOpts {
                             self.overlap_min_length,
                             self.overlap_max_error_rate,
                         ) {
+                            log::debug!(
+                                "found overlap in pair: {} shift: {}, overlap: {}, adapter: {}",
+                                r1.id().unwrap_or("read"),
+                                overlap.shift,
+                                overlap.overlap,
+                                overlap.adapter
+                            );
                             stats.overlap_stats.update(overlap);
                             let corrections = overlap.correct(
                                 &mut r1,
@@ -184,6 +191,7 @@ impl Command for TrimmerOpts {
                                     Some(self.mask_quality)
                                 },
                             );
+                            log::debug!("corrections: {:?}", corrections);
                             stats.overlap_stats.update_corrections(corrections.0, stats::ReadI::R1);
                             stats.overlap_stats.update_corrections(corrections.1, stats::ReadI::R2);
                         }

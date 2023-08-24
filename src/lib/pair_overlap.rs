@@ -68,10 +68,24 @@ impl PairOverlap {
             } else {
                 // when bases disagree, set the lower quality base to the higher quality base.
                 if r1_quals[i + self.shift] >= r2_quals[i] + bq_delta {
+                    log::debug!(
+                        "correcting read2 at {} with read1 at {}, base: {} to {}",
+                        i,
+                        i + self.shift,
+                        r2_seq[i] as char,
+                        r1_seq[i + self.shift] as char
+                    );
                     r2_seq[i] = r1_seq[i + self.shift];
                     r2_quals[i] = r1_quals[i + self.shift];
                     correction_counts.1 += 1;
                 } else if r2_quals[i] >= r1_quals[i + self.shift] + bq_delta {
+                    log::debug!(
+                        "correcting read1 at {} with read2 at {}, base: {} to {}",
+                        i + self.shift,
+                        i,
+                        r1_seq[i + self.shift] as char,
+                        r2_seq[i] as char
+                    );
                     r1_seq[i + self.shift] = r2_seq[i];
                     r1_quals[i + self.shift] = r2_quals[i];
                     correction_counts.0 += 1;

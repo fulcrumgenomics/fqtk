@@ -31,11 +31,12 @@ pub fn identify_trim_point(
     // here we have indices of oscillations. e.g.: [50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 63, 64, 65, 67, 68, 69, 70, 72, 73, 74]
 
     // use a window of `max_oscilations` and check if there are at least `max_oscillations` oscillations in the window.
-    osc.windows(max_oscillations).find(|w| 
+    osc.windows(max_oscillations)
+        .find(|w|
         // given a e.g. [50, 52, 55] means we found 3 oscillations in 5 bases (55 - 50)
         // and we had window_size to find that many. so if the last - first < window_size, we found an osc window.
-        w[w.len() - 1] - w[0] < window_size
-    ).map(|w| w[0])
+        w[w.len() - 1] - w[0] < window_size)
+        .map(|w| w[0])
 }
 
 // Indicates which tail(s) to clip.
