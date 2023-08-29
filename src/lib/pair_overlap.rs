@@ -131,6 +131,7 @@ fn reverse_complement(s: &[u8]) -> Vec<u8> {
 
 /// find overlap given the sequence of a pair of reads.
 /// max_overlap_error_rate of e.g. 0.1 means that we allow 1 error per 10 bases of overlap.
+/// This code was inspired by the straight-forward method in fastp.
 pub fn find_overlap(
     s1: &[u8],
     s2: &[u8],

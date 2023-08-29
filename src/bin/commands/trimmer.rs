@@ -121,7 +121,24 @@ impl TrimmerOpts {
         let fq_readers =
             fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE)).collect();
 
-        let writers = vec![create_writer(&self.output[0])?, create_writer(&self.output[1])?];
+        let output: Vec<_> = self
+            .output
+            .iter()
+            .map(|p| {
+                if !(p.ends_with(".gz") || p.ends_with(".bgz")) {
+                    log::warn!(
+                        "Output file {} does not end with .gz or .bgz. Writing bgzipped output to {} instead.",
+                        p.display(),
+                        p.with_extension("gz").display()
+                    );
+                    p.with_extension("gz")
+                } else {
+                    p.clone()
+                }
+            })
+            .collect();
+
+        let writers = vec![create_writer(&output[0])?, create_writer(&output[1])?];
 
         let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
             .threads(self.threads)
