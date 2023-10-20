@@ -109,6 +109,11 @@ fn create_writer<P: AsRef<Path>>(name: P) -> Result<BufWriter<File>, Error> {
     Ok(BufWriter::new(File::create(name)?))
 }
 
+fn check_extension(p: &PathBuf) -> bool {
+    let ext = p.extension().map_or("", |v| v.to_str().unwrap_or(""));
+    ["bgz", "gz"].contains(&ext)
+}
+
 impl TrimmerOpts {
     fn prepare(&self) -> Result<(Pool, Vec<PooledWriter>, VecOfFqReaders), Error> {
         let fgio = Io::new(5, BUFFER_SIZE);
@@ -125,7 +130,7 @@ impl TrimmerOpts {
             .output
             .iter()
             .map(|p| {
-                if !(p.ends_with(".gz") || p.ends_with(".bgz")) {
+                if !check_extension(p) {
                     log::warn!(
                         "Output file {} does not end with .gz or .bgz. Writing bgzipped output to {} instead.",
                         p.display(),
@@ -258,5 +263,31 @@ impl Command for TrimmerOpts {
         pool.stop_pool()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_check_extension_gz() {
+        let path = PathBuf::from("test_file.gz");
+        assert_eq!(
+            check_extension(&path),
+            true,
+            "The function should return true for .gz extension"
+        );
+    }
+
+    #[test]
+    fn test_check_extension_txt() {
+        let path = PathBuf::from("test_file.txt");
+        assert_eq!(
+            check_extension(&path),
+            false,
+            "The function should return false for .txt extension"
+        );
     }
 }
