@@ -51,6 +51,41 @@ impl PairOverlap {
         let mut r2_quals = r2.qual.clone();
         r2_quals.reverse();
 
+        if log::log_enabled!(log::Level::Debug) {
+            let r1_seq = String::from_utf8(r1_seq.clone()).unwrap();
+            let r2_seq = String::from_utf8(r2_seq.clone()).unwrap();
+            let r1_space = if self.adapter { " ".repeat(self.shift) } else { "".to_string() };
+            let r2_space = if self.adapter { "".to_string() } else { " ".repeat(self.shift) };
+
+            let r1_string = format!("{}{}", r1_space, r1_seq);
+            let r2_string = format!("{}{}", r2_space, r2_seq);
+
+            let chunk_size = 80;
+            // now wrap strings at chunk_size chars and print each pair of lines.
+            let r1_chunks = r1_string
+                .as_bytes()
+                .chunks(chunk_size)
+                .map(|x| String::from_utf8(x.to_vec()).unwrap())
+                .collect::<Vec<String>>();
+
+            let r2_chunks = r2_string
+                .as_bytes()
+                .chunks(chunk_size)
+                .map(|x| String::from_utf8(x.to_vec()).unwrap())
+                .collect::<Vec<String>>();
+
+            for i in 0..r2_chunks.len() {
+                let diffs = r1_chunks[i]
+                    .chars()
+                    .zip(r2_chunks[i].chars())
+                    .map(|(a, b)| if a != b && a != ' ' && b != ' ' { '*' } else { ' ' })
+                    .collect::<Vec<char>>();
+                eprintln!("r1: {}", r1_chunks[i]);
+                eprintln!("r2: {}", r2_chunks[i]);
+                eprintln!("dx: {}", diffs.iter().collect::<String>());
+            }
+        }
+
         if self.adapter {
             std::mem::swap(&mut r1_seq, &mut r2_seq);
             std::mem::swap(&mut r1_quals, &mut r2_quals);
