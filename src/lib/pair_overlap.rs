@@ -97,19 +97,30 @@ impl PairOverlap {
             std::mem::swap(&mut r1_seq, &mut r2_seq);
             std::mem::swap(&mut r1_quals, &mut r2_quals);
             correction_counts = (correction_counts.1, correction_counts.0);
+            // clip right end of r1
+            // but we must check for scenario like:
+            // r1:      ACGAAATA
+            // r2: GGGGGACGAAATA
+            // shift: 5
+            // where we don't need to clip r1.
+            let r1_overhang =
+                if self.overlap >= r1_seq.len() { 0 } else { r1_seq.len() - self.overlap };
             if let Some(maskq) = mask_quality {
                 // mask qualities
                 let l = r1_quals.len();
-                for q in &mut r1_quals[l - self.shift..] {
-                    *q = maskq;
+                if r1_overhang > 0 {
+                    for q in &mut r1_quals[l - r1_overhang as usize..] {
+                        *q = maskq;
+                    }
                 }
                 for q in &mut r2_quals[..self.shift] {
                     *q = maskq;
                 }
             } else {
-                // clip right end of r1
-                r1_seq = r1_seq[..r1_seq.len() - self.shift].to_vec();
-                r1_quals = r1_quals[..r1_quals.len() - self.shift].to_vec();
+                if r1_overhang > 0 {
+                    r1_seq = r1_seq[..r1_seq.len() - r1_overhang as usize].to_vec();
+                    r1_quals = r1_quals[..r1_quals.len() - r1_overhang as usize].to_vec();
+                }
                 // we're still reversed here, so we also clip of left end of r2
                 r2_seq = r2_seq[self.shift..].to_vec();
                 r2_quals = r2_quals[self.shift..].to_vec();
@@ -138,11 +149,11 @@ pub fn find_overlap(
     min_overlap: usize,
     max_overlap_error_rate: f64,
 ) -> Option<PairOverlap> {
-    // note that it's possible to do this without allocating, but then we must (re)complement many times.
     if s1.len() < min_overlap || s2.len() < min_overlap {
         return None;
     }
 
+    // note that it's possible to do this without allocating, but then we must (re)complement many times.
     let s2 = s2.iter().rev().map(|x| complement(*x)).collect::<Vec<u8>>();
 
     'shift_loop: for shift in 0..s1.len().max(min_overlap) - min_overlap {
@@ -185,6 +196,42 @@ pub fn find_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_with_adapter() {
+        let r1_seq = /* 1234567890 */ b"GCGCGTGCGTTCTGC";
+        let r2_seq = b"AAAAAAAAAAAACACGTGCGCGTGCGTTCTGC"
+            .iter()
+            .rev()
+            .map(|x| complement(*x))
+            .collect::<Vec<u8>>();
+
+        let overlap = find_overlap(r1_seq, &r2_seq, 4, 0.1);
+        assert!(overlap.is_some());
+        let overlap = overlap.unwrap();
+        assert!(overlap.shift == 17);
+        assert!(overlap.adapter);
+        assert!(overlap.overlap == r1_seq.len());
+        eprintln!("overlap: {:?}", overlap);
+
+        let mut r1 = OwnedRecord {
+            head: b"r1".to_vec(),
+            seq: r1_seq.to_vec(),
+            qual: vec![b'I'; r1_seq.len()],
+        };
+        eprintln!("r1-quals: {:?}", r1.qual);
+        let mut r2 = OwnedRecord {
+            head: b"r2".to_vec(),
+            seq: r2_seq.to_vec(),
+            qual: vec![b'I'; r2_seq.len()],
+        };
+
+        let _corrections = overlap.correct(&mut r1, &mut r2, 1, None);
+        eprintln!("r1-seq-after: {}", String::from_utf8(r1.seq.clone()).unwrap());
+        eprintln!("r2-seq-after: {}", String::from_utf8(r2.seq.clone()).unwrap());
+        assert!(r1.seq == r1_seq);
+        assert!(r2.seq == r2_seq[..r2_seq.len() - overlap.shift].to_vec());
+    }
 
     #[test]
     fn test_simple_overlap() {
@@ -253,8 +300,8 @@ mod tests {
     #[test]
     fn test_overlap_correction_with_adapter() {
         let overlap = PairOverlap { shift: 3, overlap: 5, diffs: 0, adapter: true };
-        //       IIIQIIII
-        // r1:   AAAAAGGC
+        //        IIIQIIII
+        // r1:    AAAAAGGC
         // r2: ACGAAATA
 
         let mut r1 = OwnedRecord {
