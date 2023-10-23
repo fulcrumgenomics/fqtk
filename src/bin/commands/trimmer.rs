@@ -109,7 +109,7 @@ fn create_writer<P: AsRef<Path>>(name: P) -> Result<BufWriter<File>, Error> {
     Ok(BufWriter::new(File::create(name)?))
 }
 
-fn check_extension(p: &PathBuf) -> bool {
+fn check_extension(p: &Path) -> bool {
     let ext = p.extension().map_or("", |v| v.to_str().unwrap_or(""));
     ["bgz", "gz"].contains(&ext)
 }
