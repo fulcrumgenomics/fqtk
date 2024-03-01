@@ -1769,7 +1769,7 @@ mod tests {
             read_structures,
             sample_metadata,
             output_types: vec!['T', 'B'],
-            output: output_dir.clone(),
+            output: output_dir,
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,

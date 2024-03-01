@@ -39,7 +39,7 @@ parent=$(cd $(dirname $0) && pwd -P)
 repo_root=$(cd $(dirname $0)/.. && pwd -P)
 
 run "Formatting"  "cargo fmt"
-run "Clippy"      "cargo clippy -- -D warnings"
+run "Clippy"      "cargo clippy --all-features --all-targets -- -D warnings"
 run "Unit Tests"  "cargo test"
 
 if [ -z "$failures" ]; then
