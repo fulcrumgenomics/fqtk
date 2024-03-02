@@ -36,6 +36,7 @@ bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
+ext-sort = "0.1.4"
 fgoxide = "0.3.0"
 flate2 = { version = "1.0.25", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
 itertools = "0.10.5"
