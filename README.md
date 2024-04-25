@@ -114,6 +114,8 @@ Options:
           The read structure types to write to their own files (Must be one of T, B,
           or M for template reads, sample barcode reads, and molecular barcode reads)
 
+          Multiple output types may be specified as a space-delimited list.
+
           [default: T]
 
   -s, --sample-metadata <SAMPLE_METADATA>
