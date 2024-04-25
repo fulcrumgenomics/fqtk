@@ -580,6 +580,8 @@ pub(crate) struct Demux {
 
     /// The read structure types to write to their own files (Must be one of T, B, or M for
     /// template reads, sample barcode reads, and molecular barcode reads).
+    /// 
+    /// Multiple output types may be specified as a space-delimited list.
     #[clap(long, short='b', default_value="T", num_args = 1.. )]
     output_types: Vec<char>,
 
