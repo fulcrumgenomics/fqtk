@@ -90,7 +90,7 @@ impl Display for SampleGroup {
 impl SampleGroup {
     /// Validates a group of [`Sample`]s and instantiates a [`Self`] struct if they are
     /// valid. Will clone the [`Sample`] structs and change the number on the `ordinal` field on
-    /// those cloneto match the order in which they are stored in this [`Self`]
+    /// those cloned to match the order in which they are stored in this [`Self`]
     /// # Panics
     ///   - Will panic if sample metadata sheet is improperly formatted
     ///   - Will panic if there are duplicate sample names provided
