@@ -518,9 +518,14 @@ impl DemuxMetric {
 /// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
 /// tag.
 ///
-/// Metadata about the samples should be given as a headered metadata TSV file with two columns
-/// 1. `sample_id` - the id of the sample or library.
+/// Metadata about the samples should be given as a headered metadata TSV file with at least the 
+/// following two columns present:
+/// 
+/// 1. `sample_id` - the id of the sample or library. 
 /// 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
+/// 
+/// For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be 
+/// concatenated together in the order they are read and stored in the `barcode` field.
 ///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
