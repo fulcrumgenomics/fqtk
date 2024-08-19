@@ -25,6 +25,8 @@ pub struct BarcodeMatcher {
     /// Note - this is to be replaced by a sample struct in task 3. For now we're keeping things
     /// very simple.
     sample_barcodes: Vec<BString>,
+    /// The maxium number of Ns in any barcode in set of sample barcodes
+    max_ns_in_barcodes: usize,
     /// The maximum mismatches to match a sample barcode.
     max_mismatches: u8,
     /// The minimum difference between number of mismatches in the best and second best barcodes
@@ -56,12 +58,20 @@ impl BarcodeMatcher {
             "Sample barcode cannot be empty string"
         );
 
+        let mut max_ns_in_barcodes = 0;
         let modified_sample_barcodes = sample_barcodes
             .iter()
-            .map(|barcode| BString::from(barcode.to_ascii_uppercase()))
+            .map(|barcode| {
+                let barcode = BString::from(barcode.to_ascii_uppercase());
+                let num_ns = barcode.iter().filter(|&b| byte_is_nocall(*b)).count();
+                max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
+                barcode
+            })
             .collect::<Vec<_>>();
+
         Self {
             sample_barcodes: modified_sample_barcodes,
+            max_ns_in_barcodes,
             max_mismatches,
             min_mismatch_delta,
             use_cache,
@@ -132,7 +142,7 @@ impl BarcodeMatcher {
             return None;
         }
         let num_no_calls = read_bases.iter().filter(|&&b| byte_is_nocall(b)).count();
-        if num_no_calls > self.max_mismatches as usize {
+        if num_no_calls > (self.max_mismatches as usize) + self.max_ns_in_barcodes {
             None
         } else if self.use_cache {
             if let Some(cached_match) = self.cache.get(read_bases) {
@@ -205,6 +215,11 @@ mod tests {
     #[test]
     fn ns_in_expected_barcode_dont_contribute_to_mismatch_counter() {
         assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GANNACA".as_bytes()), 0,);
+    }
+
+    #[test]
+    fn all_ns_barcode_have_no_mismatches() {
+        assert_eq!(BarcodeMatcher::count_mismatches("GANNACA".as_bytes(), "NNNNNNN".as_bytes()), 0,);
     }
 
     #[test]
