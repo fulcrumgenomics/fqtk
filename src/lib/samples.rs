@@ -178,29 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tsv_file_delim_error() {
-        let lines = vec![
-            // Sample::deserialize_header_line(),
-            "sample_id,barcode".to_owned(),
-            "sample1,GATTACA".to_owned(),
-            "sample2,CATGCTA".to_owned(),
-        ];
-        let tempdir = TempDir::new().unwrap();
-        let f1 = tempdir.path().join("sample_metadata.tsv");
-
-        let io = Io::default();
-        io.write_lines(&f1, &lines).unwrap();
-        let err = SampleGroup::from_file(&f1).unwrap_err();
-
-        if let fgoxide::FgError::DelimFileHeaderError { expected, found } = err {
-            assert_eq!(expected, Sample::deserialize_header_line());
-            assert_eq!(found, "sample_id,barcode");
-        } else {
-            panic!()
-        }
-    }
-
-    #[test]
     fn test_reading_from_file_with_empty_lines_at_end() {
         let lines = vec![
             Sample::deserialize_header_line(),
@@ -228,6 +205,27 @@ mod tests {
         let barcode = "GATTANN".to_owned();
         let ordinal = 0;
         let _sample = Sample::new(ordinal, name, barcode);
+    }
+
+    #[test]
+    fn test_tsv_file_delim_error() {
+        let lines: Vec<String> = ["sample_id,barcode", "sample1,GATTACA", "sample2,CATGCTA"]
+            .iter()
+            .map(|&s| s.into())
+            .collect();
+        let tempdir = TempDir::new().unwrap();
+        let f1 = tempdir.path().join("sample_metadata.tsv");
+
+        let io = Io::default();
+        io.write_lines(&f1, &lines).unwrap();
+        let err = SampleGroup::from_file(&f1).unwrap_err();
+
+        if let fgoxide::FgError::DelimFileHeaderError { expected, found } = err {
+            assert_eq!(expected, Sample::deserialize_header_line());
+            assert_eq!(found, "sample_id,barcode");
+        } else {
+            panic!()
+        }
     }
 
     // ############################################################################################
