@@ -1374,6 +1374,123 @@ mod tests {
     }
 
     #[test]
+    fn test_demux_with_catchall_barcode() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("7B+T").unwrap()];
+        let s1_barcode = "NNNNNNN";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files =
+            vec![fastq_file(&tmp, "ex", "ex", &[&(s1_barcode.to_owned() + &"A".repeat(100))])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 0,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let unmatched_path = output_dir.join("unmatched.R1.fq.gz");
+        let unmatched_reads = read_fastq(&unmatched_path);
+        assert_eq!(unmatched_reads.len(), 0);
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:NNNNNNN".to_vec(),
+                seq: "A".repeat(100).as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_demux_with_ns_in_barcode() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("7B+T").unwrap()];
+        let s1_barcode = "NNAAAAA";
+        let s2_barcode = "NNCCCCC";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode, s2_barcode]);
+        let input_files = vec![fastq_file(
+            &tmp,
+            "ex",
+            "ex",
+            &[
+                &("ANAAAAA".to_owned() + &"A".repeat(5)),
+                &("ANCCCCC".to_owned() + &"C".repeat(5)),
+                &("NNNAAAA".to_owned() + &"T".repeat(5)),
+            ],
+        )];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 0,
+            min_mismatch_delta: 0,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 1);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:ANAAAAA".to_vec(),
+                seq: "A".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        let output_path = output_dir.join("Sample0001.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 1);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_1 1:N:0:ANCCCCC".to_vec(),
+                seq: "C".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        // Should not match since it has 3 no calls, and barcodes have at maximum 1 no-call
+        let unmatched_path = output_dir.join("unmatched.R1.fq.gz");
+        let unmatched_reads = read_fastq(&unmatched_path);
+        assert_eq!(unmatched_reads.len(), 1);
+        assert_equal(
+            &unmatched_reads[0],
+            &OwnedRecord {
+                head: b"ex_2 1:N:0:NNNAAAA".to_vec(),
+                seq: "T".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
     fn test_demux_paired_reads_with_in_line_sample_barcodes() {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
