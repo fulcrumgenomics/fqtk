@@ -1452,7 +1452,6 @@ mod tests {
 
         let output_path = output_dir.join("Sample0000.R1.fq.gz");
         let fq_reads = read_fastq(&output_path);
-
         assert_eq!(fq_reads.len(), 1);
         assert_equal(
             &fq_reads[0],
@@ -1465,7 +1464,6 @@ mod tests {
 
         let output_path = output_dir.join("Sample0001.R1.fq.gz");
         let fq_reads = read_fastq(&output_path);
-
         assert_eq!(fq_reads.len(), 1);
         assert_equal(
             &fq_reads[0],
@@ -1480,7 +1478,6 @@ mod tests {
         let unmatched_path = output_dir.join("unmatched.R1.fq.gz");
         let unmatched_reads = read_fastq(&unmatched_path);
         assert_eq!(unmatched_reads.len(), 1);
-
         assert_equal(
             &unmatched_reads[0],
             &OwnedRecord {
