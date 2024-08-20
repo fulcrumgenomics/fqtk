@@ -151,11 +151,7 @@ mod tests {
     use core::panic;
 
     use super::*;
-    use csv::DeserializeErrorKind as CsvDeserializeErrorEnum;
-    use csv::ErrorKind as CsvErrorEnum;
     use fgoxide::{self, io::Io};
-    use serde::de::value::Error as SerdeError;
-    use serde::de::Error;
     use tempfile::TempDir;
 
     // ############################################################################################
@@ -211,6 +207,27 @@ mod tests {
         let _sample = Sample::new(ordinal, name, barcode);
     }
 
+    #[test]
+    fn test_tsv_file_delim_error() {
+        let lines: Vec<String> = ["sample_id,barcode", "sample1,GATTACA", "sample2,CATGCTA"]
+            .iter()
+            .map(|&s| s.into())
+            .collect();
+        let tempdir = TempDir::new().unwrap();
+        let f1 = tempdir.path().join("sample_metadata.tsv");
+
+        let io = Io::default();
+        io.write_lines(&f1, &lines).unwrap();
+        let err = SampleGroup::from_file(&f1).unwrap_err();
+
+        if let fgoxide::FgError::DelimFileHeaderError { expected, found } = err {
+            assert_eq!(expected, Sample::deserialize_header_line());
+            assert_eq!(found, "sample_id,barcode");
+        } else {
+            panic!()
+        }
+    }
+
     // ############################################################################################
     // Test [`SampleGroup::from_file`] - Expected to panic
     // ############################################################################################
@@ -222,16 +239,14 @@ mod tests {
 
         let io = Io::default();
         io.write_lines(&f1, &lines).unwrap();
-        let mut to_panic = true;
-        if let fgoxide::FgError::ConversionError(csv_e) = SampleGroup::from_file(&f1).unwrap_err() {
-            if let CsvErrorEnum::Deserialize { pos: _, err: csv_de_err } = csv_e.into_kind() {
-                if let CsvDeserializeErrorEnum::Message(s) = csv_de_err.kind() {
-                    to_panic = false;
-                    assert_eq!(s, &SerdeError::missing_field("sample_id").to_string());
-                }
-            }
+        if let fgoxide::FgError::DelimFileHeaderError { expected, found } =
+            SampleGroup::from_file(&f1).unwrap_err()
+        {
+            assert_eq!(expected, Sample::deserialize_header_line());
+            assert_eq!(found, "sample1\tGATTACA");
+        } else {
+            panic!("Different error type than expected reading from headerless file.")
         }
-        assert!(!to_panic, "Different error type than expected reading from headerless file.");
     }
 
     #[test]
