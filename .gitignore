@@ -1,2 +1,4 @@
 /target
 .vscode
+*.fq
+*.fq.gz
