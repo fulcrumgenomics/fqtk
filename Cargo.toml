@@ -2,7 +2,8 @@
 authors = [
     "Nathan Roach <nathan@fulcrumgenomics.com>",
     "Tim Fennell <tim@fulcrumgenomics.com>",
-    "Nils Homer <nils@fulcrumgenomics.com>"
+    "Nils Homer <nils@fulcrumgenomics.com>",
+    "Brent Pedersen <bpederse@gmail.com>"
 ]
 name = "fqtk"
 version = "0.3.2-rc.1"
@@ -33,10 +34,10 @@ path = "src/bin/main.rs"
 ahash = "0.8.2"
 anyhow = "1.0.38"
 bstr = "1.0.1"
-clap = { version = "4.0.25", features = ["derive"] }
+clap = { version = "4.3.22", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
-fgoxide = "0.3.0"
+fgoxide = { git = "https://github.com/brentp/fgoxide", branch = "pub-is-gz" }
 flate2 = { version = "1.0.25", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
 itertools = "0.10.5"
 log = "0.4.17"
