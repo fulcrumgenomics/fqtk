@@ -5,8 +5,8 @@ use fgoxide::io::DelimFile;
 use itertools::Itertools;
 use serde::Deserialize;
 use serde_aux::prelude::*;
-use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
 use std::fmt::{self, Display};
 use std::path::Path;
 
@@ -155,8 +155,8 @@ mod tests {
     use csv::DeserializeErrorKind as CsvDeserializeErrorEnum;
     use csv::ErrorKind as CsvErrorEnum;
     use fgoxide::{self, io::Io};
-    use serde::de::value::Error as SerdeError;
     use serde::de::Error;
+    use serde::de::value::Error as SerdeError;
     use tempfile::TempDir;
 
     // ############################################################################################
