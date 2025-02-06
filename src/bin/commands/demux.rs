@@ -522,6 +522,8 @@ impl DemuxMetric {
 /// 1. `sample_id` - the id of the sample or library.
 /// 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
 ///
+/// IUPAC bases are supported in the (expected) `barcode` column.
+///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
 /// sample barcodes extracted from the bases in the sample metadata and associated read structures.
