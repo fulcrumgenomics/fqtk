@@ -1,4 +1,5 @@
-use super::is_valid_base;
+use crate::is_valid_iupac;
+
 use anyhow::Result;
 use fgoxide::io::DelimFile;
 use itertools::Itertools;
@@ -43,14 +44,14 @@ impl Sample {
     /// # Panics
     ///   - Panics if sample name is empty string.
     ///   - Panics if barcode is empty string.
-    ///   - Panics if barcode has bases other than A, C, G, or T.
+    ///   - Panics if barcode has bases other than A, C, G, T, or N/n/.
     #[must_use]
     pub fn new(ordinal: usize, name: String, barcode: String) -> Self {
         assert!(!name.is_empty(), "Sample name cannot be empty");
         assert!(!barcode.is_empty(), "Sample barcode cannot be empty");
         assert!(
-            barcode.as_bytes().iter().all(|&b| is_valid_base(b)),
-            "All sample barcode bases must be one of A, C, G, or T"
+            barcode.as_bytes().iter().all(|&b| is_valid_iupac(b)),
+            "All sample barcode bases must be one of A, C, G, T, U, R, Y, S, W, K, M, D, V, H, B, N"
         );
         Self { sample_id: name, barcode, ordinal }
     }

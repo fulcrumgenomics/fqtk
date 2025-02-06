@@ -580,7 +580,7 @@ pub(crate) struct Demux {
 
     /// The read structure types to write to their own files (Must be one of T, B, or M for
     /// template reads, sample barcode reads, and molecular barcode reads).
-    /// 
+    ///
     /// Multiple output types may be specified as a space-delimited list.
     #[clap(long, short='b', default_value="T", num_args = 1.. )]
     output_types: Vec<char>,
@@ -735,7 +735,7 @@ impl Demux {
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
 
-            for (optional_ws, target) in vec![
+            for (optional_ws, target) in [
                 (template_writers, &mut new_template_writers),
                 (barcode_writers, &mut new_sample_barcode_writers),
                 (mol_writers, &mut new_molecular_barcode_writers),
@@ -1413,6 +1413,82 @@ mod tests {
                 head: b"ex_0 1:N:0:NNNNNNN".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_demux_with_iupac_bases_in_barcode() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("7B+T").unwrap()];
+        let s1_barcode = "MMMMMMM";
+        let s2_barcode = "KKKKKKK";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode, s2_barcode]);
+        let input_files = vec![fastq_file(
+            &tmp,
+            "ex",
+            "ex",
+            &[
+                &("AAAAAAA".to_owned() + &"A".repeat(5)), // barcode s1
+                &("CCCCCCC".to_owned() + &"A".repeat(5)), // barcode s1
+                &("ACACACA".to_owned() + &"A".repeat(5)), // barcode s1
+                &("GTGTGTG".to_owned() + &"C".repeat(5)), // barcode s2
+                &("TGTGTGT".to_owned() + &"C".repeat(5)), // barcode s2
+                &("CGCGCGC".to_owned() + &"T".repeat(5)), // unmatched
+            ],
+        )];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 0,
+            min_mismatch_delta: 0,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 3);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAA".to_vec(),
+                seq: "A".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        let output_path = output_dir.join("Sample0001.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 2);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_3 1:N:0:GTGTGTG".to_vec(),
+                seq: "C".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        // Should not match since it has 3 no calls, and barcodes have at maximum 1 no-call
+        let unmatched_path = output_dir.join("unmatched.R1.fq.gz");
+        let unmatched_reads = read_fastq(&unmatched_path);
+        assert_eq!(unmatched_reads.len(), 1);
+        assert_equal(
+            &unmatched_reads[0],
+            &OwnedRecord {
+                head: b"ex_5 1:N:0:CGCGCGC".to_vec(),
+                seq: "T".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
             },
         );
     }
