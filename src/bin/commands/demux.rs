@@ -522,7 +522,11 @@ impl DemuxMetric {
 /// 1. `sample_id` - the id of the sample or library.
 /// 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
 ///
-/// IUPAC bases are supported in the (expected) `barcode` column.
+/// IUPAC bases are supported in the (expected) `barcode` column.  An observed IUPAC base must be
+/// at least as specific as the corresponding base in the expected sample barcode.  E.g. If the
+/// observed base is an N, it will only match expected sample barcrods with an N.  And if the
+/// observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
+/// A and G (R/V/D/N are a superset of the bases compare to R).
 ///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the

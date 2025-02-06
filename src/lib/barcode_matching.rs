@@ -92,7 +92,11 @@ impl BarcodeMatcher {
         for i in 0..observed_bases.nr_symbols() {
             let observed_base = observed_bases.get(i).unwrap();
             let expected_base = expected_bases.get(i).unwrap();
-            // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes, but not in the observed barcodes.
+            // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes.
+            // An IUPAC base in the observed barcode matches if it is at least as specific as the
+            // corresponding (IUPAC) base in the expected barcode. E.g. If the observed base is an
+            // N, it will not match anything but an N, and if the observed base is an R, it
+            // will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
             if expected_base & observed_base != observed_base {
                 count += 1;
             }
@@ -253,6 +257,19 @@ mod tests {
         assert_eq!(count_mismatches("ACGTTAAACCGAAACA", "ACGTUMRWSYKVHDBN"), 0,);
         // IUPAC bases are mismatches in the observed barcodes
         assert_eq!(count_mismatches("ACGTUMRWSYKVHDBN", "ACGTTAAACCGAAACA"), 11,);
+    }
+
+    #[test]
+    fn count_mismatches_iupac_bases_assymetry() {
+        // if the observed base is an N, it will not match anything but an N
+        assert_eq!(count_mismatches("N", "R"), 1,);
+        assert_eq!(count_mismatches("N", "N"), 0,);
+        // if the observed base is an R, it will match R, V, D, and N
+        assert_eq!(count_mismatches("R", "R"), 0,);
+        assert_eq!(count_mismatches("R", "V"), 0,);
+        assert_eq!(count_mismatches("R", "D"), 0,);
+        assert_eq!(count_mismatches("R", "N"), 0,);
+        assert_eq!(count_mismatches("R", "B"), 1,);
     }
 
     #[test]
