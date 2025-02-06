@@ -537,6 +537,7 @@ impl DemuxMetric {
 ///    mismatches (see `--max-mismatches`).
 /// 2. The difference between number of mismatches in the best and second best barcodes is greater
 ///    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
+///
 /// The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
 /// of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 /// both the observed barcodes `AAA` and `AAN`).
@@ -894,7 +895,7 @@ impl Command for Demux {
         );
 
         let mut fq_iterators = fq_sources
-            .zip(self.read_structures.clone().into_iter())
+            .zip(self.read_structures.clone())
             .map(|(source, read_structure)| {
                 ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
                     .read_ahead(1000, 1000)
@@ -1147,6 +1148,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "cannot be read-only")]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn test_read_only_output_dir_fails() {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
@@ -1880,7 +1882,7 @@ mod tests {
         let read_structures =
             vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("7B").unwrap()];
 
-        let records = vec![
+        let records = [
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
@@ -1916,7 +1918,7 @@ mod tests {
         let read_structures =
             vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("7B").unwrap()];
 
-        let records = vec![
+        let records = [
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
