@@ -107,6 +107,10 @@ impl BarcodeMatcher {
 
         // If observed bases contains '-' and the expected bases contains 'N', treat
         // '-'/'N' as a match.
+        // TODO: would just need to complement observed, then take the intersection, and count the
+        // # of Ns.  Needs bio-seq to implement the complement of Iupac bases:
+        // https://github.com/jeff-k/bio-seq/blame/c5c657603ecb845ba7398f5d78cb31bdf19351f5/bio-seq/src/codec/iupac.rs#L153
+
         if expected_has_ns && observed_bases.iter().contains(&Iupac::X) {
             for (obs, exp) in observed_bases.iter().zip(expected_bases.iter()) {
                 if obs == Iupac::X && exp == Iupac::N {
