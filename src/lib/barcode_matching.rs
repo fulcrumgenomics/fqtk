@@ -1,9 +1,11 @@
-use crate::encode;
+use crate::encode_expected;
+use crate::encode_observed;
 
 use super::byte_is_nocall;
 use ahash::HashMap as AHashMap;
 use ahash::HashMapExt;
-use bio::data_structures::bitenc::BitEnc;
+use bio_seq::prelude::*;
+use itertools::Itertools;
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
@@ -24,7 +26,7 @@ pub struct BarcodeMatch {
 #[derive(Clone, Debug)]
 pub struct BarcodeMatcher {
     /// Vec of the barcodes for each sample
-    sample_barcodes: Vec<BitEnc>,
+    sample_barcodes: Vec<Seq<Iupac>>,
     /// The maxium number of Ns in any barcode in set of sample barcodes
     max_ns_in_barcodes: usize,
     /// The maximum mismatches to match a sample barcode.
@@ -36,6 +38,8 @@ pub struct BarcodeMatcher {
     use_cache: bool,
     /// Caching struct for storing results of previous matches
     cache: AHashMap<Vec<u8>, BarcodeMatch>,
+    /// Vec of booleans for each sample indicating whether the sample barcode has any Ns.
+    has_ns: Vec<bool>,
 }
 
 impl BarcodeMatcher {
@@ -63,11 +67,13 @@ impl BarcodeMatcher {
             .iter()
             .map(|barcode| {
                 let num_ns: usize = barcode.chars().filter(|&b| byte_is_nocall(b as u8)).count();
-                let barcode: BitEnc = encode(barcode.to_ascii_uppercase().as_bytes());
+                let barcode: Seq<Iupac> = encode_expected(barcode.to_ascii_uppercase().as_bytes());
                 max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
                 barcode
             })
             .collect::<Vec<_>>();
+        let has_ns =
+            modified_sample_barcodes.iter().map(|b| (*b).iter().contains(&Iupac::N)).collect();
 
         Self {
             sample_barcodes: modified_sample_barcodes,
@@ -76,29 +82,36 @@ impl BarcodeMatcher {
             min_mismatch_delta,
             use_cache,
             cache: AHashMap::with_capacity(STARTING_CACHE_SIZE),
+            has_ns,
         }
     }
 
     /// Counts the number of bases that differ between two byte arrays.
-    fn count_mismatches(observed_bases: &BitEnc, expected_bases: &BitEnc) -> u8 {
+    fn count_mismatches(
+        observed_bases: &Seq<Iupac>,
+        expected_bases: &Seq<Iupac>,
+        expected_has_ns: bool,
+    ) -> u8 {
         assert_eq!(
-            observed_bases.nr_symbols(),
-            expected_bases.nr_symbols(),
+            observed_bases.len(),
+            expected_bases.len(),
             "observed_bases: {}, expected_bases: {}",
-            observed_bases.nr_symbols(),
-            expected_bases.nr_symbols()
+            observed_bases.len(),
+            expected_bases.len()
         );
-        let mut count: usize = 0;
-        for i in 0..observed_bases.nr_symbols() {
-            let observed_base = observed_bases.get(i).unwrap();
-            let expected_base = expected_bases.get(i).unwrap();
-            // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes.
-            // An IUPAC base in the observed barcode matches if it is at least as specific as the
-            // corresponding (IUPAC) base in the expected barcode. E.g. If the observed base is an
-            // N, it will not match anything but an N, and if the observed base is an R, it
-            // will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
-            if expected_base & observed_base != observed_base {
-                count += 1;
+
+        let observed_bases: &SeqSlice<Iupac> = observed_bases;
+        let expected_bases: &SeqSlice<Iupac> = expected_bases;
+        let intersection: Seq<Iupac> = observed_bases & expected_bases;
+        let mut count: usize = intersection.iter().filter(|b| b.to_char() as u8 == b'-').count();
+
+        // If observed bases contains '-' and the expected bases contains 'N', treat
+        // '-'/'N' as a match.
+        if expected_has_ns && observed_bases.iter().contains(&Iupac::X) {
+            for (obs, exp) in observed_bases.iter().zip(expected_bases.iter()) {
+                if obs == Iupac::X && exp == Iupac::N {
+                    count -= 1;
+                }
             }
         }
         u8::try_from(count).expect("Overflow on number of mismatch bases")
@@ -106,7 +119,7 @@ impl BarcodeMatcher {
 
     /// Returns the expected barcode length, assuming a fixed length for all samples.
     fn expected_barcode_length(&self) -> usize {
-        self.sample_barcodes[0].nr_symbols()
+        self.sample_barcodes[0].len()
     }
 
     /// Assigns the barcode that best matches the provided ``read_bases``.
@@ -115,9 +128,10 @@ impl BarcodeMatcher {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
-        let read_bases = encode(read_bases); // NB: this encodes IUPAC bases in the read, but count_mismatches will treat them as no-calls.
+        let read_bases = encode_observed(read_bases);
         for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
-            let mismatches = Self::count_mismatches(&read_bases, sample_barcode);
+            let mismatches =
+                Self::count_mismatches(&read_bases, sample_barcode, self.has_ns[index]);
             if mismatches < best_mismatches {
                 next_best_mismatches = best_mismatches;
                 best_mismatches = mismatches;
@@ -202,9 +216,13 @@ mod tests {
     }
 
     fn count_mismatches(observed_bases: &str, expected_bases: &str) -> u8 {
+        let expected_bases = encode_expected(expected_bases.as_bytes());
+        let has_ns = expected_bases.iter().contains(&Iupac::N);
+
         BarcodeMatcher::count_mismatches(
-            &encode(observed_bases.as_bytes()),
-            &encode(expected_bases.as_bytes()),
+            &encode_observed(observed_bases.as_bytes()),
+            &expected_bases,
+            has_ns,
         )
     }
 
@@ -254,9 +272,9 @@ mod tests {
 
     #[test]
     fn find_compare_iupac_barcode() {
-        assert_eq!(count_mismatches("ACGTTAAACCGAAACA", "ACGTUMRWSYKVHDBN"), 0,);
+        assert_eq!(count_mismatches("ACGTAAACCGAAACA", "ACGTMRWSYKVHDBN"), 0,);
         // IUPAC bases are mismatches in the observed barcodes
-        assert_eq!(count_mismatches("ACGTUMRWSYKVHDBN", "ACGTTAAACCGAAACA"), 11,);
+        assert_eq!(count_mismatches("ACGTMRWSYKVHDBN", "ACGTAAACCGAAACA"), 11,);
     }
 
     #[test]
@@ -264,12 +282,12 @@ mod tests {
         // if the observed base is an N, it will not match anything but an N
         assert_eq!(count_mismatches("N", "R"), 1,);
         assert_eq!(count_mismatches("N", "N"), 0,);
-        // if the observed base is an R, it will match R, V, D, and N
-        assert_eq!(count_mismatches("R", "R"), 0,);
-        assert_eq!(count_mismatches("R", "V"), 0,);
-        assert_eq!(count_mismatches("R", "D"), 0,);
-        assert_eq!(count_mismatches("R", "N"), 0,);
+        // if the observed base is not A, C, G, T, U, or N, it will not match anything except an N
+        assert_eq!(count_mismatches("R", "R"), 1,);
+        assert_eq!(count_mismatches("R", "V"), 1,);
+        assert_eq!(count_mismatches("R", "D"), 1,);
         assert_eq!(count_mismatches("R", "B"), 1,);
+        assert_eq!(count_mismatches("R", "N"), 0,);
     }
 
     #[test]

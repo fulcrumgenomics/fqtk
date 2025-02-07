@@ -49,8 +49,8 @@ serde-aux = "4.1.2"
 seq_io = "0.3.1"
 thiserror = "1.0.37"
 proglog = {version = "0.3.0", features = ["pretty_counts"] }
+bio-seq = { version = "0.13.12", features = ["extra_codecs", "simd"] }
 lazy_static = "1.5.0"
-bio = "2.0.3"
 
 [dev-dependencies]
 csv = "1.1.6"

@@ -1,7 +1,7 @@
 pub mod barcode_matching;
 pub mod samples;
 
-use bio::data_structures::bitenc::BitEnc;
+use bio_seq::prelude::*;
 use lazy_static::lazy_static;
 
 pub const DNA_BASES: [u8; 5] = *b"ACGTN";
@@ -48,20 +48,49 @@ lazy_static! {
 }
 
 #[must_use]
-pub fn encode(bases: &[u8]) -> BitEnc {
-    let mut vec = BitEnc::with_capacity(4, bases.len());
-    for base in bases {
-        let base =
-            if byte_is_nocall(*base) { 'N' as usize } else { base.to_ascii_uppercase() as usize };
-        let bit = if base >= 256 { 0 } else { IUPAC_MASKS[base] };
-        vec.push(bit);
-    }
-    vec
+fn encode_observed(bases: &[u8]) -> Seq<Iupac> {
+    bases
+        .iter()
+        .map(|b| {
+            if byte_is_nocall(*b) || !is_valid_base(*b) {
+                b'-' // so that Ns in the observed read match nothing, even other Ns
+            } else if *b == b'U' {
+                b'T'
+            } else {
+                *b
+            }
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+#[must_use]
+fn encode_expected(bases: &[u8]) -> Seq<Iupac> {
+    bases
+        .iter()
+        .map(|b| {
+            if byte_is_nocall(*b) || !is_valid_iupac(*b) {
+                b'N'
+            } else if *b == b'U' {
+                b'T'
+            } else {
+                *b
+            }
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
 }
 
 /// Checks whether a given u8 byte is a "No-call"-ed base, signified by the bytes 'N', 'n' and '.'
 fn byte_is_nocall(byte: u8) -> bool {
     byte == b'N' || byte == b'n' || byte == b'.'
+}
+
+/// Checks whether a provided byte is an IUPAC or nocall.
+fn is_valid_base(byte: u8) -> bool {
+    DNA_MASKS[byte as usize] != 0 || byte_is_nocall(byte)
 }
 
 /// Checks whether a provided byte is an IUPAC or nocall.
@@ -106,26 +135,46 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_dna_bases() {
-        for base in DNA_BASES {
-            let actual: u8 = encode(&[base]).get(0).unwrap();
-            assert_eq!(actual, IUPAC_MASKS[base as usize]);
-        }
+    fn test_encode_observed() {
+        assert_eq!(encode_observed(b"A").get(0).unwrap(), Iupac::A);
+        assert_eq!(encode_observed(b"C").get(0).unwrap(), Iupac::C);
+        assert_eq!(encode_observed(b"G").get(0).unwrap(), Iupac::G);
+        assert_eq!(encode_observed(b"T").get(0).unwrap(), Iupac::T);
+        assert_eq!(encode_observed(b"U").get(0).unwrap(), Iupac::T);
+        assert_eq!(encode_observed(b"M").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"R").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"W").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"S").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"Y").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"K").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"V").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"H").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"D").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"B").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"N").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b".").get(0).unwrap(), Iupac::X);
+        assert_eq!(encode_observed(b"h").get(0).unwrap(), Iupac::X);
     }
 
     #[test]
-    fn test_encode_iupac_bases() {
-        for base in IUPAC_BASES {
-            let actual: u8 = encode(&[base]).get(0).unwrap();
-            assert_eq!(actual, IUPAC_MASKS[base as usize]);
-        }
-    }
-
-    #[test]
-    fn test_encode_no_calls() {
-        for base in [b'N', b'n', b'.'] {
-            let actual: u8 = encode(&[base]).get(0).unwrap();
-            assert_eq!(actual as usize, 15);
-        }
+    fn test_encode_expected() {
+        assert_eq!(encode_expected(b"A").get(0).unwrap(), Iupac::A);
+        assert_eq!(encode_expected(b"C").get(0).unwrap(), Iupac::C);
+        assert_eq!(encode_expected(b"G").get(0).unwrap(), Iupac::G);
+        assert_eq!(encode_expected(b"T").get(0).unwrap(), Iupac::T);
+        assert_eq!(encode_expected(b"U").get(0).unwrap(), Iupac::T);
+        assert_eq!(encode_expected(b"M").get(0).unwrap(), Iupac::M);
+        assert_eq!(encode_expected(b"R").get(0).unwrap(), Iupac::R);
+        assert_eq!(encode_expected(b"W").get(0).unwrap(), Iupac::W);
+        assert_eq!(encode_expected(b"S").get(0).unwrap(), Iupac::S);
+        assert_eq!(encode_expected(b"Y").get(0).unwrap(), Iupac::Y);
+        assert_eq!(encode_expected(b"K").get(0).unwrap(), Iupac::K);
+        assert_eq!(encode_expected(b"V").get(0).unwrap(), Iupac::V);
+        assert_eq!(encode_expected(b"H").get(0).unwrap(), Iupac::H);
+        assert_eq!(encode_expected(b"D").get(0).unwrap(), Iupac::D);
+        assert_eq!(encode_expected(b"B").get(0).unwrap(), Iupac::B);
+        assert_eq!(encode_expected(b"N").get(0).unwrap(), Iupac::N);
+        assert_eq!(encode_expected(b".").get(0).unwrap(), Iupac::N);
+        assert_eq!(encode_expected(b"h").get(0).unwrap(), Iupac::N);
     }
 }
