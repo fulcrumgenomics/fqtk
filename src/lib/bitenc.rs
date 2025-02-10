@@ -451,7 +451,7 @@ pub struct BitEncIter<'a> {
     i: usize,
 }
 
-impl<'a> Iterator for BitEncIter<'a> {
+impl Iterator for BitEncIter<'_> {
     type Item = u8;
 
     fn next(&mut self) -> Option<u8> {
@@ -521,10 +521,9 @@ mod tests {
         // | 42 42 42 42 | 17 17 23 42 | 17 17 17 17 | 17 17 17 17 | __ __ 17 17 |
 
         let values: Vec<u8> = bitenc.iter().collect();
-        assert_eq!(
-            values,
-            [42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
-        );
+        assert_eq!(values, [
+            42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17
+        ]);
         assert_eq!(bitenc.nr_blocks(), 5);
         assert_eq!(bitenc.nr_symbols(), 18);
     }
@@ -533,7 +532,7 @@ mod tests {
     fn test_issue29() {
         for w in 2..9 {
             let mut vec = BitEnc::with_capacity(w, 1000);
-            for i in 0..1000 {
+            for _ in 0..1000 {
                 vec.push(1);
             }
         }
