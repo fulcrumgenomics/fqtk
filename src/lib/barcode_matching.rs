@@ -1,9 +1,11 @@
+use std::cmp::min;
+
 use crate::encode;
 
 use super::byte_is_nocall;
+use crate::bitenc::BitEnc;
 use ahash::HashMap as AHashMap;
 use ahash::HashMapExt;
-use bio::data_structures::bitenc::BitEnc;
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
@@ -80,7 +82,11 @@ impl BarcodeMatcher {
     }
 
     /// Counts the number of bases that differ between two byte arrays.
-    fn count_mismatches(observed_bases: &BitEnc, expected_bases: &BitEnc) -> u8 {
+    fn count_mismatches(
+        observed_bases: &BitEnc,
+        expected_bases: &BitEnc,
+        max_mismatches: u8,
+    ) -> u8 {
         assert_eq!(
             observed_bases.nr_symbols(),
             expected_bases.nr_symbols(),
@@ -88,19 +94,20 @@ impl BarcodeMatcher {
             observed_bases.nr_symbols(),
             expected_bases.nr_symbols()
         );
-        let mut count: usize = 0;
-        for i in 0..observed_bases.nr_symbols() {
-            let observed_base = observed_bases.get(i).unwrap();
-            let expected_base = expected_bases.get(i).unwrap();
-            // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes.
-            // An IUPAC base in the observed barcode matches if it is at least as specific as the
-            // corresponding (IUPAC) base in the expected barcode. E.g. If the observed base is an
-            // N, it will not match anything but an N, and if the observed base is an R, it
-            // will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
-            if expected_base & observed_base != observed_base {
-                count += 1;
-            }
-        }
+        // let mut count: usize = 0;
+        // for i in 0..observed_bases.nr_symbols() {
+        //     let observed_base = observed_bases.get(i).unwrap();
+        //     let expected_base = expected_bases.get(i).unwrap();
+        //     // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes.
+        //     // An IUPAC base in the observed barcode matches if it is at least as specific as the
+        //     // corresponding (IUPAC) base in the expected barcode. E.g. If the observed base is an
+        //     // N, it will not match anything but an N, and if the observed base is an R, it
+        //     // will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
+        //     if expected_base & observed_base != observed_base {
+        //         count += 1;
+        //     }
+        // }
+        let count = observed_bases.hamming(expected_bases, u32::from(max_mismatches));
         u8::try_from(count).expect("Overflow on number of mismatch bases")
     }
 
@@ -115,15 +122,20 @@ impl BarcodeMatcher {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
+        let mut max_mismatches = 255u8;
         let read_bases = encode(read_bases); // NB: this encodes IUPAC bases in the read, but count_mismatches will treat them as no-calls.
         for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
-            let mismatches = Self::count_mismatches(&read_bases, sample_barcode);
+            let mismatches = Self::count_mismatches(&read_bases, sample_barcode, max_mismatches);
             if mismatches < best_mismatches {
                 next_best_mismatches = best_mismatches;
                 best_mismatches = mismatches;
                 best_barcode_index = index;
             } else if mismatches < next_best_mismatches {
                 next_best_mismatches = mismatches;
+            }
+            if next_best_mismatches < 255u8 - self.min_mismatch_delta {
+                max_mismatches =
+                    min(max_mismatches, next_best_mismatches + self.min_mismatch_delta);
             }
         }
 
@@ -205,6 +217,7 @@ mod tests {
         BarcodeMatcher::count_mismatches(
             &encode(observed_bases.as_bytes()),
             &encode(expected_bases.as_bytes()),
+            255,
         )
     }
 

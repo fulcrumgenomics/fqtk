@@ -1,7 +1,8 @@
 pub mod barcode_matching;
+pub mod bitenc;
 pub mod samples;
 
-use bio::data_structures::bitenc::BitEnc;
+use crate::bitenc::BitEnc;
 use lazy_static::lazy_static;
 
 pub const DNA_BASES: [u8; 5] = *b"ACGTN";
@@ -51,9 +52,16 @@ lazy_static! {
 pub fn encode(bases: &[u8]) -> BitEnc {
     let mut vec = BitEnc::with_capacity(4, bases.len());
     for base in bases {
-        let base =
-            if byte_is_nocall(*base) { 'N' as usize } else { base.to_ascii_uppercase() as usize };
-        let bit = if base >= 256 { 0 } else { IUPAC_MASKS[base] };
+        let bit: u8 = if byte_is_nocall(*base) {
+            IUPAC_MASKS[b'N' as usize]
+        } else {
+            let value = base.to_ascii_uppercase() as usize;
+            if value < 256 {
+                IUPAC_MASKS[value]
+            } else {
+                0
+            }
+        };
         vec.push(bit);
     }
     vec
