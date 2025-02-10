@@ -131,7 +131,7 @@ impl BarcodeMatcher {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
-        let read_bases = encode_observed(read_bases);
+        let read_bases = encode_observed(&read_bases.to_ascii_uppercase());
         for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
             let mismatches =
                 Self::count_mismatches(&read_bases, sample_barcode, self.has_ns[index]);
