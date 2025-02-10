@@ -94,19 +94,6 @@ impl BarcodeMatcher {
             observed_bases.nr_symbols(),
             expected_bases.nr_symbols()
         );
-        // let mut count: usize = 0;
-        // for i in 0..observed_bases.nr_symbols() {
-        //     let observed_base = observed_bases.get(i).unwrap();
-        //     let expected_base = expected_bases.get(i).unwrap();
-        //     // Note: this allows IUPAC fuzzy matching with IUPAC bases in the expected barcodes.
-        //     // An IUPAC base in the observed barcode matches if it is at least as specific as the
-        //     // corresponding (IUPAC) base in the expected barcode. E.g. If the observed base is an
-        //     // N, it will not match anything but an N, and if the observed base is an R, it
-        //     // will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
-        //     if expected_base & observed_base != observed_base {
-        //         count += 1;
-        //     }
-        // }
         let count = observed_bases.hamming(expected_bases, u32::from(max_mismatches));
         u8::try_from(count).expect("Overflow on number of mismatch bases")
     }

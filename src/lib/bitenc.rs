@@ -418,6 +418,12 @@ impl BitEnc {
     }
 
     /// Calculate the Hamming distance between this and another bitencoded sequence.
+    ///
+    /// Note: this allows IUPAC fuzzy matching with IUPAC bases in this sequence.
+    /// An IUPAC base in the other sequence matches if it is at least as specific as the
+    /// corresponding (IUPAC) base in this sequence. E.g. If the other sequence is an
+    /// N, it will not match anything but an N, and if the other base is an R, it
+    /// will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
     pub fn hamming(&self, other: &BitEnc, max_mismatches: u32) -> u32 {
         assert!(self.len == other.len, "Both bitenc sequences must have the same length");
         assert!(self.width == other.width, "Both bitenc sequences must have the same width");
@@ -521,9 +527,10 @@ mod tests {
         // | 42 42 42 42 | 17 17 23 42 | 17 17 17 17 | 17 17 17 17 | __ __ 17 17 |
 
         let values: Vec<u8> = bitenc.iter().collect();
-        assert_eq!(values, [
-            42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17
-        ]);
+        assert_eq!(
+            values,
+            [42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+        );
         assert_eq!(bitenc.nr_blocks(), 5);
         assert_eq!(bitenc.nr_symbols(), 18);
     }
