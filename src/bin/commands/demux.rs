@@ -547,7 +547,7 @@ impl DemuxMetric {
 /// structures) of one of the types supplied to `--output-types`.  FASTQ files have names
 /// of the format:
 ///
-/// ```
+/// ```bash
 /// {sample_id}.{segment_type}{read_num}.fq.gz
 /// ```
 ///
@@ -564,7 +564,7 @@ impl DemuxMetric {
 /// reading a sample barcode, as well as an in-line 8bp sample barcode in read one, the command
 /// line would be:
 ///
-/// ```
+/// ```bash
 /// fqtk demux \
 ///     --inputs r1.fq.gz i1.fq.gz i2.fq.gz r2.fq.gz \
 ///     --read-structures 8B92T 8B 8B 100T \
@@ -574,6 +574,7 @@ impl DemuxMetric {
 ///
 #[derive(Parser, Debug)]
 #[command(version)]
+#[clap(verbatim_doc_comment)]
 pub(crate) struct Demux {
     /// One or more input fastq files each corresponding to a sequencing (e.g. R1, I1).
     #[clap(long, short = 'i', required = true, num_args = 1..)]
