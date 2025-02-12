@@ -432,13 +432,14 @@ impl BitEnc {
         for block_index in 0..self.nr_blocks() {
             let intersection = self.storage[block_index] & other.storage[block_index];
             if intersection != self.storage[block_index] {
+                let mut shift_i = 0;
                 for i in 0..values_per_block {
-                    let shift_i = i * self.width;
                     let intersection_sub = (intersection >> shift_i) & self.mask;
                     let self_sub = (self.storage[block_index] >> shift_i) & self.mask;
                     if intersection_sub != self_sub {
                         count += 1;
                     }
+                    shift_i += self.width;
                 }
                 if count >= max_mismatches {
                     return max_mismatches;
