@@ -1,14 +1,18 @@
+use std::cmp::min;
+
+use crate::encode;
+
 use super::byte_is_nocall;
+use crate::bitenc::BitEnc;
 use ahash::HashMap as AHashMap;
 use ahash::HashMapExt;
-use bstr::{BString, ByteSlice};
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
 /// The struct that contains the info related to the best and next best sample barcode match.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BarcodeMatch {
-    /// Index of the best bardcode match in the corresponding BarcodeMatcher struct that generated
+    /// Index of the best bardcode match in the corresponding ``BarcodeMatcher`` struct that generated
     /// this match.
     pub best_match: usize,
     /// The number of mismatches to the best matching barcode for the read described by this match.
@@ -22,9 +26,7 @@ pub struct BarcodeMatch {
 #[derive(Clone, Debug)]
 pub struct BarcodeMatcher {
     /// Vec of the barcodes for each sample
-    /// Note - this is to be replaced by a sample struct in task 3. For now we're keeping things
-    /// very simple.
-    sample_barcodes: Vec<BString>,
+    sample_barcodes: Vec<BitEnc>,
     /// The maxium number of Ns in any barcode in set of sample barcodes
     max_ns_in_barcodes: usize,
     /// The maximum mismatches to match a sample barcode.
@@ -62,8 +64,8 @@ impl BarcodeMatcher {
         let modified_sample_barcodes = sample_barcodes
             .iter()
             .map(|barcode| {
-                let barcode = BString::from(barcode.to_ascii_uppercase());
-                let num_ns = barcode.iter().filter(|&b| byte_is_nocall(*b)).count();
+                let num_ns: usize = barcode.chars().filter(|&b| byte_is_nocall(b as u8)).count();
+                let barcode: BitEnc = encode(barcode.to_ascii_uppercase().as_bytes());
                 max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
                 barcode
             })
@@ -80,26 +82,25 @@ impl BarcodeMatcher {
     }
 
     /// Counts the number of bases that differ between two byte arrays.
-    fn count_mismatches(observed_bases: &[u8], expected_bases: &[u8]) -> u8 {
+    fn count_mismatches(
+        observed_bases: &BitEnc,
+        expected_bases: &BitEnc,
+        max_mismatches: u8,
+    ) -> u8 {
         assert_eq!(
-            observed_bases.len(),
-            expected_bases.len(),
+            observed_bases.nr_symbols(),
+            expected_bases.nr_symbols(),
             "observed_bases: {}, expected_bases: {}",
-            observed_bases.len(),
-            expected_bases.len()
+            observed_bases.nr_symbols(),
+            expected_bases.nr_symbols()
         );
-        let mut count: usize = 0;
-        for (&expected_base, &observed_base) in expected_bases.iter().zip(observed_bases.iter()) {
-            if !byte_is_nocall(expected_base) && expected_base != observed_base {
-                count += 1;
-            }
-        }
+        let count = observed_bases.hamming(expected_bases, u32::from(max_mismatches));
         u8::try_from(count).expect("Overflow on number of mismatch bases")
     }
 
     /// Returns the expected barcode length, assuming a fixed length for all samples.
     fn expected_barcode_length(&self) -> usize {
-        self.sample_barcodes[0].len()
+        self.sample_barcodes[0].nr_symbols()
     }
 
     /// Assigns the barcode that best matches the provided ``read_bases``.
@@ -108,15 +109,20 @@ impl BarcodeMatcher {
         let mut best_barcode_index = self.sample_barcodes.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
+        let mut max_mismatches = 255u8;
+        let read_bases = encode(read_bases); // NB: this encodes IUPAC bases in the read, but count_mismatches will treat them as no-calls.
         for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
-            let mismatches = Self::count_mismatches(read_bases, sample_barcode.as_bstr());
-
+            let mismatches = Self::count_mismatches(&read_bases, sample_barcode, max_mismatches);
             if mismatches < best_mismatches {
                 next_best_mismatches = best_mismatches;
                 best_mismatches = mismatches;
                 best_barcode_index = index;
             } else if mismatches < next_best_mismatches {
                 next_best_mismatches = mismatches;
+            }
+            if next_best_mismatches < 255u8 - self.min_mismatch_delta {
+                max_mismatches =
+                    min(max_mismatches, next_best_mismatches + self.min_mismatch_delta);
             }
         }
 
@@ -194,6 +200,14 @@ mod tests {
         let _matcher = BarcodeMatcher::new(&sample_barcodes, 2, 1, use_cache);
     }
 
+    fn count_mismatches(observed_bases: &str, expected_bases: &str) -> u8 {
+        BarcodeMatcher::count_mismatches(
+            &encode(observed_bases.as_bytes()),
+            &encode(expected_bases.as_bytes()),
+            255,
+        )
+    }
+
     // ############################################################################################
     // Test BarcodeMatcher::count_mismatches
     // ############################################################################################
@@ -204,43 +218,64 @@ mod tests {
     //   2. the fewer operations / better optimization in this core matching function the better.
     #[test]
     fn empty_string_can_run_in_count_mismatches() {
-        assert_eq!(BarcodeMatcher::count_mismatches("".as_bytes(), "".as_bytes()), 0);
+        assert_eq!(count_mismatches("", ""), 0);
     }
 
     #[test]
+
     fn find_no_mismatches() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GATTACA".as_bytes()), 0,);
+        assert_eq!(count_mismatches("GATTACA", "GATTACA"), 0,);
     }
 
     #[test]
     fn ns_in_expected_barcode_dont_contribute_to_mismatch_counter() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GANNACA".as_bytes()), 0,);
+        assert_eq!(count_mismatches("GATTACA", "GANNACA"), 0,);
     }
 
     #[test]
     fn all_ns_barcode_have_no_mismatches() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GANNACA".as_bytes(), "NNNNNNN".as_bytes()), 0,);
+        assert_eq!(count_mismatches("GANNACA", "NNNNNNN"), 0,);
     }
 
     #[test]
     fn find_two_mismatches() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GACCACA".as_bytes()), 2,);
+        assert_eq!(count_mismatches("GATTACA", "GACCACA"), 2,);
     }
 
     #[test]
     fn not_count_no_calls() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "GANNACA".as_bytes()), 0,);
+        assert_eq!(count_mismatches("GATTACA", "GANNACA"), 0,);
     }
 
     #[test]
     fn find_compare_two_sequences_that_have_all_mismatches() {
-        assert_eq!(BarcodeMatcher::count_mismatches("GATTACA".as_bytes(), "CTAATGT".as_bytes()), 7,);
+        assert_eq!(count_mismatches("GATTACA", "CTAATGT"), 7,);
+    }
+
+    #[test]
+    fn find_compare_iupac_barcode() {
+        assert_eq!(count_mismatches("ACGTTAAACCGAAACA", "ACGTUMRWSYKVHDBN"), 0,);
+        // IUPAC bases are mismatches in the observed barcodes
+        assert_eq!(count_mismatches("ACGTUMRWSYKVHDBN", "ACGTTAAACCGAAACA"), 11,);
+    }
+
+    #[test]
+    fn count_mismatches_iupac_bases_assymetry() {
+        // if the observed base is an N, it will not match anything but an N
+        assert_eq!(count_mismatches("N", "R"), 1,);
+        assert_eq!(count_mismatches("N", "N"), 0,);
+        // if the observed base is an R, it will match R, V, D, and N
+        assert_eq!(count_mismatches("R", "R"), 0,);
+        assert_eq!(count_mismatches("R", "V"), 0,);
+        assert_eq!(count_mismatches("R", "D"), 0,);
+        assert_eq!(count_mismatches("R", "N"), 0,);
+        assert_eq!(count_mismatches("R", "B"), 1,);
     }
 
     #[test]
     #[should_panic(expected = "observed_bases: 5, expected_bases: 6")]
     fn find_compare_two_sequences_of_different_length() {
-        let _mismatches = BarcodeMatcher::count_mismatches("GATTA".as_bytes(), "CTATGT".as_bytes());
+        let _mismatches = count_mismatches("GATTA", "CTATGT");
     }
 
     // ############################################################################################
