@@ -433,7 +433,7 @@ impl BitEnc {
             let intersection = self.storage[block_index] & other.storage[block_index];
             if intersection != self.storage[block_index] {
                 let mut shift_i = 0;
-                for i in 0..values_per_block {
+                for _ in 0..values_per_block {
                     let intersection_sub = (intersection >> shift_i) & self.mask;
                     let self_sub = (self.storage[block_index] >> shift_i) & self.mask;
                     if intersection_sub != self_sub {
@@ -528,10 +528,9 @@ mod tests {
         // | 42 42 42 42 | 17 17 23 42 | 17 17 17 17 | 17 17 17 17 | __ __ 17 17 |
 
         let values: Vec<u8> = bitenc.iter().collect();
-        assert_eq!(
-            values,
-            [42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
-        );
+        assert_eq!(values, [
+            42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17
+        ]);
         assert_eq!(bitenc.nr_blocks(), 5);
         assert_eq!(bitenc.nr_symbols(), 18);
     }
