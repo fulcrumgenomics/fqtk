@@ -36,9 +36,7 @@ bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
 enum_dispatch = "0.3.8"
 env_logger = "0.9.3"
-# TODO: change this when 0.3.1 is released with header validation.
-# fgoxide = "0.3.1"
-fgoxide = { git = "https://github.com/fulcrumgenomics/fgoxide.git", branch = "jf/validate-header" }
+fgoxide = "0.5.0"
 flate2 = { version = "1.0.25", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
 itertools = "0.10.5"
 log = "0.4.17"
