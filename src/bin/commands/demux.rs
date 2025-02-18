@@ -54,7 +54,7 @@ struct FastqSegment {
 
 #[derive(Eq, Hash, PartialEq, Debug, Clone, Copy)]
 enum SkipReason {
-    /// The read had to few bases for the segment.
+    /// The read had too few bases for the segment.
     TooFewBases,
 }
 
@@ -531,7 +531,7 @@ impl DemuxMetric {
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
 /// sample barcodes extracted from the bases in the sample metadata and associated read structures.
 ///
-/// An observed barcode matches an expected barcocde if all the following are true:
+/// An observed barcode matches an expected barcode if all the following are true:
 /// 1. The number of mismatches (edits/substitutions) is less than or equal to the maximum
 ///    mismatches (see `--max-mismatches`).
 /// 2. The difference between number of mismatches in the best and second best barcodes is greater
@@ -586,7 +586,7 @@ pub(crate) struct Demux {
 
     /// The read structure types to write to their own files (Must be one of T, B, or M for
     /// template reads, sample barcode reads, and molecular barcode reads).
-    /// 
+    ///
     /// Multiple output types may be specified as a space-delimited list.
     #[clap(long, short='b', default_value="T", num_args = 1.. )]
     output_types: Vec<char>,
@@ -887,7 +887,7 @@ impl Command for Demux {
 
         // Setup the barcode matcher - the primary return from here is the index of the samp
         let mut barcode_matcher = BarcodeMatcher::new(
-            &sample_group.samples.iter().map(|s| s.barcode.as_str()).collect::<Vec<_>>(),
+            &sample_group.samples,
             u8::try_from(self.max_mismatches)?,
             u8::try_from(self.min_mismatch_delta)?,
             true,
