@@ -75,7 +75,7 @@ bases, and molecular identifiers from each read.  The observed sample barcode
 will be matched to the sample barcodes extracted from the bases in the sample
 metadata and associated read structures.
 
-An observed barcode matches an expected barcocde if all the following are true:
+An observed barcode matches an expected barcode if all the following are true:
 
 1. The number of mismatches (edits/substitutions) is less than or equal to the
    maximum mismatches (see --max-mismatches).
