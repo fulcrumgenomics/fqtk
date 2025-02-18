@@ -120,7 +120,7 @@ Usage: fqtk demux [OPTIONS] --inputs <INPUTS>... --read-structures <READ_STRUCTU
 
 Options:
   -i, --inputs <INPUTS>...
-          One or more input fastq files each corresponding to a sequencing read (e.g. R1, I1)
+          One or more input FASTQ files each corresponding to a sequencing read (e.g. R1, I1)
 
   -r, --read-structures <READ_STRUCTURES>...
           The read structures, one per input FASTQ in the same order
