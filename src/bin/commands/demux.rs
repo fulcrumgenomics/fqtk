@@ -576,7 +576,7 @@ impl DemuxMetric {
 #[command(version)]
 #[clap(verbatim_doc_comment)]
 pub(crate) struct Demux {
-    /// One or more input fastq files each corresponding to a sequencing (e.g. R1, I1).
+    /// One or more input FASTQ files each corresponding to a sequencing read (e.g. R1, I1).
     #[clap(long, short = 'i', required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 
