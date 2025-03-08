@@ -1,5 +1,11 @@
+use std::cmp::min;
+
+use crate::decode;
+use crate::encode;
+
 use super::byte_is_nocall;
 use super::samples::Sample;
+use crate::bitenc::BitEnc;
 use ahash::HashMap as AHashMap;
 use ahash::HashMapExt;
 
@@ -8,8 +14,8 @@ const STARTING_CACHE_SIZE: usize = 1_000_000;
 /// The struct that contains the info related to the best and next best sample barcode match.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BarcodeMatch {
-    /// Index of the best barcode match in the corresponding BarcodeMatcher struct that generated
-    /// this match.
+    /// Index of the best barcode match in the corresponding ``BarcodeMatcher`` struct that
+    /// generated this match.
     pub best_match: usize,
     /// The number of mismatches to the best matching barcode for the read described by this match.
     pub best_mismatches: u8,
@@ -23,6 +29,8 @@ pub struct BarcodeMatch {
 pub struct BarcodeMatcher {
     /// Vec storing each sample
     samples: Vec<Sample>,
+    /// Vec of the barcodes for each sample
+    sample_barcodes: Vec<BitEnc>,
     /// The maxium number of Ns in any barcode in set of sample barcodes
     max_ns_in_barcodes: usize,
     /// The maximum mismatches to match a sample barcode.
@@ -58,13 +66,17 @@ impl BarcodeMatcher {
 
         let mut max_ns_in_barcodes = 0;
         let mut modified_samples = samples.to_vec();
-        for sample in modified_samples.iter_mut() {
+        let mut sample_barcodes = Vec::with_capacity(samples.len());
+        for sample in &mut modified_samples {
             sample.barcode = sample.barcode.to_ascii_uppercase();
-            let num_ns = sample.barcode.as_bytes().iter().filter(|&b| byte_is_nocall(*b)).count();
+            let bytes = sample.barcode.as_bytes();
+            let num_ns: usize = bytes.iter().filter(|&&b| byte_is_nocall(b)).count();
             max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
+            sample_barcodes.push(encode(bytes));
         }
         Self {
             samples: modified_samples,
+            sample_barcodes,
             max_ns_in_barcodes,
             max_mismatches,
             min_mismatch_delta,
@@ -74,27 +86,27 @@ impl BarcodeMatcher {
     }
 
     /// Counts the number of bases that differ between two byte arrays.
-    fn count_mismatches(observed_bases: &[u8], sample: &Sample) -> u8 {
-        let expected_bases = sample.barcode.as_bytes();
-        let observed_string =
-            std::str::from_utf8(observed_bases).expect("Observed bases are not valid UTF-8");
-        assert_eq!(
-            observed_bases.len(),
-            expected_bases.len(),
-            "Read barcode ({}) length ({}) differs from expected barcode ({}) length ({}) for sample {}",
-            observed_string,
-            observed_bases.len(),
-            sample.barcode,
-            expected_bases.len(),
-            sample.sample_id
-        );
-        let mut count: usize = 0;
-        for (&expected_base, &observed_base) in expected_bases.iter().zip(observed_bases.iter()) {
-            if !byte_is_nocall(expected_base) && expected_base != observed_base {
-                count += 1;
-            }
+    fn count_mismatches(
+        observed_bases: &BitEnc,
+        expected_bases: &BitEnc,
+        sample: &Sample,
+        max_mismatches: u8,
+    ) -> u8 {
+        if observed_bases.nr_symbols() != expected_bases.nr_symbols() {
+            let observed_string = decode(observed_bases);
+            assert_eq!(
+                observed_bases.nr_symbols(),
+                expected_bases.nr_symbols(),
+                "Read barcode ({}) length ({}) differs from expected barcode ({}) length ({}) for sample {}",
+                observed_string,
+                observed_bases.nr_symbols(),
+                sample.barcode,
+                expected_bases.nr_symbols(),
+                sample.sample_id
+            );
         }
-        u8::try_from(count).expect("Overflow on number of mismatched bases")
+        let count = observed_bases.hamming(expected_bases, u32::from(max_mismatches));
+        u8::try_from(count).expect("Overflow on number of mismatch bases")
     }
 
     /// Returns the expected barcode length, assuming a fixed length for all samples.
@@ -108,15 +120,29 @@ impl BarcodeMatcher {
         let mut best_barcode_index = self.samples.len();
         let mut best_mismatches = 255u8;
         let mut next_best_mismatches = 255u8;
-        for (index, sample) in self.samples.iter().enumerate() {
-            let mismatches = Self::count_mismatches(read_bases, sample);
-
+        let mut max_mismatches = 255u8;
+        let read_bases = encode(read_bases); // NB: this encodes IUPAC bases in the read, but count_mismatches will treat them as no-calls.
+        for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
+            let mismatches = Self::count_mismatches(
+                &read_bases,
+                sample_barcode,
+                &self.samples[index],
+                max_mismatches,
+            );
             if mismatches < best_mismatches {
                 next_best_mismatches = best_mismatches;
                 best_mismatches = mismatches;
                 best_barcode_index = index;
+                if next_best_mismatches < 255u8 - self.min_mismatch_delta {
+                    max_mismatches =
+                        min(max_mismatches, next_best_mismatches + self.min_mismatch_delta);
+                }
             } else if mismatches < next_best_mismatches {
                 next_best_mismatches = mismatches;
+                if next_best_mismatches < 255u8 - self.min_mismatch_delta {
+                    max_mismatches =
+                        min(max_mismatches, next_best_mismatches + self.min_mismatch_delta);
+                }
             }
         }
 
@@ -168,7 +194,11 @@ mod tests {
     /// Given a barcode and integer identifier, generate a sample instance. This helper function
     /// allows creating more succinct testing code.
     fn barcode_to_sample(barcode: &str, idx: usize) -> Sample {
-        Sample::new(idx, format!("sample_{idx}").to_string(), barcode.to_string())
+        Sample {
+            barcode: barcode.to_string(),
+            sample_id: format!("sample_{idx}").to_string(),
+            ordinal: idx,
+        }
     }
 
     /// Create a vector of samples from a list of barcodes, for more succinct testing code.
@@ -178,6 +208,18 @@ mod tests {
             .enumerate()
             .map(|(idx, barcode)| barcode_to_sample(barcode, idx))
             .collect::<Vec<_>>()
+    }
+
+    /// Helper for running ``BarcodeMatcher::count_mismatches``.  Encodes the bases, and creates a
+    /// dummy sample.
+    fn count_mismatches(observed_bases: &str, expected_bases: &str) -> u8 {
+        let sample = barcode_to_sample(expected_bases, 0);
+        BarcodeMatcher::count_mismatches(
+            &encode(observed_bases.as_bytes()),
+            &encode(expected_bases.as_bytes()),
+            &sample,
+            255,
+        )
     }
 
     // ############################################################################################
@@ -211,74 +253,62 @@ mod tests {
         expected = "Read barcode () length (0) differs from expected barcode (CTATGT) length (6) for sample sample_0"
     )]
     fn empty_read_barcode_fails_length_mismatch() {
-        let _mismatches =
-            BarcodeMatcher::count_mismatches("".as_bytes(), &barcode_to_sample("CTATGT", 0));
+        count_mismatches("", "CTATGT");
+    }
+
+    #[test]
+    fn empty_string_can_run_in_count_mismatches() {
+        assert_eq!(count_mismatches("", ""), 0);
     }
 
     #[test]
     fn find_no_mismatches() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GATTACA".as_bytes(),
-                &barcode_to_sample("GATTACA", 0)
-            ),
-            0
-        );
+        assert_eq!(count_mismatches("GATTACA", "GATTACA"), 0,);
     }
 
     #[test]
     fn ns_in_expected_barcode_dont_contribute_to_mismatch_counter() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GATTACA".as_bytes(),
-                &barcode_to_sample("GANNACA", 0)
-            ),
-            0
-        );
+        assert_eq!(count_mismatches("GATTACA", "GANNACA"), 0,);
     }
 
     #[test]
     fn all_ns_barcode_have_no_mismatches() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GANNACA".as_bytes(),
-                &barcode_to_sample("NNNNNNN", 0)
-            ),
-            0
-        );
+        assert_eq!(count_mismatches("GANNACA", "NNNNNNN"), 0,);
     }
 
     #[test]
     fn find_two_mismatches() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GATTACA".as_bytes(),
-                &barcode_to_sample("GACCACA", 0)
-            ),
-            2
-        );
+        assert_eq!(count_mismatches("GATTACA", "GACCACA"), 2,);
     }
 
     #[test]
     fn not_count_no_calls() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GATTACA".as_bytes(),
-                &barcode_to_sample("GANNACA", 0)
-            ),
-            0
-        );
+        assert_eq!(count_mismatches("GATTACA", "GANNACA"), 0,);
     }
 
     #[test]
     fn find_compare_two_sequences_that_have_all_mismatches() {
-        assert_eq!(
-            BarcodeMatcher::count_mismatches(
-                "GATTACA".as_bytes(),
-                &barcode_to_sample("CTAATGT", 0)
-            ),
-            7
-        );
+        assert_eq!(count_mismatches("GATTACA", "CTAATGT"), 7,);
+    }
+
+    #[test]
+    fn find_compare_iupac_barcode() {
+        assert_eq!(count_mismatches("ACGTTAAACCGAAACA", "ACGTUMRWSYKVHDBN"), 0,);
+        // IUPAC bases are mismatches in the observed barcodes
+        assert_eq!(count_mismatches("ACGTUMRWSYKVHDBN", "ACGTTAAACCGAAACA"), 11,);
+    }
+
+    #[test]
+    fn count_mismatches_iupac_bases_assymetry() {
+        // if the observed base is an N, it will not match anything but an N
+        assert_eq!(count_mismatches("N", "R"), 1,);
+        assert_eq!(count_mismatches("N", "N"), 0,);
+        // if the observed base is an R, it will match R, V, D, and N
+        assert_eq!(count_mismatches("R", "R"), 0,);
+        assert_eq!(count_mismatches("R", "V"), 0,);
+        assert_eq!(count_mismatches("R", "D"), 0,);
+        assert_eq!(count_mismatches("R", "N"), 0,);
+        assert_eq!(count_mismatches("R", "B"), 1,);
     }
 
     #[test]
@@ -286,8 +316,7 @@ mod tests {
         expected = "Read barcode (GATTA) length (5) differs from expected barcode (CTATGT) length (6) for sample sample_0"
     )]
     fn find_compare_two_sequences_of_different_length() {
-        let _mismatches =
-            BarcodeMatcher::count_mismatches("GATTA".as_bytes(), &barcode_to_sample("CTATGT", 0));
+        let _mismatches = count_mismatches("GATTA", "CTATGT");
     }
 
     // ############################################################################################
