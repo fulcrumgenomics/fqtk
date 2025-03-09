@@ -25,6 +25,7 @@ It is highly efficient and multi-threaded for high performance.
 
 Usage for `fqtk demux` follows:
 
+<!-- start usage -->
 ```console
 Performs sample demultiplexing on FASTQs.
 
@@ -178,6 +179,7 @@ Options:
   -V, --version
           Print version information
 ```
+<!-- end usage -->
 
 ## Installing
 
