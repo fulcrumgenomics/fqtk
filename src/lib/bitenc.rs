@@ -424,19 +424,28 @@ impl BitEnc {
     /// corresponding (IUPAC) base in this sequence. E.g. If the other sequence is an
     /// N, it will not match anything but an N, and if the other base is an R, it
     /// will match R, V, D, and N, since the latter IUPAC codes allow both A and G.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length and widths of the two sequences are not the same.
+    #[must_use]
     pub fn hamming(&self, other: &BitEnc, max_mismatches: u32) -> u32 {
         assert!(self.len == other.len, "Both bitenc sequences must have the same length");
         assert!(self.width == other.width, "Both bitenc sequences must have the same width");
         let mut count: u32 = 0;
         let values_per_block = self.usable_bits_per_block / self.width;
         for block_index in 0..self.nr_blocks() {
-            let intersection = self.storage[block_index] & other.storage[block_index];
-            if intersection != self.storage[block_index] {
+            // Get the bits that are different across the two blocks.  These represent differences
+            // in values (bases), where multiple values (bases) are stored in each block.  We
+            // save the block differences so we efficiently count the differences below.
+            let block_diff = self.storage[block_index] & !other.storage[block_index];
+            if block_diff != 0 {
+                // Scan through the values (bases) in the block, counting those values (bases)
+                // that are different.
                 let mut shift_i = 0;
                 for _ in 0..values_per_block {
-                    let intersection_sub = (intersection >> shift_i) & self.mask;
-                    let self_sub = (self.storage[block_index] >> shift_i) & self.mask;
-                    if intersection_sub != self_sub {
+                    let block_diff_sub = (block_diff >> shift_i) & self.mask;
+                    if block_diff_sub != 0 {
                         count += 1;
                     }
                     shift_i += self.width;
@@ -528,9 +537,10 @@ mod tests {
         // | 42 42 42 42 | 17 17 23 42 | 17 17 17 17 | 17 17 17 17 | __ __ 17 17 |
 
         let values: Vec<u8> = bitenc.iter().collect();
-        assert_eq!(values, [
-            42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17
-        ]);
+        assert_eq!(
+            values,
+            [42, 42, 42, 42, 42, 23, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+        );
         assert_eq!(bitenc.nr_blocks(), 5);
         assert_eq!(bitenc.nr_symbols(), 18);
     }

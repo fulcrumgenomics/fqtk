@@ -3,50 +3,48 @@ pub mod bitenc;
 pub mod samples;
 
 use crate::bitenc::BitEnc;
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 pub const DNA_BASES: [u8; 5] = *b"ACGTN";
 pub const IUPAC_BASES: [u8; 15] = *b"ACGTMRWSYKVHDBN";
 
-lazy_static! {
-    pub static ref BASE_A: usize = 1;
-    pub static ref BASE_C: usize = 2;
-    pub static ref BASE_G: usize = 4;
-    pub static ref BASE_T: usize = 8;
-    pub static ref BASE_N: usize = 15;
-    pub static ref DNA_MASKS: [u8; 256] = {
-        let mut masks = [0; 256];
-        let (a, c, g, t) = (1, 2, 4, 8);
-        masks['A' as usize] = a;
-        masks['C' as usize] = c;
-        masks['G' as usize] = g;
-        masks['T' as usize] = t;
-        masks['U' as usize] = t;
-        masks['N' as usize] = a | c | g | t;
-        masks
-    };
-    pub static ref IUPAC_MASKS: [u8; 256] = {
-        let mut masks = [0; 256];
-        let (a, c, g, t) = (1, 2, 4, 8);
-        masks['A' as usize] = a;
-        masks['C' as usize] = c;
-        masks['G' as usize] = g;
-        masks['T' as usize] = t;
-        masks['U' as usize] = t;
-        masks['M' as usize] = a | c;
-        masks['R' as usize] = a | g;
-        masks['W' as usize] = a | t;
-        masks['S' as usize] = c | g;
-        masks['Y' as usize] = c | t;
-        masks['K' as usize] = g | t;
-        masks['V' as usize] = a | c | g;
-        masks['H' as usize] = a | c | t;
-        masks['D' as usize] = a | g | t;
-        masks['B' as usize] = c | g | t;
-        masks['N' as usize] = a | c | g | t;
-        masks
-    };
-}
+pub static BASE_A: LazyLock<usize> = LazyLock::new(|| 1);
+pub static BASE_C: LazyLock<usize> = LazyLock::new(|| 2);
+pub static BASE_G: LazyLock<usize> = LazyLock::new(|| 4);
+pub static BASE_T: LazyLock<usize> = LazyLock::new(|| 8);
+pub static BASE_N: LazyLock<usize> = LazyLock::new(|| 15);
+pub static DNA_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
+    let mut masks = [0; 256];
+    let (a, c, g, t) = (1, 2, 4, 8);
+    masks['A' as usize] = a;
+    masks['C' as usize] = c;
+    masks['G' as usize] = g;
+    masks['T' as usize] = t;
+    masks['U' as usize] = t;
+    masks['N' as usize] = a | c | g | t;
+    masks
+});
+pub static IUPAC_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
+    let mut masks = [0; 256];
+    let (a, c, g, t) = (1, 2, 4, 8);
+    masks['A' as usize] = a;
+    masks['C' as usize] = c;
+    masks['G' as usize] = g;
+    masks['T' as usize] = t;
+    masks['U' as usize] = t;
+    masks['M' as usize] = a | c;
+    masks['R' as usize] = a | g;
+    masks['W' as usize] = a | t;
+    masks['S' as usize] = c | g;
+    masks['Y' as usize] = c | t;
+    masks['K' as usize] = g | t;
+    masks['V' as usize] = a | c | g;
+    masks['H' as usize] = a | c | t;
+    masks['D' as usize] = a | g | t;
+    masks['B' as usize] = c | g | t;
+    masks['N' as usize] = a | c | g | t;
+    masks
+});
 
 #[must_use]
 pub fn encode(bases: &[u8]) -> BitEnc {
