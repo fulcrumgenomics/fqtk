@@ -3,17 +3,16 @@ pub mod bitenc;
 pub mod samples;
 
 use crate::bitenc::BitEnc;
-use std::sync::LazyLock;
 
 pub const DNA_BASES: [u8; 5] = *b"ACGTN";
 pub const IUPAC_BASES: [u8; 15] = *b"ACGTMRWSYKVHDBN";
 
-pub static BASE_A: LazyLock<usize> = LazyLock::new(|| 1);
-pub static BASE_C: LazyLock<usize> = LazyLock::new(|| 2);
-pub static BASE_G: LazyLock<usize> = LazyLock::new(|| 4);
-pub static BASE_T: LazyLock<usize> = LazyLock::new(|| 8);
-pub static BASE_N: LazyLock<usize> = LazyLock::new(|| 15);
-pub static DNA_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
+pub const BASE_A: usize = 1;
+pub const BASE_C: usize = 2;
+pub const BASE_G: usize = 4;
+pub const BASE_T: usize = 8;
+pub const BASE_B: usize = 15;
+pub const DNA_MASKS: [u8; 256] = {
     let mut masks = [0; 256];
     let (a, c, g, t) = (1, 2, 4, 8);
     masks['A' as usize] = a;
@@ -23,8 +22,8 @@ pub static DNA_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
     masks['U' as usize] = t;
     masks['N' as usize] = a | c | g | t;
     masks
-});
-pub static IUPAC_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
+};
+pub const IUPAC_MASKS: [u8; 256] = {
     let mut masks = [0; 256];
     let (a, c, g, t) = (1, 2, 4, 8);
     masks['A' as usize] = a;
@@ -44,7 +43,7 @@ pub static IUPAC_MASKS: LazyLock<[u8; 256]> = LazyLock::new(|| {
     masks['B' as usize] = c | g | t;
     masks['N' as usize] = a | c | g | t;
     masks
-});
+};
 
 #[must_use]
 pub fn encode(bases: &[u8]) -> BitEnc {
@@ -54,7 +53,11 @@ pub fn encode(bases: &[u8]) -> BitEnc {
             IUPAC_MASKS[b'N' as usize]
         } else {
             let value = base.to_ascii_uppercase() as usize;
-            if value < 256 { IUPAC_MASKS[value] } else { 0 }
+            if value < 256 {
+                IUPAC_MASKS[value]
+            } else {
+                0
+            }
         };
         vec.push(bit);
     }
