@@ -71,6 +71,12 @@ following two columns present:
 For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be
 concatenated together in the order they are read and stored in the `barcode` field.
 
+IUPAC bases are supported in the (expected) `barcode` column.  An observed IUPAC base must be
+at least as specific as the corresponding base in the expected sample barcode.  E.g. If the
+observed base is an N, it will only match expected sample barcrods with an N.  And if the
+observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
+A and G (R/V/D/N are a superset of the bases compare to R).
+
 The read structures will be used to extract the observed sample barcode, template bases, and
 molecular identifiers from each read.  The observed sample barcode will be matched to the
 sample barcodes extracted from the bases in the sample metadata and associated read structures.
@@ -80,6 +86,7 @@ An observed barcode matches an expected barcode if all the following are true:
    mismatches (see `--max-mismatches`).
 2. The difference between number of mismatches in the best and second best barcodes is greater
    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
+
 The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
 of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 both the observed barcodes `AAA` and `AAN`).
@@ -154,7 +161,7 @@ Options:
           [default: 2]
 
   -t, --threads <THREADS>
-          The number of threads to use. Cannot be less than 5
+          The number of threads to use. Cannot be less than 3
 
           [default: 8]
 
