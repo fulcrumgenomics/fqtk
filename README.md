@@ -62,14 +62,20 @@ be concatenated using the `-` delimiter and placed in the given SAM record tag (
 default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
 tag.
 
-Metadata about the samples should be given as a headered metadata TSV file with at least the 
+Metadata about the samples should be given as a headered metadata TSV file with at least the
 following two columns present:
 
-1. `sample_id` - the id of the sample or library. 
+1. `sample_id` - the id of the sample or library.
 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
 
-For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be 
+For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be
 concatenated together in the order they are read and stored in the `barcode` field.
+
+IUPAC bases are supported in the (expected) `barcode` column.  An observed IUPAC base must be
+at least as specific as the corresponding base in the expected sample barcode.  E.g. If the
+observed base is an N, it will only match expected sample barcrods with an N.  And if the
+observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
+A and G (R/V/D/N are a superset of the bases compare to R).
 
 The read structures will be used to extract the observed sample barcode, template bases, and
 molecular identifiers from each read.  The observed sample barcode will be matched to the
@@ -80,6 +86,7 @@ An observed barcode matches an expected barcode if all the following are true:
    mismatches (see `--max-mismatches`).
 2. The difference between number of mismatches in the best and second best barcodes is greater
    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
+
 The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
 of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 both the observed barcodes `AAA` and `AAN`).

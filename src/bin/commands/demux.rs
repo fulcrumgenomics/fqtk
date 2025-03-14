@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgoxide::io::{DelimFile, Io};
@@ -8,7 +8,7 @@ use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use itertools::Itertools;
 use log::info;
-use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
+use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
 use proglog::{CountFormatterKind, ProgLogBuilder};
 use read_structure::ReadStructure;
 use read_structure::ReadStructureError;
@@ -518,14 +518,20 @@ impl DemuxMetric {
 /// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
 /// tag.
 ///
-/// Metadata about the samples should be given as a headered metadata TSV file with at least the 
+/// Metadata about the samples should be given as a headered metadata TSV file with at least the
 /// following two columns present:
-/// 
-/// 1. `sample_id` - the id of the sample or library. 
+///
+/// 1. `sample_id` - the id of the sample or library.
 /// 2. `barcode` - the expected barcode sequence associated with the `sample_id`.
-/// 
-/// For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be 
+///
+/// For reads containing multiple barcodes (such as dual-indexed reads), all barcodes should be
 /// concatenated together in the order they are read and stored in the `barcode` field.
+///
+/// IUPAC bases are supported in the (expected) `barcode` column.  An observed IUPAC base must be
+/// at least as specific as the corresponding base in the expected sample barcode.  E.g. If the
+/// observed base is an N, it will only match expected sample barcrods with an N.  And if the
+/// observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
+/// A and G (R/V/D/N are a superset of the bases compare to R).
 ///
 /// The read structures will be used to extract the observed sample barcode, template bases, and
 /// molecular identifiers from each read.  The observed sample barcode will be matched to the
@@ -536,6 +542,7 @@ impl DemuxMetric {
 ///    mismatches (see `--max-mismatches`).
 /// 2. The difference between number of mismatches in the best and second best barcodes is greater
 ///    than or equal to the minimum mismatch delta (`--min-mismatch-delta`).
+///
 /// The expected barcode sequence may contains Ns, which are not counted as mismatches regardless
 /// of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 /// both the observed barcodes `AAA` and `AAN`).
@@ -741,7 +748,7 @@ impl Demux {
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
 
-            for (optional_ws, target) in vec![
+            for (optional_ws, target) in [
                 (template_writers, &mut new_template_writers),
                 (barcode_writers, &mut new_sample_barcode_writers),
                 (mol_writers, &mut new_molecular_barcode_writers),
@@ -894,7 +901,7 @@ impl Command for Demux {
         );
 
         let mut fq_iterators = fq_sources
-            .zip(self.read_structures.clone().into_iter())
+            .zip(self.read_structures.clone())
             .map(|(source, read_structure)| {
                 ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
                     .read_ahead(1000, 1000)
@@ -1147,6 +1154,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "cannot be read-only")]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn test_read_only_output_dir_fails() {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
@@ -1419,6 +1427,82 @@ mod tests {
                 head: b"ex_0 1:N:0:NNNNNNN".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_demux_with_iupac_bases_in_barcode() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("7B+T").unwrap()];
+        let s1_barcode = "MMMMMMM";
+        let s2_barcode = "KKKKKKK";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode, s2_barcode]);
+        let input_files = vec![fastq_file(
+            &tmp,
+            "ex",
+            "ex",
+            &[
+                &("AAAAAAA".to_owned() + &"A".repeat(5)), // barcode s1
+                &("CCCCCCC".to_owned() + &"A".repeat(5)), // barcode s1
+                &("ACACACA".to_owned() + &"A".repeat(5)), // barcode s1
+                &("GTGTGTG".to_owned() + &"C".repeat(5)), // barcode s2
+                &("TGTGTGT".to_owned() + &"C".repeat(5)), // barcode s2
+                &("CGCGCGC".to_owned() + &"T".repeat(5)), // unmatched
+            ],
+        )];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 0,
+            min_mismatch_delta: 0,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 3);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAA".to_vec(),
+                seq: "A".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        let output_path = output_dir.join("Sample0001.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+        assert_eq!(fq_reads.len(), 2);
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_3 1:N:0:GTGTGTG".to_vec(),
+                seq: "C".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
+            },
+        );
+
+        // Should not match since it has 3 no calls, and barcodes have at maximum 1 no-call
+        let unmatched_path = output_dir.join("unmatched.R1.fq.gz");
+        let unmatched_reads = read_fastq(&unmatched_path);
+        assert_eq!(unmatched_reads.len(), 1);
+        assert_equal(
+            &unmatched_reads[0],
+            &OwnedRecord {
+                head: b"ex_5 1:N:0:CGCGCGC".to_vec(),
+                seq: "T".repeat(5).as_bytes().to_vec(),
+                qual: ";".repeat(5).as_bytes().to_vec(),
             },
         );
     }
@@ -1875,7 +1959,7 @@ mod tests {
         let read_structures =
             vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("7B").unwrap()];
 
-        let records = vec![
+        let records = [
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
@@ -1911,7 +1995,7 @@ mod tests {
         let read_structures =
             vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("7B").unwrap()];
 
-        let records = vec![
+        let records = [
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
