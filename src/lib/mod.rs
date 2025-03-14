@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod barcode_matching;
 pub mod bitenc;
 pub mod samples;
@@ -52,8 +54,7 @@ pub fn encode(bases: &[u8]) -> BitEnc {
         let bit: u8 = if byte_is_nocall(*base) {
             IUPAC_MASKS[b'N' as usize]
         } else {
-            let value = base.to_ascii_uppercase() as usize;
-            if value < 256 { IUPAC_MASKS[value] } else { 0 }
+            IUPAC_MASKS[base.to_ascii_uppercase() as usize]
         };
         vec.push(bit);
     }

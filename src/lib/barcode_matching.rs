@@ -6,8 +6,7 @@ use crate::encode;
 use super::byte_is_nocall;
 use super::samples::Sample;
 use crate::bitenc::BitEnc;
-use ahash::HashMap as AHashMap;
-use ahash::HashMapExt;
+use rustc_hash::FxHashMap;
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
@@ -38,10 +37,8 @@ pub struct BarcodeMatcher {
     /// The minimum difference between number of mismatches in the best and second best barcodes
     /// for a barcode to be considered a match.
     min_mismatch_delta: u8,
-    /// If true will attempt to use the cache when matching.
-    use_cache: bool,
-    /// Caching struct for storing results of previous matches
-    cache: AHashMap<Vec<u8>, BarcodeMatch>,
+    /// Cache of previous matches; `None` disables caching, `Some(map)` enables it.
+    cache: Option<FxHashMap<Vec<u8>, BarcodeMatch>>,
 }
 
 impl BarcodeMatcher {
@@ -74,37 +71,25 @@ impl BarcodeMatcher {
             max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
             sample_barcodes.push(encode(bytes));
         }
+        let cache = use_cache
+            .then(|| FxHashMap::with_capacity_and_hasher(STARTING_CACHE_SIZE, Default::default()));
         Self {
             samples: modified_samples,
             sample_barcodes,
             max_ns_in_barcodes,
             max_mismatches,
             min_mismatch_delta,
-            use_cache,
-            cache: AHashMap::with_capacity(STARTING_CACHE_SIZE),
+            cache,
         }
     }
 
-    /// Counts the number of bases that differ between two byte arrays.
+    /// Counts the number of bases that differ between two equal-length encoded byte arrays.
+    /// Callers must ensure lengths match (validated once in [`Self::assign_internal`]).
     fn count_mismatches(
         observed_bases: &BitEnc,
         expected_bases: &BitEnc,
-        sample: &Sample,
         max_mismatches: u8,
     ) -> u8 {
-        if observed_bases.nr_symbols() != expected_bases.nr_symbols() {
-            let observed_string = decode(observed_bases);
-            assert_eq!(
-                observed_bases.nr_symbols(),
-                expected_bases.nr_symbols(),
-                "Read barcode ({}) length ({}) differs from expected barcode ({}) length ({}) for sample {}",
-                observed_string,
-                observed_bases.nr_symbols(),
-                sample.barcode,
-                expected_bases.nr_symbols(),
-                sample.sample_id
-            );
-        }
         let count = observed_bases.hamming(expected_bases, u32::from(max_mismatches));
         u8::try_from(count).expect("Overflow on number of mismatch bases")
     }
@@ -122,13 +107,16 @@ impl BarcodeMatcher {
         let mut next_best_mismatches = 255u8;
         let mut max_mismatches = 255u8;
         let read_bases = encode(read_bases); // NB: this encodes IUPAC bases in the read, but count_mismatches will treat them as no-calls.
+        let expected_len = self.expected_barcode_length();
+        assert!(
+            read_bases.nr_symbols() == expected_len,
+            "Read barcode ({}) length ({}) differs from expected barcode length ({})",
+            decode(&read_bases),
+            read_bases.nr_symbols(),
+            expected_len,
+        );
         for (index, sample_barcode) in self.sample_barcodes.iter().enumerate() {
-            let mismatches = Self::count_mismatches(
-                &read_bases,
-                sample_barcode,
-                &self.samples[index],
-                max_mismatches,
-            );
+            let mismatches = Self::count_mismatches(&read_bases, sample_barcode, max_mismatches);
             if mismatches < best_mismatches {
                 next_best_mismatches = best_mismatches;
                 best_mismatches = mismatches;
@@ -169,20 +157,18 @@ impl BarcodeMatcher {
         }
         let num_no_calls = read_bases.iter().filter(|&&b| byte_is_nocall(b)).count();
         if num_no_calls > (self.max_mismatches as usize) + self.max_ns_in_barcodes {
-            None
-        } else if self.use_cache {
-            if let Some(cached_match) = self.cache.get(read_bases) {
-                Some(*cached_match)
-            } else {
-                let maybe_match = self.assign_internal(read_bases);
-                if let Some(internal_val) = maybe_match {
-                    self.cache.insert(read_bases.to_vec(), internal_val);
-                };
-                maybe_match
-            }
-        } else {
-            self.assign_internal(read_bases)
+            return None;
         }
+        if let Some(cache) = &self.cache {
+            if let Some(cached_match) = cache.get(read_bases) {
+                return Some(*cached_match);
+            }
+        }
+        let maybe_match = self.assign_internal(read_bases);
+        if let (Some(cache), Some(m)) = (self.cache.as_mut(), maybe_match) {
+            cache.insert(read_bases.to_vec(), m);
+        }
+        maybe_match
     }
 }
 
@@ -194,11 +180,7 @@ mod tests {
     /// Given a barcode and integer identifier, generate a sample instance. This helper function
     /// allows creating more succinct testing code.
     fn barcode_to_sample(barcode: &str, idx: usize) -> Sample {
-        Sample {
-            barcode: barcode.to_string(),
-            sample_id: format!("sample_{idx}").to_string(),
-            ordinal: idx,
-        }
+        Sample::new(idx, format!("sample_{idx}"), barcode.to_string())
     }
 
     /// Create a vector of samples from a list of barcodes, for more succinct testing code.
@@ -210,14 +192,11 @@ mod tests {
             .collect::<Vec<_>>()
     }
 
-    /// Helper for running ``BarcodeMatcher::count_mismatches``.  Encodes the bases, and creates a
-    /// dummy sample.
+    /// Helper for running ``BarcodeMatcher::count_mismatches``.  Encodes the bases.
     fn count_mismatches(observed_bases: &str, expected_bases: &str) -> u8 {
-        let sample = barcode_to_sample(expected_bases, 0);
         BarcodeMatcher::count_mismatches(
             &encode(observed_bases.as_bytes()),
             &encode(expected_bases.as_bytes()),
-            &sample,
             255,
         )
     }
@@ -245,16 +224,6 @@ mod tests {
     // ############################################################################################
     // Test BarcodeMatcher::count_mismatches
     // ############################################################################################
-
-    // NB: no need to test for empty barcode in sample (not allowed per 'samples.rs'),
-    // instead test that mismatch counting fails for empty read barcodes
-    #[test]
-    #[should_panic(
-        expected = "Read barcode () length (0) differs from expected barcode (CTATGT) length (6) for sample sample_0"
-    )]
-    fn empty_read_barcode_fails_length_mismatch() {
-        count_mismatches("", "CTATGT");
-    }
 
     #[test]
     fn empty_string_can_run_in_count_mismatches() {
@@ -313,10 +282,12 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Read barcode (GATTA) length (5) differs from expected barcode (CTATGT) length (6) for sample sample_0"
+        expected = "Read barcode (GATTAGA) length (7) differs from expected barcode length (6)"
     )]
-    fn find_compare_two_sequences_of_different_length() {
-        let _mismatches = count_mismatches("GATTA", "CTATGT");
+    fn assign_panics_when_read_is_longer_than_expected_barcode() {
+        let samples = barcodes_to_samples(&["CTATGT"]);
+        let mut matcher = BarcodeMatcher::new(&samples, 1, 2, false);
+        let _ = matcher.assign(b"GATTAGA");
     }
 
     // ############################################################################################

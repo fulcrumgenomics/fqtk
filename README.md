@@ -167,7 +167,7 @@ Options:
           [default: 2]
 
   -t, --threads <THREADS>
-          The number of threads to use. Cannot be less than 3
+          The number of threads to use. Cannot be less than 5
 
           [default: 8]
 

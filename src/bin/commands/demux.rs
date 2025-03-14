@@ -16,6 +16,7 @@ use read_structure::SegmentType;
 use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::fs::File;
@@ -36,6 +37,10 @@ type VecOfReaders = Vec<Box<dyn BufRead + Send>>;
 type SegmentIter<'a> = Filter<Iter<'a, FastqSegment>, fn(&&FastqSegment) -> bool>;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Buffer capacity for each per-output `.fq.gz` writer.  Sized to roughly one BGZF block so
+/// each flush corresponds to a single write syscall.
+const OUTPUT_WRITER_BUFFER_SIZE: usize = 64 * 1024;
 
 /// The bases and qualities associated with a segment of a FASTQ record.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -93,6 +98,20 @@ impl ReadSet {
     const SPACE: u8 = b' ';
     const COLON: u8 = b':';
     const PLUS: u8 = b'+';
+    /// ASCII digit table; indexing it avoids a `format!` allocation for the common
+    /// single-digit read-number case (see [`Self::write_read_num`]).
+    const READ_NUMBERS: &[u8] = b"0123456789";
+
+    /// Writes `read_num` as ASCII to `writer`, using a single-byte fast path for 0-9 and
+    /// falling back to `write!` for larger values.
+    fn write_read_num<W: Write>(writer: &mut W, read_num: usize) -> Result<()> {
+        if read_num < Self::READ_NUMBERS.len() {
+            writer.write_all(&[Self::READ_NUMBERS[read_num]])?;
+        } else {
+            write!(writer, "{}", read_num)?;
+        }
+        Ok(())
+    }
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
     fn template_segments(&self) -> SegmentIter {
@@ -117,9 +136,26 @@ impl ReadSet {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
     }
 
-    /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
-    fn sample_barcode_sequence(&self) -> Vec<u8> {
-        self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
+    /// Generates the sample barcode sequence for this read set as a borrow when possible.
+    /// Returns `Cow::Borrowed(&seg.seq)` for the common single-segment case (zero allocation),
+    /// otherwise concatenates segment bytes into a new `Vec<u8>`.
+    fn sample_barcode_sequence(&self) -> Cow<'_, [u8]> {
+        let mut iter = self.sample_barcode_segments();
+        let Some(first) = iter.next() else {
+            return Cow::Owned(Vec::new());
+        };
+        match iter.next() {
+            None => Cow::Borrowed(&first.seq),
+            Some(second) => {
+                let mut bytes = Vec::with_capacity(first.seq.len() + second.seq.len());
+                bytes.extend_from_slice(&first.seq);
+                bytes.extend_from_slice(&second.seq);
+                for seg in iter {
+                    bytes.extend_from_slice(&seg.seq);
+                }
+                Cow::Owned(bytes)
+            }
+        }
     }
 
     /// Combines ``ReadSet`` structs together into a single ``ReadSet``
@@ -219,7 +255,8 @@ impl ReadSet {
             None => {
                 // If no pre-existing comment, assume the read is a passing filter, non-control
                 // read and generate a comment for it (sample barcode is added below).
-                write!(writer, "{}:N:0:", read_num)?;
+                Self::write_read_num(writer, read_num)?;
+                writer.write_all(b":N:0:")?;
             }
             Some(chars) => {
                 // Else check it's a 4-part name... fix the read number at the front and
@@ -245,7 +282,8 @@ impl ReadSet {
                         &chars[first_colon_idx + 1..chars.len()]
                     };
 
-                    write!(writer, "{}:", read_num)?;
+                    Self::write_read_num(writer, read_num)?;
+                    writer.write_all(&[Self::COLON])?;
                     writer.write_all(remainder)?;
 
                     if *remainder.last().unwrap() != Self::COLON {
@@ -634,7 +672,7 @@ pub(crate) struct Demux {
     #[clap(long, short = 'd', default_value = "2")]
     min_mismatch_delta: usize,
 
-    /// The number of threads to use. Cannot be less than 3.
+    /// The number of threads to use. Cannot be less than 5.
     #[clap(long, short = 't', default_value = "8")]
     threads: usize,
 
@@ -683,9 +721,12 @@ impl Demux {
                 read_structures.iter().map(|s| s.segments_by_type(*output_type).count()).sum();
 
             for idx in 1..=segment_count {
-                output_type_writers.push(BufWriter::new(File::create(
-                    output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
-                )?));
+                output_type_writers.push(BufWriter::with_capacity(
+                    OUTPUT_WRITER_BUFFER_SIZE,
+                    File::create(
+                        output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
+                    )?,
+                ));
             }
 
             match output_type {
@@ -1012,6 +1053,19 @@ mod tests {
     use tempfile::TempDir;
 
     const SAMPLE1_BARCODE: &str = "GATTGGG";
+
+    #[rstest]
+    #[case(0, "0")]
+    #[case(1, "1")]
+    #[case(9, "9")]
+    #[case(10, "10")]
+    #[case(123, "123")]
+    #[case(99_999, "99999")]
+    fn test_write_read_num(#[case] read_num: usize, #[case] expected: &str) {
+        let mut buf: Vec<u8> = Vec::new();
+        ReadSet::write_read_num(&mut buf, read_num).unwrap();
+        assert_eq!(str::from_utf8(&buf).unwrap(), expected);
+    }
 
     /// Given a record name prefix and a slice of bases for a set of records, returns the contents
     /// of a FASTQ file as a vec of Strings, one string per line of the FASTQ.
@@ -1993,7 +2047,7 @@ mod tests {
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
-            vec!["G", SAMPLE1_BARCODE],              // barcode the correct length
+            vec!["G", SAMPLE1_BARCODE],
         ];
 
         let input_files = vec![
@@ -2029,7 +2083,7 @@ mod tests {
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
-            vec!["G", SAMPLE1_BARCODE],              // barcode the correct length
+            vec!["G", SAMPLE1_BARCODE],
         ];
 
         let input_files = vec![
@@ -2200,7 +2254,7 @@ mod tests {
     // ############################################################################################
 
     #[test]
-    fn test_sample_barcode_sequence() {
+    fn test_sample_barcode_sequence_multi_segment_owns() {
         let segments = vec![
             seg("AGCT".as_bytes(), SegmentType::Template),
             seg("GATA".as_bytes(), SegmentType::SampleBarcode),
@@ -2209,8 +2263,30 @@ mod tests {
         ];
 
         let read_set = read_set(segments);
+        let bc = read_set.sample_barcode_sequence();
+        assert_eq!(bc.as_ref(), b"GATACAC");
+        assert!(matches!(bc, Cow::Owned(_)));
+    }
 
-        assert_eq!(read_set.sample_barcode_sequence(), "GATACAC".as_bytes().to_owned());
+    #[test]
+    fn test_sample_barcode_sequence_single_segment_borrows() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATTACA".as_bytes(), SegmentType::SampleBarcode),
+        ];
+
+        let read_set = read_set(segments);
+        let bc = read_set.sample_barcode_sequence();
+        assert_eq!(bc.as_ref(), b"GATTACA");
+        assert!(matches!(bc, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sample_barcode_sequence_no_segments_returns_empty() {
+        let segments = vec![seg("AGCT".as_bytes(), SegmentType::Template)];
+        let read_set = read_set(segments);
+        let bc = read_set.sample_barcode_sequence();
+        assert!(bc.is_empty());
     }
 
     #[test]
