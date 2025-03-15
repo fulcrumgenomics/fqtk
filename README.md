@@ -5,6 +5,7 @@
   <img src="https://img.shields.io/crates/l/fqtk.svg" alt="license">
   <a href="https://crates.io/crates/fqtk"><img src="https://img.shields.io/crates/v/fqtk.svg?colorB=319e8c" alt="Version info"></a>
   <a href="http://bioconda.github.io/recipes/fqtk/README.html"><img src="https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat" alt="Install with bioconda"></a>
+  <a href="https://doi.org/10.5281/zenodo.13345414"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.13345414.svg" alt="DOI"></a>
   <br>
 </p>
 
