@@ -53,11 +53,7 @@ pub fn encode(bases: &[u8]) -> BitEnc {
             IUPAC_MASKS[b'N' as usize]
         } else {
             let value = base.to_ascii_uppercase() as usize;
-            if value < 256 {
-                IUPAC_MASKS[value]
-            } else {
-                0
-            }
+            if value < 256 { IUPAC_MASKS[value] } else { 0 }
         };
         vec.push(bit);
     }

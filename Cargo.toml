@@ -30,7 +30,6 @@ path = "src/bin/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ahash = "0.8.11"
 anyhow = "1.0.38"
 bstr = "1.0.1"
 clap = { version = "4.0.25", features = ["derive"] }
@@ -49,6 +48,7 @@ serde-aux = "4.1.2"
 seq_io = "0.3.1"
 thiserror = "1.0.37"
 proglog = {version = "0.3.0", features = ["pretty_counts"] }
+rustc-hash = "2.1.1"
 
 [dev-dependencies]
 csv = "1.1.6"
