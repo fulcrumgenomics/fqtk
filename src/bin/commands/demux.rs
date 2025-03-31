@@ -93,6 +93,7 @@ impl ReadSet {
     const SPACE: u8 = b' ';
     const COLON: u8 = b':';
     const PLUS: u8 = b'+';
+    const READ_NUMBERS: &[u8] = b"12345678";
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
     fn template_segments(&self) -> SegmentIter {
@@ -213,7 +214,12 @@ impl ReadSet {
             None => {
                 // If no pre-existing comment, assume the read is a passing filter, non-control
                 // read and generate a comment for it (sample barcode is added below).
-                write!(writer, "{}:N:0:", read_num)?;
+                if read_num < Self::READ_NUMBERS.len() {
+                    writer.write_all(&[Self::READ_NUMBERS[read_num - 1]])?;
+                    write!(writer, ":N:0:")?;
+                } else {
+                    write!(writer, "{}:N:0:", read_num)?;
+                }
             }
             Some(chars) => {
                 // Else check it's a 4-part name... fix the read number at the front and
@@ -239,7 +245,11 @@ impl ReadSet {
                         &chars[first_colon_idx + 1..chars.len()]
                     };
 
-                    write!(writer, "{}:", read_num)?;
+                    if read_num < Self::READ_NUMBERS.len() {
+                        writer.write_all(&[Self::READ_NUMBERS[read_num - 1], b':'])?;
+                    } else {
+                        write!(writer, "{}:", read_num)?;
+                    }
                     writer.write_all(remainder)?;
 
                     if *remainder.last().unwrap() != Self::COLON {
@@ -619,7 +629,7 @@ pub(crate) struct Demux {
     #[clap(long, short = 'd', default_value = "2")]
     min_mismatch_delta: usize,
 
-    /// The number of threads to use. Cannot be less than 3.
+    /// The number of threads to use. Cannot be less than 5.
     #[clap(long, short = 't', default_value = "8")]
     threads: usize,
 
@@ -666,9 +676,12 @@ impl Demux {
                 read_structures.iter().map(|s| s.segments_by_type(*output_type).count()).sum();
 
             for idx in 1..=segment_count {
-                output_type_writers.push(BufWriter::new(File::create(
-                    output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
-                )?));
+                output_type_writers.push(BufWriter::with_capacity(
+                    65_536usize,
+                    File::create(
+                        output_dir.join(format!("{}.{}{}.fq.gz", prefix, file_type_code, idx)),
+                    )?,
+                ));
             }
 
             match output_type {
@@ -1189,6 +1202,7 @@ mod tests {
             skip_reasons: vec![],
         };
         let demux_result = demux_inputs.execute();
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(tmp.path(), permissions).unwrap();
         demux_result.unwrap();
@@ -1963,7 +1977,7 @@ mod tests {
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
-            vec!["G", SAMPLE1_BARCODE],              // barcode the correct length
+            vec!["G", SAMPLE1_BARCODE],
         ];
 
         let input_files = vec![
@@ -1999,7 +2013,7 @@ mod tests {
             vec!["AAAAAAA", &SAMPLE1_BARCODE[0..7]], // barcode too short
             vec!["CCCCCCC", SAMPLE1_BARCODE],        // barcode the correct length
             vec!["", SAMPLE1_BARCODE],               // template basese too short
-            vec!["G", SAMPLE1_BARCODE],              // barcode the correct length
+            vec!["G", SAMPLE1_BARCODE],
         ];
 
         let input_files = vec![

@@ -19,6 +19,9 @@ pub struct Sample {
     pub sample_id: String,
     /// DNA barcode associated with the sample
     pub barcode: String,
+    /// DNA barcode as a byte
+    #[serde(skip_deserializing)]
+    pub barcode_bytes: Vec<u8>,
     /// index of the sample in the [`SampleGroup`] object, used for syncing indices across
     /// different structs
     #[serde(skip_deserializing)]
@@ -53,7 +56,8 @@ impl Sample {
             barcode.as_bytes().iter().all(|&b| is_valid_iupac(b)),
             "All sample barcode bases must be one of A, C, G, T, U, R, Y, S, W, K, M, D, V, H, B, N"
         );
-        Self { sample_id: name, barcode, ordinal }
+        let barcode_bytes = barcode.as_bytes().to_vec();
+        Self { sample_id: name, barcode, barcode_bytes, ordinal }
     }
 
     /// Returns the header line expected by serde when deserializing
@@ -294,11 +298,7 @@ mod tests {
         let barcode = "GATTACA".to_owned();
         let ordinal = 0;
         let sample = Sample::new(ordinal, name.clone(), barcode.clone());
-        assert_eq!(
-            Sample { sample_id: name, barcode, ordinal },
-            sample,
-            "Sample differed from expectation"
-        );
+        assert_eq!(Sample::new(ordinal, name, barcode), sample, "Sample differed from expectation");
     }
 
     // ############################################################################################
