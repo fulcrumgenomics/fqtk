@@ -6,8 +6,7 @@ use crate::encode;
 use super::byte_is_nocall;
 use super::samples::Sample;
 use crate::bitenc::BitEnc;
-use ahash::HashMap as AHashMap;
-use ahash::HashMapExt;
+use rustc_hash::FxHashMap;
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
@@ -41,7 +40,7 @@ pub struct BarcodeMatcher {
     /// If true will attempt to use the cache when matching.
     use_cache: bool,
     /// Caching struct for storing results of previous matches
-    cache: AHashMap<Vec<u8>, BarcodeMatch>,
+    cache: FxHashMap<Vec<u8>, BarcodeMatch>,
 }
 
 impl BarcodeMatcher {
@@ -81,7 +80,7 @@ impl BarcodeMatcher {
             max_mismatches,
             min_mismatch_delta,
             use_cache,
-            cache: AHashMap::with_capacity(STARTING_CACHE_SIZE),
+            cache: FxHashMap::with_capacity_and_hasher(STARTING_CACHE_SIZE, Default::default()),
         }
     }
 
@@ -94,9 +93,7 @@ impl BarcodeMatcher {
     ) -> u8 {
         if observed_bases.nr_symbols() != expected_bases.nr_symbols() {
             let observed_string = decode(observed_bases);
-            assert_eq!(
-                observed_bases.nr_symbols(),
-                expected_bases.nr_symbols(),
+            panic!(
                 "Read barcode ({}) length ({}) differs from expected barcode ({}) length ({}) for sample {}",
                 observed_string,
                 observed_bases.nr_symbols(),
@@ -196,6 +193,7 @@ mod tests {
     fn barcode_to_sample(barcode: &str, idx: usize) -> Sample {
         Sample {
             barcode: barcode.to_string(),
+            barcode_bytes: barcode.as_bytes().to_vec(),
             sample_id: format!("sample_{idx}").to_string(),
             ordinal: idx,
         }

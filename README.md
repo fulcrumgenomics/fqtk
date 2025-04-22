@@ -162,7 +162,7 @@ Options:
           [default: 2]
 
   -t, --threads <THREADS>
-          The number of threads to use. Cannot be less than 3
+          The number of threads to use. Cannot be less than 5
 
           [default: 8]
 
@@ -177,10 +177,10 @@ Options:
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
 
   -h, --help
-          Print help information (use `-h` for a summary)
+          Print help (see a summary with '-h')
 
   -V, --version
-          Print version information
+          Print version
 ```
 <!-- end usage -->
 
