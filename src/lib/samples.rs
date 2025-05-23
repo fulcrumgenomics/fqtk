@@ -141,7 +141,7 @@ impl SampleGroup {
     ///   - Will panic if sample metadata sheet is improperly formatted
     ///   - Will panic if a different number of names and barcodes are provided
     ///   - Will panic if each
-    pub fn from_file<P: AsRef<Path>>(path: &P) -> Result<SampleGroup, fgoxide::FgError> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<SampleGroup, fgoxide::FgError> {
         let reader = DelimFile::default();
         Ok(Self::from_samples(&reader.read(path, DEFAULT_FILE_DELIMETER, false)?))
     }
