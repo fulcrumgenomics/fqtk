@@ -2,6 +2,7 @@ extern crate core;
 
 pub mod commands;
 
+use crate::commands::shard::Shard;
 use anyhow::Result;
 use clap::Parser;
 use commands::command::Command;
@@ -23,6 +24,7 @@ struct Args {
 #[command(version)]
 enum Subcommand {
     Demux(Demux),
+    Shard(Shard),
 }
 
 fn main() -> Result<()> {
