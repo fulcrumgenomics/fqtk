@@ -2,6 +2,7 @@ use crate::commands::command::Command;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use fgoxide::io::Io;
+use fgoxide::iter::IntoChunkedReadAheadIterator;
 use itertools::Itertools;
 use log::info;
 use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
@@ -152,8 +153,9 @@ impl Command for Shard {
     fn execute(&self) -> Result<()> {
         info!("Reading {} input FASTQs and generating {} shards.", self.inputs.len(), self.shards);
 
-        let mut fq_readers = Self::build_readers(&self.inputs)?;
-        let mut fq_iters = fq_readers.iter_mut().map(|r| r.records()).collect_vec();
+        let fq_readers = Self::build_readers(&self.inputs)?;
+        let fq_iters = fq_readers.into_iter().map(|r| r.into_records()).collect_vec();
+        let mut fq_iters = fq_iters.into_iter().map(|i| i.read_ahead(128, 48)).collect_vec();
 
         let (mut pool, mut shard_writers) = Self::build_writer_pool(
             self.output_prefix.as_str(),
