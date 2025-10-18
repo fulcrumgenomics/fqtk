@@ -238,3 +238,131 @@ impl Command for Shard {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::commands::command::Command;
+    use crate::commands::shard::Shard;
+    use bstr::ByteSlice;
+    use itertools::Itertools;
+    use rand;
+    use seq_io::fastq::{OwnedRecord, Record};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// Writes zero or more records to a FASTQ file at `path`.  Bases and quals are randomly
+    /// generated.  Read names are of the format `{prefix}{idx}{suffix}` where `idx` starts
+    /// from the value of the `idx` parameter, and increases by one for each record.
+    fn build_fastq(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) -> () {
+        let bases = "ACGT".as_bytes();
+        let io = fgoxide::io::Io::new(1, 8 * 1024);
+        let mut out = io.new_writer(path).unwrap();
+        for i in idx..idx + count {
+            let seq = (0..30)
+                .into_iter()
+                .map(|_| rand::random_range(0..4))
+                .map(|i| bases[i])
+                .collect_vec();
+
+            let qual =
+                (0..30).into_iter().map(|_| rand::random_range(2u8..40u8) + 33).collect_vec();
+
+            let rec = OwnedRecord {
+                head: format!("{}{}{}", prefix, suffix, i).as_bytes().to_owned(),
+                seq,
+                qual,
+            };
+
+            rec.write(&mut out).unwrap();
+        }
+
+        ()
+    }
+
+    /// Runs sharding and returns the outputs.  The returned Vec is nested as follows:
+    ///  - Each entry in the top level vec is a _shard_
+    ///  - Each entry in the second level vec is the sharded reads from a single input fastq
+    ///  - Each entry in the third level vec is an individual fastq record
+    fn run_sharding(tmp: &TempDir, inputs: &[&Path], shards: usize) -> Vec<Vec<Vec<OwnedRecord>>> {
+        let mut results: Vec<Vec<Vec<OwnedRecord>>> = Vec::with_capacity(shards);
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let sharder = Shard {
+            inputs: inputs.iter().map(|p| p.to_path_buf()).collect_vec(),
+            output_prefix: prefix.clone(),
+            shard_prefix: "shard".to_string(),
+            read_number_prefix: "read".to_string(),
+            shards: shards,
+            threads: 4,
+            compression_level: 1,
+        };
+
+        sharder.execute().unwrap();
+
+        for shard in 1..=shards {
+            let mut reads_vecs = Vec::with_capacity(inputs.len());
+
+            for input_idx in 1..=inputs.len() {
+                let path_str = format!("{}.shard{}.read{}.fq.gz", prefix, shard, input_idx);
+                let path = Path::new(&path_str);
+                reads_vecs.push(read_fastq(&path));
+            }
+
+            results.push(reads_vecs);
+        }
+
+        results
+    }
+
+    /// Reads a FASTQ file into a vec of records
+    fn read_fastq(path: &Path) -> Vec<OwnedRecord> {
+        let io = fgoxide::io::Io::new(1, 8 * 1024);
+        let mut reader = io.new_reader(path).unwrap();
+        let mut fq_reader = seq_io::fastq::Reader::with_capacity(&mut reader, 8 * 1024);
+        let records = fq_reader.records().map(|r| r.unwrap()).collect_vec();
+        records
+    }
+
+    #[test]
+    fn test_shard_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 50);
+        let outputs = run_sharding(&tmp, &[&r1], 5);
+
+        assert_eq!(outputs.len(), 5);
+        for shard in outputs.iter() {
+            assert_eq!(shard.len(), 1);
+            assert_eq!(shard.iter().next().unwrap().len(), 10);
+        }
+
+        let read_names: HashSet<&str> =
+            outputs.iter().flatten().flatten().map(|r| r.head.to_str().unwrap()).collect();
+        assert_eq!(read_names.len(), 50);
+    }
+
+    #[test]
+    fn test_shard_multiple_files() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "/1", 1, 64);
+        build_fastq(r2.as_path(), "q", "/2", 1, 64);
+        let outputs = run_sharding(&tmp, &[&r1, &r2], 3);
+
+        assert_eq!(outputs.len(), 3);
+
+        for shard in outputs.iter() {
+            assert_eq!(shard.len(), 2); // two reads in each shard
+            assert_eq!(shard[0].len(), shard[1].len()); // both r1 and r2 have same number of reads
+            assert!(shard[0].len() == 21 || shard[0].len() == 22); // 64 / 3 == 21 1/3
+        }
+    }
+
+    // TODO: test with empty inputs
+    // TODO: test with uneven number of reads
+    // TODO: test with compressed inputs
+    // TODO: test with uncompressed inputs
+    // TODO: test with and without /1 and /2 on read names
+    // TODO: test fails when given mismatched fastq files
+}
