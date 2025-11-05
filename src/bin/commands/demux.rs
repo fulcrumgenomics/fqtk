@@ -111,6 +111,12 @@ impl ReadSet {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
     }
 
+    /// Produces an iterator over references to the cellular barcode segments stored in this
+    /// ``ReadSet``.
+    fn cellular_barcode_segments(&self) -> SegmentIter {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
+    }
+
     /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
     fn sample_barcode_sequence(&self) -> Vec<u8> {
         self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
@@ -363,18 +369,21 @@ struct SampleWriters<W: Write> {
     sample_barcode_writers: Option<Vec<W>>,
     /// Vec of the writers for the molecular barcode read segments.
     molecular_barcode_writers: Option<Vec<W>>,
+    /// Vec of the writers for the cellular barcode read segments.
+    cellular_barcode_writers: Option<Vec<W>>,
 }
 
 impl<W: Write> SampleWriters<W> {
     /// Destroys this struct and decomposes it into its component types. Used when swapping
     /// writers for pooled writers.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
             self.name,
             self.template_writers,
             self.sample_barcode_writers,
             self.molecular_barcode_writers,
+            self.cellular_barcode_writers,
         )
     }
 
@@ -387,6 +396,7 @@ impl<W: Write> SampleWriters<W> {
             (&mut self.template_writers, &mut read_set.template_segments()),
             (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
             (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
+            (&mut self.cellular_barcode_writers, &mut read_set.cellular_barcode_segments()),
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
@@ -651,6 +661,7 @@ impl Demux {
         let mut template_writers = None;
         let mut sample_barcode_writers = None;
         let mut molecular_barcode_writers = None;
+        let mut cellular_barcode_writers = None;
 
         for output_type in output_types {
             let mut output_type_writers = Vec::new();
@@ -659,6 +670,7 @@ impl Demux {
                 SegmentType::Template => 'R',
                 SegmentType::SampleBarcode => 'I',
                 SegmentType::MolecularBarcode => 'U',
+                SegmentType::CellularBarcode => 'C',
                 _ => 'S',
             };
 
@@ -679,6 +691,9 @@ impl Demux {
                 SegmentType::MolecularBarcode => {
                     molecular_barcode_writers = Some(output_type_writers);
                 }
+                SegmentType::CellularBarcode => {
+                    cellular_barcode_writers = Some(output_type_writers);
+                }
                 _ => {}
             }
         }
@@ -688,6 +703,7 @@ impl Demux {
             template_writers,
             sample_barcode_writers,
             molecular_barcode_writers,
+            cellular_barcode_writers,
         })
     }
 
@@ -743,15 +759,17 @@ impl Demux {
             .compression_level(u8::try_from(compression_level)?)?;
 
         for sample in sample_writers {
-            let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
+            let (name, template_writers, barcode_writers, mol_writers, cb_writers) = sample.into_parts();
             let mut new_template_writers = None;
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
+            let mut new_cellular_barcode_writers = None;
 
             for (optional_ws, target) in [
                 (template_writers, &mut new_template_writers),
                 (barcode_writers, &mut new_sample_barcode_writers),
                 (mol_writers, &mut new_molecular_barcode_writers),
+                (cb_writers, &mut new_cellular_barcode_writers),
             ] {
                 if let Some(ws) = optional_ws {
                     let mut new_writers = Vec::with_capacity(ws.len());
@@ -766,6 +784,7 @@ impl Demux {
                 template_writers: new_template_writers,
                 sample_barcode_writers: new_sample_barcode_writers,
                 molecular_barcode_writers: new_molecular_barcode_writers,
+                cellular_barcode_writers: new_cellular_barcode_writers,
             });
         }
         let pool = pool_builder.build()?;
