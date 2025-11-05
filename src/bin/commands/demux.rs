@@ -2201,6 +2201,26 @@ mod tests {
 
         assert_eq!(read_set.sample_barcode_sequence(), "GATACAC".as_bytes().to_owned());
     }
+
+    #[test]
+    fn test_cellular_barcode_segments() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATA".as_bytes(), SegmentType::SampleBarcode),
+            seg("CAC".as_bytes(), SegmentType::SampleBarcode),
+            seg("GACCCC".as_bytes(), SegmentType::MolecularBarcode),
+            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
+        ];
+
+        let read_set = read_set(segments);
+
+        let expected = vec![
+            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
+        ];
+
+        assert_eq!(expected, read_set.cellular_barcode_segments().cloned().collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_template_segments() {
         let segments = vec![
