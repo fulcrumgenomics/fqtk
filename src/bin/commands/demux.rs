@@ -420,7 +420,7 @@ impl SampleWriters<PooledWriter> {
     ///     - Will error if closing of the ``PooledWriter``s fails for any reason
     fn close(self) -> Result<()> {
         for writers in
-            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers]
+            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers, self.cellular_barcode_writers]
                 .into_iter()
                 .flatten()
         {
