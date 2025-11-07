@@ -524,10 +524,7 @@ impl DemuxMetric {
 ///
 /// The last `<number><operator>` pair may be specified using a `+` sign instead of number to
 /// denote "all remaining bases". This is useful if, e.g., fastqs have been trimmed and contain
-/// reads of varying length. Both reads must have template bases.  Any molecular identifiers will
-/// be concatenated using the `-` delimiter and placed in the given SAM record tag (`RX` by
-/// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
-/// tag.
+/// reads of varying length. Both reads must have template bases.
 ///
 /// Metadata about the samples should be given as a headered metadata TSV file with at least the
 /// following two columns present:
