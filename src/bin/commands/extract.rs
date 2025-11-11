@@ -87,9 +87,9 @@ impl ReadSet {
 
     /// Produces an iterator over references to the cell barcode segments stored in this
     /// ``ReadSet``.
-    // fn cell_barcode_segments(&self) -> impl Iterator<Item = &FastqSegment> {
-    //     self.segments.iter().filter(|s| s.segment_type == SegmentType::CellBarcode)
-    // }
+    fn cell_barcode_segments(&self) -> impl Iterator<Item = &FastqSegment> {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
+    }
 
     /// Combines ``ReadSet`` structs together into a single ``ReadSet``
     fn combine_readsets(readsets: Vec<Self>) -> Self {
@@ -437,6 +437,7 @@ impl Extract {
     }
 
     /// Create SAM records from a read set
+    #[allow(clippy::too_many_lines)]
     fn make_sam_records(
         &self,
         read_set: &ReadSet,
@@ -447,19 +448,19 @@ impl Extract {
         ensure!(!templates.is_empty(), "No template segments found");
 
         // Extract various barcode types as BString to ensure proper lifetimes
-        // let cell_barcode_bs: BString = read_set
-        //     .cell_barcode_segments()
-        //     .map(|s| String::from_utf8_lossy(&s.seq))
-        //     .collect::<Vec<_>>()
-        //     .join("-")
-        //     .into();
+        let cell_barcode_bs: BString = read_set
+            .cell_barcode_segments()
+            .map(|s| String::from_utf8_lossy(&s.seq))
+            .collect::<Vec<_>>()
+            .join("-")
+            .into();
 
-        // let cell_quals_bs: BString = read_set
-        //     .cell_barcode_segments()
-        //     .map(|s| String::from_utf8_lossy(&s.quals))
-        //     .collect::<Vec<_>>()
-        //     .join(" ")
-        //     .into();
+        let cell_quals_bs: BString = read_set
+            .cell_barcode_segments()
+            .map(|s| String::from_utf8_lossy(&s.quals))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into();
 
         let sample_barcode_bs: BString = read_set
             .sample_barcode_segments()
@@ -544,15 +545,15 @@ impl Extract {
             data.insert(Tag::READ_GROUP, Value::String(rgid_bs.as_bstr()).try_into()?);
 
             // Cell barcode
-            // if !cell_barcode_bs.is_empty() {
-            //     Self::add_tag(data, self.cell_tag.as_bytes(), cell_barcode_bs.clone()).unwrap();
-            // }
+            if !cell_barcode_bs.is_empty() {
+                Self::add_tag(data, self.cell_tag.as_bytes(), &cell_barcode_bs.clone()).unwrap();
+            }
 
-            // if !cell_quals_bs.is_empty() {
-            //     if let Some(ref qual_tag) = self.cell_qual_tag {
-            //         Self::add_tag(data, qual_tag.as_bytes(), cell_quals_bs.clone()).unwrap();
-            //     }
-            // }
+            if !cell_quals_bs.is_empty() {
+                if let Some(ref qual_tag) = self.cell_qual_tag {
+                    Self::add_tag(data, qual_tag.as_bytes(), &cell_quals_bs.clone()).unwrap();
+                }
+            }
 
             // Sample barcode
             if !sample_barcode_bs.is_empty() {

@@ -1049,9 +1049,9 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "read-structure"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "578bb3e36958ed6aae0116dd505b3ca5aeafc9b10500ddfd9c50758e05b4aafa"
+checksum = "61edbf674ba055b6c4c8051ea95aea3aad15b087544522a4b2b85dbfd743a26d"
 dependencies = [
  "bstr 0.2.17",
  "strum",
