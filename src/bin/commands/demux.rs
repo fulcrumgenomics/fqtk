@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Result};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgoxide::io::{DelimFile, Io};
@@ -8,7 +8,7 @@ use fqtk_lib::barcode_matching::BarcodeMatcher;
 use fqtk_lib::samples::SampleGroup;
 use itertools::Itertools;
 use log::info;
-use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
+use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use proglog::{CountFormatterKind, ProgLogBuilder};
 use read_structure::ReadStructure;
 use read_structure::ReadStructureError;
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     fn read_fastq(file_path: &PathBuf) -> Vec<OwnedRecord> {
-        let fg_io = Io::default();
+        let fg_io: Io = Io::default();
 
         FastqReader::new(fg_io.new_reader(file_path).unwrap())
             .into_records()

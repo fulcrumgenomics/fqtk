@@ -1,6 +1,5 @@
 [package]
 authors = [
-    "Nathan Roach <nathan@fulcrumgenomics.com>",
     "Tim Fennell <tim@fulcrumgenomics.com>",
     "Nils Homer <nils@fulcrumgenomics.com>"
 ]
@@ -49,6 +48,7 @@ serde-aux = "4.1.2"
 seq_io = "0.3.1"
 thiserror = "1.0.37"
 proglog = {version = "0.3.0", features = ["pretty_counts"] }
+noodles = { version = "0.101.0", features = ["bam", "sam", "bgzf"] }
 
 [dev-dependencies]
 csv = "1.1.6"
