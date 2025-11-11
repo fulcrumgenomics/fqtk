@@ -25,6 +25,9 @@ use anyhow::{bail, ensure, Result};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgoxide::io::Io;
+use fqtk_lib::read_set::FastqSegment;
+use fqtk_lib::read_set::ReadSet;
+use fqtk_lib::read_set::ReadSetIterator;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -46,168 +49,6 @@ use std::str::FromStr;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
-
-/// The bases and qualities associated with a segment of a FASTQ record.
-#[derive(PartialEq, Eq, Debug, Clone)]
-struct FastqSegment {
-    /// bases of the FASTQ subsection
-    seq: Vec<u8>,
-    /// qualities of the FASTQ subsection
-    quals: Vec<u8>,
-    /// the type of segment being stored
-    segment_type: SegmentType,
-}
-
-/// One unit of FASTQ records separated into their component read segments.
-#[derive(PartialEq, Debug, Clone)]
-struct ReadSet {
-    /// Header of the FASTQ record
-    header: Vec<u8>,
-    /// Segments of reads
-    segments: Vec<FastqSegment>,
-}
-
-impl ReadSet {
-    /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
-    fn template_segments(&self) -> impl Iterator<Item = &FastqSegment> {
-        self.segments.iter().filter(|s| s.segment_type == SegmentType::Template)
-    }
-
-    /// Produces an iterator over references to the sample barcode segments stored in this
-    /// ``ReadSet``.
-    fn sample_barcode_segments(&self) -> impl Iterator<Item = &FastqSegment> {
-        self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode)
-    }
-
-    /// Produces an iterator over references to the molecular barcode segments stored in this
-    /// ``ReadSet``.
-    fn molecular_barcode_segments(&self) -> impl Iterator<Item = &FastqSegment> {
-        self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
-    }
-
-    /// Produces an iterator over references to the cell barcode segments stored in this
-    /// ``ReadSet``.
-    fn cell_barcode_segments(&self) -> impl Iterator<Item = &FastqSegment> {
-        self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
-    }
-
-    /// Combines ``ReadSet`` structs together into a single ``ReadSet``
-    fn combine_readsets(readsets: Vec<Self>) -> Self {
-        let total_segments: usize = readsets.iter().map(|s| s.segments.len()).sum();
-        assert!(total_segments > 0, "Cannot call combine readsets on an empty vec!");
-
-        let mut readset_iter = readsets.into_iter();
-        let mut first = readset_iter.next().expect("Cannot call combine readsets on an empty vec!");
-        first.segments.reserve_exact(total_segments - first.segments.len());
-
-        for next_readset in readset_iter {
-            first.segments.extend(next_readset.segments);
-        }
-
-        first
-    }
-
-    /// Extracts read name, optionally extracting UMI from the 8th colon-delimited field
-    fn extract_read_name_and_umi(&self, extract_umis: bool) -> (Vec<u8>, Option<Vec<u8>>) {
-        let header = &self.header;
-
-        // Remove @ prefix if present
-        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
-
-        // Split on space to get just the name part
-        let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
-
-        if !extract_umis {
-            return (name_part.to_vec(), None);
-        }
-
-        // Count colons to find 8th field (UMI)
-        let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
-
-        if parts.len() >= 8 {
-            let umi = parts[7].to_vec();
-            if !umi.is_empty() {
-                return (name_part.to_vec(), Some(umi));
-            }
-        }
-
-        (name_part.to_vec(), None)
-    }
-}
-
-/// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
-/// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
-struct ReadSetIterator {
-    /// Read structure object describing the structure of the reads in this file.
-    read_structure: ReadStructure,
-    /// The iterator over FASTQ records
-    records:
-        Box<dyn Iterator<Item = Result<seq_io::fastq::OwnedRecord, seq_io::fastq::Error>> + Send>,
-}
-
-impl Iterator for ReadSetIterator {
-    type Item = ReadSet;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.records.next() {
-            Some(Ok(next_fq_rec)) => {
-                let mut segments = Vec::with_capacity(self.read_structure.number_of_segments());
-                let read_name = next_fq_rec.head();
-                let bases = next_fq_rec.seq();
-                let quals = next_fq_rec.qual();
-
-                // Check that we have enough bases for this segment
-                let min_len = self.read_structure.iter().map(|s| s.length().unwrap_or(1)).sum();
-                assert!(
-                    (bases.len() >= min_len),
-                    "Read {} had too few bases {} vs. {} needed in read structure {}.",
-                    String::from_utf8_lossy(read_name),
-                    bases.len(),
-                    min_len,
-                    self.read_structure
-                );
-
-                for (read_segment_index, read_segment) in self.read_structure.iter().enumerate() {
-                    // Extract the bases and qualities for this segment
-                    let (seq, quals) =
-                        read_segment.extract_bases_and_quals(bases, quals).unwrap_or_else(|e| {
-                            panic!(
-                                "Error extracting bases (len: {}) or quals (len: {}) for the {}th read segment ({}) in read structure ({}) from FASTQ record with name {}; {}",
-                                bases.len(),
-                                quals.len(),
-                                read_segment_index,
-                                read_segment,
-                                self.read_structure,
-                                String::from_utf8_lossy(read_name),
-                                e
-                            )
-                        });
-                    // Add a new FastqSegment
-                    segments.push(FastqSegment {
-                        seq: seq.to_vec(),
-                        quals: quals.to_vec(),
-                        segment_type: read_segment.kind,
-                    });
-                }
-                Some(ReadSet { header: read_name.to_vec(), segments })
-            }
-            Some(Err(e)) => panic!("Error reading FASTQ: {e}"),
-            None => None,
-        }
-    }
-}
-
-impl ReadSetIterator {
-    /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
-    /// structures
-    pub fn new(
-        read_structure: ReadStructure,
-        source: FastqReader<Box<dyn BufRead + Send>>,
-    ) -> Self {
-        let records = Box::new(source.into_records());
-        Self { read_structure, records }
-    }
-}
 
 /// Quality encoding type
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +122,7 @@ pub(crate) struct Extract {
 
     /// Extract UMI(s) from read names and prepend to UMIs from reads
     #[clap(long, short = 'n')]
+    #[allow(clippy::struct_field_names)]
     extract_umis_from_read_names: bool,
 
     /// Read group ID to use in the file header
@@ -436,6 +278,34 @@ impl Extract {
         Ok(())
     }
 
+    /// Extracts read name, optionally extracting UMI from the 8th colon-delimited field
+    fn extract_read_name_and_umi(
+        header: &Vec<u8>,
+        extract_umis: bool,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        // Remove @ prefix if present
+        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
+
+        // Split on space to get just the name part
+        let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
+
+        if !extract_umis {
+            return (name_part.to_vec(), None);
+        }
+
+        // Count colons to find 8th field (UMI)
+        let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
+
+        if parts.len() >= 8 {
+            let umi = parts[7].to_vec();
+            if !umi.is_empty() {
+                return (name_part.to_vec(), Some(umi));
+            }
+        }
+
+        (name_part.to_vec(), None)
+    }
+
     /// Create SAM records from a read set
     #[allow(clippy::too_many_lines)]
     fn make_sam_records(
@@ -492,7 +362,7 @@ impl Extract {
 
         // Extract UMI from read name if requested
         let (read_name, umi_from_name) =
-            read_set.extract_read_name_and_umi(self.extract_umis_from_read_names);
+            Self::extract_read_name_and_umi(&read_set.header, self.extract_umis_from_read_names);
 
         // Prepare final UMI as BString
         let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
@@ -623,7 +493,7 @@ impl Command for Extract {
         let mut fq_iterators: Vec<ReadSetIterator> = fq_sources
             .into_iter()
             .zip(read_structures.iter())
-            .map(|(source, rs)| ReadSetIterator::new(rs.clone(), source))
+            .map(|(source, rs)| ReadSetIterator::new(rs.clone(), source, Vec::new()))
             .collect();
 
         // Create header and output writer

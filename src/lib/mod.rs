@@ -1,5 +1,6 @@
 pub mod barcode_matching;
 pub mod bitenc;
+pub mod read_set;
 pub mod samples;
 
 use crate::bitenc::BitEnc;
