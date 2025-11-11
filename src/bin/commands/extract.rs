@@ -263,11 +263,16 @@ impl Extract {
         Ok(header.build())
     }
 
+    /// Adds the given tag and value to the record's data.
+    ///
+    /// # Panics
+    /// If the tag is not length two
     fn add_tag(
         data: &mut noodles::sam::alignment::record_buf::Data,
         tag: &[u8],
         value: &BString,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(tag.len() == 2, "Tag must have length two, found {}: {tag:?}", tag.len());
         // Create the tag
         let bytes = tag.as_bytes();
         let tag = Tag::from([bytes[0], bytes[1]]);
