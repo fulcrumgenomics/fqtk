@@ -29,7 +29,7 @@ Usage for `fqtk demux` follows:
 <!-- start usage -->
 ````console
 
-IPSUM DOLOR Performs sample demultiplexing on FASTQs.
+Performs sample demultiplexing on FASTQs.
 
 The sample barcode for each sample in the metadata TSV will be compared against the sample
 barcode bases extracted from the FASTQs, to assign each read to a sample.  Reads that do not
