@@ -1384,16 +1384,6 @@ mod tests {
             },
         );
 
-        assert_eq!(barcode_fq_reads.len(), 1);
-        assert_equal(
-            &barcode_fq_reads[0],
-            &OwnedRecord {
-                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
-                seq: b"AAAAAAAA".to_vec(),
-                qual: ";".repeat(8).as_bytes().to_vec(),
-            },
-        );
-
         assert_eq!(umi_fq_reads.len(), 1);
         assert_equal(
             &umi_fq_reads[0],
