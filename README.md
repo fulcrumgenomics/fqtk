@@ -49,19 +49,17 @@ concatenated together prior to running this tool
 
 (Read structures)[<https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures>] are made up of
 `<number><operator>` pairs much like the `CIGAR` string in BAM files.
-Four kinds of operators are recognized:
+Five kinds of operators are recognized:
 
 1. `T` identifies a template read
 2. `B` identifies a sample barcode read
 3. `M` identifies a unique molecular index read
-4. `S` identifies a set of bases that should be skipped or ignored
+4. `C` identifies a unique cellular barcode read
+5. `S` identifies a set of bases that should be skipped or ignored
 
 The last `<number><operator>` pair may be specified using a `+` sign instead of number to
 denote "all remaining bases". This is useful if, e.g., fastqs have been trimmed and contain
-reads of varying length. Both reads must have template bases.  Any molecular identifiers will
-be concatenated using the `-` delimiter and placed in the given SAM record tag (`RX` by
-default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
-tag.
+reads of varying length. Both reads must have template bases.
 
 Metadata about the samples should be given as a headered metadata TSV file with at least the
 following two columns present:
@@ -78,9 +76,10 @@ observed base is an N, it will only match expected sample barcrods with an N.  A
 observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 A and G (R/V/D/N are a superset of the bases compare to R).
 
-The read structures will be used to extract the observed sample barcode, template bases, and
-molecular identifiers from each read.  The observed sample barcode will be matched to the
-sample barcodes extracted from the bases in the sample metadata and associated read structures.
+The read structures will be used to extract the observed sample barcode, template bases, 
+molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
+be matched to the sample barcodes extracted from the bases in the sample metadata and associated
+read structures.
 
 An observed barcode matches an expected barcode if all the following are true:
 1. The number of mismatches (edits/substitutions) is less than or equal to the maximum
@@ -103,9 +102,9 @@ of the format:
 {sample_id}.{segment_type}{read_num}.fq.gz
 ```
 
-where `segment_type` is one of `R`, `I`, and `U` (for template, barcode/index and molecular
-barcode/UMI reads respectively) and `read_num` is a number starting at 1 for each segment
-type.
+where `segment_type` is one of `R`, `I`, `U`, and `C` (for template, sample barcode/index,
+molecular barcode/UMI, and cellular barcode reads, respectively) and `read_num` is a number
+starting at 1 for each segment type.
 
 In addition a `demux-metrics.txt` file is written that is a tab-delimited file with counts
 of how many reads were assigned to each sample and derived metrics.
@@ -134,7 +133,7 @@ Options:
           The read structures, one per input FASTQ in the same order
 
   -b, --output-types <OUTPUT_TYPES>...
-          The read structure types to write to their own files (Must be one of T, B, or M for template reads, sample barcode reads, and molecular barcode reads).
+          The read structure types to write to their own files (Must be one of T, B, M, or C for template reads, sample barcode reads, molecular barcode reads, or cellular barcode reads).
 
           Multiple output types may be specified as a space-delimited list.
 
@@ -177,10 +176,10 @@ Options:
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
 
   -h, --help
-          Print help information (use `-h` for a summary)
+          Print help (see a summary with '-h')
 
   -V, --version
-          Print version information
+          Print version
 ````
 <!-- end usage -->
 
