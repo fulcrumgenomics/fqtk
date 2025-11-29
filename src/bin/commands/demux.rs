@@ -1328,16 +1328,17 @@ mod tests {
     #[test]
     fn test_output_type_reads() {
         let tmp = TempDir::new().unwrap();
-        let read_structures = vec![ReadStructure::from_str("10M8B100T").unwrap()];
+        let read_structures = vec![ReadStructure::from_str("10M8B7C100T").unwrap()];
         let s1_barcode = "AAAAAAAA";
         let s1_umi = "ATCGATCGAT";
+        let s1_cellular_barcode = "GATTACA";
         let sample_metadata =
             metadata_file(&tmp, &[s1_barcode, "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"]);
         let input_files = vec![fastq_file(
             &tmp,
             "ex",
             "ex",
-            &[&(s1_umi.to_owned() + &*s1_barcode.to_owned() + &"A".repeat(100))],
+            &[&(s1_umi.to_owned() + &*s1_barcode.to_owned() + &s1_cellular_barcode.to_owned() + &"A".repeat(100))],
         )];
 
         let output_dir = tmp.path().to_path_buf().join("output");
@@ -1346,7 +1347,7 @@ mod tests {
             inputs: input_files,
             read_structures,
             sample_metadata,
-            output_types: vec!['T', 'B', 'M'],
+            output_types: vec!['T', 'B', 'M', 'C'],
             output: output_dir.clone(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
@@ -1360,9 +1361,11 @@ mod tests {
         let output_path = output_dir.join("Sample0000.R1.fq.gz");
         let barcode_output_path = output_dir.join("Sample0000.I1.fq.gz");
         let umi_output_path = output_dir.join("Sample0000.U1.fq.gz");
+        let cellular_barcode_output_path = output_dir.join("Sample0000.C1.fq.gz");
         let fq_reads = read_fastq(&output_path);
         let barcode_fq_reads = read_fastq(&barcode_output_path);
         let umi_fq_reads = read_fastq(&umi_output_path);
+        let cellular_barcode_fq_reads = read_fastq(&cellular_barcode_output_path);
 
         assert_eq!(fq_reads.len(), 1);
         assert_equal(
@@ -1391,6 +1394,16 @@ mod tests {
                 head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
                 seq: b"ATCGATCGAT".to_vec(),
                 qual: ";".repeat(10).as_bytes().to_vec(),
+            },
+        );
+
+        assert_eq!(cellular_barcode_fq_reads.len(), 1);
+        assert_equal(
+            &cellular_barcode_fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: b"GATTACA".to_vec(),
+                qual: ";".repeat(7).as_bytes().to_vec(),
             },
         );
     }
