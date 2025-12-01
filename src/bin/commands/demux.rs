@@ -1334,11 +1334,13 @@ mod tests {
         let s1_cellular_barcode = "GATTACA";
         let sample_metadata =
             metadata_file(&tmp, &[s1_barcode, "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"]);
+        let template_sequence = "A".repeat(100);
+
         let input_files = vec![fastq_file(
             &tmp,
             "ex",
             "ex",
-            &[&(s1_umi.to_owned() + &*s1_barcode.to_owned() + &s1_cellular_barcode.to_owned() + &"A".repeat(100))],
+            &[&format!("{s1_umi}{s1_barcode}{s1_cellular_barcode}{template_sequence}")],
         )];
 
         let output_dir = tmp.path().to_path_buf().join("output");
