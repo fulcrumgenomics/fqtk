@@ -42,7 +42,7 @@ itertools = "0.10.5"
 log = "0.4.17"
 mimalloc = { version = "0.1.32", default-features = false }
 pooled-writer = "0.3.0"
-read-structure = "0.1.0"
+read-structure = "0.2.0"
 rstest="0.15.0"
 serde = { version = "1.0.147", features = ["derive"] }
 serde-aux = "4.1.2"

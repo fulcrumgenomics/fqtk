@@ -111,6 +111,12 @@ impl ReadSet {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
     }
 
+    /// Produces an iterator over references to the cellular barcode segments stored in this
+    /// ``ReadSet``.
+    fn cellular_barcode_segments(&self) -> SegmentIter {
+        self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
+    }
+
     /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
     fn sample_barcode_sequence(&self) -> Vec<u8> {
         self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
@@ -363,18 +369,21 @@ struct SampleWriters<W: Write> {
     sample_barcode_writers: Option<Vec<W>>,
     /// Vec of the writers for the molecular barcode read segments.
     molecular_barcode_writers: Option<Vec<W>>,
+    /// Vec of the writers for the cellular barcode read segments.
+    cellular_barcode_writers: Option<Vec<W>>,
 }
 
 impl<W: Write> SampleWriters<W> {
     /// Destroys this struct and decomposes it into its component types. Used when swapping
     /// writers for pooled writers.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
             self.name,
             self.template_writers,
             self.sample_barcode_writers,
             self.molecular_barcode_writers,
+            self.cellular_barcode_writers,
         )
     }
 
@@ -387,6 +396,7 @@ impl<W: Write> SampleWriters<W> {
             (&mut self.template_writers, &mut read_set.template_segments()),
             (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
             (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
+            (&mut self.cellular_barcode_writers, &mut read_set.cellular_barcode_segments()),
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
@@ -410,7 +420,7 @@ impl SampleWriters<PooledWriter> {
     ///     - Will error if closing of the ``PooledWriter``s fails for any reason
     fn close(self) -> Result<()> {
         for writers in
-            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers]
+            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers, self.cellular_barcode_writers]
                 .into_iter()
                 .flatten()
         {
@@ -504,19 +514,17 @@ impl DemuxMetric {
 ///
 /// (Read structures)[<https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures>] are made up of
 /// `<number><operator>` pairs much like the `CIGAR` string in BAM files.
-/// Four kinds of operators are recognized:
+/// Five kinds of operators are recognized:
 ///
 /// 1. `T` identifies a template read
 /// 2. `B` identifies a sample barcode read
 /// 3. `M` identifies a unique molecular index read
-/// 4. `S` identifies a set of bases that should be skipped or ignored
+/// 4. `C` identifies a unique cellular barcode read
+/// 5. `S` identifies a set of bases that should be skipped or ignored
 ///
 /// The last `<number><operator>` pair may be specified using a `+` sign instead of number to
 /// denote "all remaining bases". This is useful if, e.g., fastqs have been trimmed and contain
-/// reads of varying length. Both reads must have template bases.  Any molecular identifiers will
-/// be concatenated using the `-` delimiter and placed in the given SAM record tag (`RX` by
-/// default).  Similarly, the sample barcode bases from the given read will be placed in the `BC`
-/// tag.
+/// reads of varying length. Both reads must have template bases.
 ///
 /// Metadata about the samples should be given as a headered metadata TSV file with at least the
 /// following two columns present:
@@ -533,9 +541,10 @@ impl DemuxMetric {
 /// observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 /// A and G (R/V/D/N are a superset of the bases compare to R).
 ///
-/// The read structures will be used to extract the observed sample barcode, template bases, and
-/// molecular identifiers from each read.  The observed sample barcode will be matched to the
-/// sample barcodes extracted from the bases in the sample metadata and associated read structures.
+/// The read structures will be used to extract the observed sample barcode, template bases, 
+/// molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
+/// be matched to the sample barcodes extracted from the bases in the sample metadata and associated
+/// read structures.
 ///
 /// An observed barcode matches an expected barcode if all the following are true:
 /// 1. The number of mismatches (edits/substitutions) is less than or equal to the maximum
@@ -558,9 +567,9 @@ impl DemuxMetric {
 /// {sample_id}.{segment_type}{read_num}.fq.gz
 /// ```
 ///
-/// where `segment_type` is one of `R`, `I`, and `U` (for template, barcode/index and molecular
-/// barcode/UMI reads respectively) and `read_num` is a number starting at 1 for each segment
-/// type.
+/// where `segment_type` is one of `R`, `I`, `U`, and `C` (for template, sample barcode/index,
+/// molecular barcode/UMI, and cellular barcode reads, respectively) and `read_num` is a number
+/// starting at 1 for each segment type.
 ///
 /// In addition a `demux-metrics.txt` file is written that is a tab-delimited file with counts
 /// of how many reads were assigned to each sample and derived metrics.
@@ -591,8 +600,8 @@ pub(crate) struct Demux {
     #[clap(long, short = 'r' , required = true, num_args = 1..)]
     read_structures: Vec<ReadStructure>,
 
-    /// The read structure types to write to their own files (Must be one of T, B, or M for
-    /// template reads, sample barcode reads, and molecular barcode reads).
+    /// The read structure types to write to their own files (Must be one of T, B, M, or C for
+    /// template reads, sample barcode reads, molecular barcode reads, or cellular barcode reads).
     ///
     /// Multiple output types may be specified as a space-delimited list.
     #[clap(long, short='b', default_value="T", num_args = 1.. )]
@@ -651,6 +660,7 @@ impl Demux {
         let mut template_writers = None;
         let mut sample_barcode_writers = None;
         let mut molecular_barcode_writers = None;
+        let mut cellular_barcode_writers = None;
 
         for output_type in output_types {
             let mut output_type_writers = Vec::new();
@@ -659,6 +669,7 @@ impl Demux {
                 SegmentType::Template => 'R',
                 SegmentType::SampleBarcode => 'I',
                 SegmentType::MolecularBarcode => 'U',
+                SegmentType::CellularBarcode => 'C',
                 _ => 'S',
             };
 
@@ -679,6 +690,9 @@ impl Demux {
                 SegmentType::MolecularBarcode => {
                     molecular_barcode_writers = Some(output_type_writers);
                 }
+                SegmentType::CellularBarcode => {
+                    cellular_barcode_writers = Some(output_type_writers);
+                }
                 _ => {}
             }
         }
@@ -688,6 +702,7 @@ impl Demux {
             template_writers,
             sample_barcode_writers,
             molecular_barcode_writers,
+            cellular_barcode_writers,
         })
     }
 
@@ -743,15 +758,17 @@ impl Demux {
             .compression_level(u8::try_from(compression_level)?)?;
 
         for sample in sample_writers {
-            let (name, template_writers, barcode_writers, mol_writers) = sample.into_parts();
+            let (name, template_writers, barcode_writers, mol_writers, cb_writers) = sample.into_parts();
             let mut new_template_writers = None;
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
+            let mut new_cellular_barcode_writers = None;
 
             for (optional_ws, target) in [
                 (template_writers, &mut new_template_writers),
                 (barcode_writers, &mut new_sample_barcode_writers),
                 (mol_writers, &mut new_molecular_barcode_writers),
+                (cb_writers, &mut new_cellular_barcode_writers),
             ] {
                 if let Some(ws) = optional_ws {
                     let mut new_writers = Vec::with_capacity(ws.len());
@@ -766,6 +783,7 @@ impl Demux {
                 template_writers: new_template_writers,
                 sample_barcode_writers: new_sample_barcode_writers,
                 molecular_barcode_writers: new_molecular_barcode_writers,
+                cellular_barcode_writers: new_cellular_barcode_writers,
             });
         }
         let pool = pool_builder.build()?;
@@ -1310,16 +1328,19 @@ mod tests {
     #[test]
     fn test_output_type_reads() {
         let tmp = TempDir::new().unwrap();
-        let read_structures = vec![ReadStructure::from_str("10M8B100T").unwrap()];
+        let read_structures = vec![ReadStructure::from_str("10M8B7C100T").unwrap()];
         let s1_barcode = "AAAAAAAA";
         let s1_umi = "ATCGATCGAT";
+        let s1_cellular_barcode = "GATTACA";
         let sample_metadata =
             metadata_file(&tmp, &[s1_barcode, "CCCCCCCC", "GGGGGGGG", "TTTTTTTT"]);
+        let template_sequence = "A".repeat(100);
+
         let input_files = vec![fastq_file(
             &tmp,
             "ex",
             "ex",
-            &[&(s1_umi.to_owned() + &*s1_barcode.to_owned() + &"A".repeat(100))],
+            &[&format!("{s1_umi}{s1_barcode}{s1_cellular_barcode}{template_sequence}")],
         )];
 
         let output_dir = tmp.path().to_path_buf().join("output");
@@ -1328,7 +1349,7 @@ mod tests {
             inputs: input_files,
             read_structures,
             sample_metadata,
-            output_types: vec!['T', 'B', 'M'],
+            output_types: vec!['T', 'B', 'M', 'C'],
             output: output_dir.clone(),
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
@@ -1342,9 +1363,11 @@ mod tests {
         let output_path = output_dir.join("Sample0000.R1.fq.gz");
         let barcode_output_path = output_dir.join("Sample0000.I1.fq.gz");
         let umi_output_path = output_dir.join("Sample0000.U1.fq.gz");
+        let cellular_barcode_output_path = output_dir.join("Sample0000.C1.fq.gz");
         let fq_reads = read_fastq(&output_path);
         let barcode_fq_reads = read_fastq(&barcode_output_path);
         let umi_fq_reads = read_fastq(&umi_output_path);
+        let cellular_barcode_fq_reads = read_fastq(&cellular_barcode_output_path);
 
         assert_eq!(fq_reads.len(), 1);
         assert_equal(
@@ -1366,16 +1389,6 @@ mod tests {
             },
         );
 
-        assert_eq!(barcode_fq_reads.len(), 1);
-        assert_equal(
-            &barcode_fq_reads[0],
-            &OwnedRecord {
-                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
-                seq: b"AAAAAAAA".to_vec(),
-                qual: ";".repeat(8).as_bytes().to_vec(),
-            },
-        );
-
         assert_eq!(umi_fq_reads.len(), 1);
         assert_equal(
             &umi_fq_reads[0],
@@ -1383,6 +1396,16 @@ mod tests {
                 head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
                 seq: b"ATCGATCGAT".to_vec(),
                 qual: ";".repeat(10).as_bytes().to_vec(),
+            },
+        );
+
+        assert_eq!(cellular_barcode_fq_reads.len(), 1);
+        assert_equal(
+            &cellular_barcode_fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:ATCGATCGAT 1:N:0:AAAAAAAA".to_vec(),
+                seq: b"GATTACA".to_vec(),
+                qual: ";".repeat(7).as_bytes().to_vec(),
             },
         );
     }
@@ -2182,6 +2205,26 @@ mod tests {
 
         assert_eq!(read_set.sample_barcode_sequence(), "GATACAC".as_bytes().to_owned());
     }
+
+    #[test]
+    fn test_cellular_barcode_segments() {
+        let segments = vec![
+            seg("AGCT".as_bytes(), SegmentType::Template),
+            seg("GATA".as_bytes(), SegmentType::SampleBarcode),
+            seg("CAC".as_bytes(), SegmentType::SampleBarcode),
+            seg("GACCCC".as_bytes(), SegmentType::MolecularBarcode),
+            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
+        ];
+
+        let read_set = read_set(segments);
+
+        let expected = vec![
+            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
+        ];
+
+        assert_eq!(expected, read_set.cellular_barcode_segments().cloned().collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_template_segments() {
         let segments = vec![
