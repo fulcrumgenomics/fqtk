@@ -2,7 +2,7 @@ name: Check
 
 on: [push, pull_request]
 
-env: 
+env:
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
-      
+
       - name: Run cargo check
         uses: actions-rs/cargo@v1
         with:
@@ -74,5 +74,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: bash src/scripts/precommit.sh
-
+        run: bash ci/check.sh
