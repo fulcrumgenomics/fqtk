@@ -46,6 +46,8 @@ struct FastqSegment {
     quals: Vec<u8>,
     /// the type of segment being stored
     segment_type: SegmentType,
+    /// the index of the source FASTQ file this segment came from
+    source_index: usize,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -136,6 +138,20 @@ impl ReadSet {
         }
 
         first
+    }
+
+    /// Reconstructs the original (untrimmed) read for a given source index by concatenating
+    /// all segments from that source in order. Used for --no-trim output.
+    fn original_read_for_source(&self, source_index: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut seq = Vec::new();
+        let mut quals = Vec::new();
+        for segment in &self.segments {
+            if segment.source_index == source_index {
+                seq.extend_from_slice(&segment.seq);
+                quals.extend_from_slice(&segment.quals);
+            }
+        }
+        (seq, quals)
     }
 
     /// Writes the FASTQ header to the given writer.  Substitutes in the given read number into
@@ -280,6 +296,8 @@ struct ReadSetIterator {
     source: FastqReader<Box<dyn BufRead + Send>>,
     /// Valid reasons for skipping reads, otherwise panic!
     skip_reasons: Vec<SkipReason>,
+    /// The index of this FASTQ source (0-based), used for tracking original reads.
+    source_index: usize,
 }
 
 impl Iterator for ReadSetIterator {
@@ -333,6 +351,7 @@ impl Iterator for ReadSetIterator {
                     seq: seq.to_vec(),
                     quals: quals.to_vec(),
                     segment_type: read_segment.kind,
+                    source_index: self.source_index,
                 });
             }
             Some(ReadSet { header: read_name.to_vec(), segments, skip_reason: None })
@@ -344,13 +363,14 @@ impl Iterator for ReadSetIterator {
 
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
-    /// structures
+    /// structures.
     pub fn new(
         read_structure: ReadStructure,
         source: FastqReader<Box<dyn BufRead + Send>>,
         skip_reasons: Vec<SkipReason>,
+        source_index: usize,
     ) -> Self {
-        Self { read_structure, source, skip_reasons }
+        Self { read_structure, source, skip_reasons, source_index }
     }
 }
 
@@ -377,7 +397,9 @@ impl<W: Write> SampleWriters<W> {
     /// Destroys this struct and decomposes it into its component types. Used when swapping
     /// writers for pooled writers.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+    fn into_parts(
+        self,
+    ) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
             self.name,
             self.template_writers,
@@ -391,9 +413,35 @@ impl<W: Write> SampleWriters<W> {
     /// ``Self`` struct.
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
     /// checked at runtime as doing so substantially slows demulitplexing.
-    fn write(&mut self, read_set: &ReadSet) -> Result<()> {
+    ///
+    /// If `no_trim` is true, template outputs will contain the full original reads instead of
+    /// just the template segments.
+    fn write(&mut self, read_set: &ReadSet, no_trim: bool) -> Result<()> {
+        // Handle template writers separately to support no_trim
+        if let Some(writers) = &mut self.template_writers {
+            for (read_idx, (writer, segment)) in
+                writers.iter_mut().zip(read_set.template_segments()).enumerate()
+            {
+                read_set.write_header(writer, read_idx + 1)?;
+                writer.write_all(b"\n")?;
+                if no_trim {
+                    // Write the original untrimmed read by reconstructing from segments
+                    let (seq, quals) = read_set.original_read_for_source(segment.source_index);
+                    writer.write_all(&seq)?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(&quals)?;
+                } else {
+                    // Write just the template segment
+                    writer.write_all(segment.seq.as_slice())?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(segment.quals.as_slice())?;
+                }
+                writer.write_all(b"\n")?;
+            }
+        }
+
+        // Handle other segment types (barcodes, UMIs, etc.) - always write segments, not originals
         for (writers_opt, segments) in [
-            (&mut self.template_writers, &mut read_set.template_segments()),
             (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
             (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
             (&mut self.cellular_barcode_writers, &mut read_set.cellular_barcode_segments()),
@@ -419,10 +467,14 @@ impl SampleWriters<PooledWriter> {
     /// # Errors
     ///     - Will error if closing of the ``PooledWriter``s fails for any reason
     fn close(self) -> Result<()> {
-        for writers in
-            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers, self.cellular_barcode_writers]
-                .into_iter()
-                .flatten()
+        for writers in [
+            self.template_writers,
+            self.sample_barcode_writers,
+            self.molecular_barcode_writers,
+            self.cellular_barcode_writers,
+        ]
+        .into_iter()
+        .flatten()
         {
             writers.into_iter().try_for_each(PooledWriter::close)?;
         }
@@ -541,7 +593,7 @@ impl DemuxMetric {
 /// observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 /// A and G (R/V/D/N are a superset of the bases compare to R).
 ///
-/// The read structures will be used to extract the observed sample barcode, template bases, 
+/// The read structures will be used to extract the observed sample barcode, template bases,
 /// molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
 /// be matched to the sample barcodes extracted from the bases in the sample metadata and associated
 /// read structures.
@@ -643,6 +695,12 @@ pub(crate) struct Demux {
     ///    if a read is empty and the read structure is `+T`.
     #[clap(long, short = 'S')]
     skip_reasons: Vec<SkipReason>,
+
+    /// Output the original untrimmed reads in the template FASTQ files instead of just the
+    /// template segments. The read structure is still used for barcode extraction/matching,
+    /// but template outputs will contain the full original read.
+    #[clap(long)]
+    no_trim: bool,
 }
 
 impl Demux {
@@ -758,7 +816,8 @@ impl Demux {
             .compression_level(u8::try_from(compression_level)?)?;
 
         for sample in sample_writers {
-            let (name, template_writers, barcode_writers, mol_writers, cb_writers) = sample.into_parts();
+            let (name, template_writers, barcode_writers, mol_writers, cb_writers) =
+                sample.into_parts();
             let mut new_template_writers = None;
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
@@ -920,9 +979,15 @@ impl Command for Demux {
 
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone())
-            .map(|(source, read_structure)| {
-                ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
-                    .read_ahead(1000, 1000)
+            .enumerate()
+            .map(|(source_index, (source, read_structure))| {
+                ReadSetIterator::new(
+                    read_structure,
+                    source,
+                    self.skip_reasons.clone(),
+                    source_index,
+                )
+                .read_ahead(1000, 1000)
             })
             .collect::<Vec<_>>();
 
@@ -960,10 +1025,10 @@ impl Command for Demux {
             let read_set = ReadSet::combine_readsets(next_read_sets);
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
             {
-                sample_writers[barcode_match.best_match].write(&read_set)?;
+                sample_writers[barcode_match.best_match].write(&read_set, self.no_trim)?;
                 sample_metrics[barcode_match.best_match].templates += 1;
             } else {
-                sample_writers[unmatched_index].write(&read_set)?;
+                sample_writers[unmatched_index].write(&read_set, self.no_trim)?;
                 unmatched_metric.templates += 1;
             }
             logger.record();
@@ -1123,6 +1188,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1166,6 +1232,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1205,6 +1272,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -1243,6 +1311,7 @@ mod tests {
             threads: 2,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1278,6 +1347,7 @@ mod tests {
             threads: 2,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1308,6 +1378,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1320,6 +1391,111 @@ mod tests {
             &OwnedRecord {
                 head: b"ex_0 1:N:0:AAAAAAAAGATTACAGA".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_no_trim_outputs_original_reads() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("17B100T").unwrap()];
+        let s1_barcode = "AAAAAAAAGATTACAGA";
+        let template_seq = "T".repeat(100);
+        let full_read = s1_barcode.to_owned() + &template_seq;
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &[&full_read])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            no_trim: true,
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        // With no_trim, the output should be the full original read (barcode + template)
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAAAGATTACAGA".to_vec(),
+                seq: full_read.as_bytes().to_vec(),
+                qual: ";".repeat(117).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_no_trim_with_paired_reads() {
+        let tmp = TempDir::new().unwrap();
+        // R1 has inline barcode, R2 is pure template
+        let read_structures = vec![
+            ReadStructure::from_str("8B92T").unwrap(),
+            ReadStructure::from_str("100T").unwrap(),
+        ];
+        let s1_barcode = "AAAAAAAA";
+        let r1_full = s1_barcode.to_owned() + &"A".repeat(92);
+        let r2_full = "T".repeat(100);
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![
+            fastq_file(&tmp, "ex_R1", "ex", &[&r1_full]),
+            fastq_file(&tmp, "ex_R2", "ex", &[&r2_full]),
+        ];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            no_trim: true,
+        };
+        demux_inputs.execute().unwrap();
+
+        // R1 output should be full 100bp read (barcode + template)
+        let r1_path = output_dir.join("Sample0000.R1.fq.gz");
+        let r1_reads = read_fastq(&r1_path);
+        assert_eq!(r1_reads.len(), 1);
+        assert_equal(
+            &r1_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAAA".to_vec(),
+                seq: r1_full.as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+
+        // R2 output should be full 100bp read (same as template since no barcode)
+        let r2_path = output_dir.join("Sample0000.R2.fq.gz");
+        let r2_reads = read_fastq(&r2_path);
+        assert_eq!(r2_reads.len(), 1);
+        assert_equal(
+            &r2_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 2:N:0:AAAAAAAA".to_vec(),
+                seq: r2_full.as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             },
         );
@@ -1357,6 +1533,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1433,6 +1610,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1489,6 +1667,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1562,6 +1741,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1634,6 +1814,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1699,6 +1880,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux.execute().unwrap();
 
@@ -1763,6 +1945,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux.execute().unwrap();
 
@@ -1827,6 +2010,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -1901,6 +2085,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1935,6 +2120,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -1969,6 +2155,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2008,6 +2195,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2044,6 +2232,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![SkipReason::TooFewBases],
+            no_trim: false,
         };
         demux_inputs.execute().unwrap();
 
@@ -2071,7 +2260,7 @@ mod tests {
 
     fn seg(bases: &[u8], segment_type: SegmentType) -> FastqSegment {
         let quals = vec![b'#'; bases.len()];
-        FastqSegment { seq: bases.to_vec(), quals, segment_type }
+        FastqSegment { seq: bases.to_vec(), quals, segment_type, source_index: 0 }
     }
 
     #[test]
@@ -2218,9 +2407,7 @@ mod tests {
 
         let read_set = read_set(segments);
 
-        let expected = vec![
-            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
-        ];
+        let expected = vec![seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode)];
 
         assert_eq!(expected, read_set.cellular_barcode_segments().cloned().collect::<Vec<_>>());
     }

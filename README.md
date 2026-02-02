@@ -76,7 +76,7 @@ observed base is an N, it will only match expected sample barcrods with an N.  A
 observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 A and G (R/V/D/N are a superset of the bases compare to R).
 
-The read structures will be used to extract the observed sample barcode, template bases, 
+The read structures will be used to extract the observed sample barcode, template bases,
 molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
 be matched to the sample barcodes extracted from the bases in the sample metadata and associated
 read structures.
@@ -174,6 +174,9 @@ Options:
           Skip demultiplexing reads for any of the following reasons, otherwise panic.
 
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
+
+      --no-trim
+          Output the original untrimmed reads in the template FASTQ files instead of just the template segments. The read structure is still used for barcode extraction/matching, but template outputs will contain the full original read
 
   -h, --help
           Print help (see a summary with '-h')
