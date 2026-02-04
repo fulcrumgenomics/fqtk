@@ -175,8 +175,16 @@ Options:
 
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
 
-      --no-trim
-          Output the original untrimmed reads in the template FASTQ files instead of just the template segments. The read structure is still used for barcode extraction/matching, but template outputs will contain the full original read
+      --template-types <TEMPLATE_TYPES>...
+          The read structure types to include in the template FASTQ output files.
+
+          By default, only template (T) segments are included. To include additional segment types (e.g. to preserve UMIs in the output reads), specify them here. For example, `--template-types M T` will include both molecular barcode and template segments.
+
+          To output the full original reads (all segments), specify all segment types present in your read structure (e.g. `--template-types B M T`).
+
+          Note: If `--template-types` includes any non-`T` type, `T` must be included in `--output-types`.
+
+          [default: T]
 
   -h, --help
           Print help (see a summary with '-h')
