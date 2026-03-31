@@ -35,10 +35,7 @@ function run() {
     fi
 }
 
-parent=$(cd $(dirname $0) && pwd -P)
-repo_root=$(cd $(dirname $0)/.. && pwd -P)
-
-run "Formatting"  "cargo fmt"
+run "Formatting"  "cargo fmt --check --all"
 run "Clippy"      "cargo clippy --all-features --all-targets -- -D warnings"
 run "Unit Tests"  "cargo test"
 
