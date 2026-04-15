@@ -150,6 +150,10 @@ impl Subsample {
             errors.push(format!("Threads must be at least 2, got {}.", self.threads));
         }
 
+        if !(1..=12).contains(&self.compression_level) {
+            errors.push(format!("Compression level must be 1-12, got {}.", self.compression_level));
+        }
+
         if let Some(parent) = self.output.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 errors.push(format!("Output parent directory {parent:?} does not exist."));
@@ -203,9 +207,9 @@ impl Command for Subsample {
             .map(|p| {
                 fgio.new_reader(p)
                     .map(|r| FastqReader::with_capacity(r, BUFFER_SIZE))
-                    .unwrap_or_else(|e| panic!("Failed to open {p:?}: {e}"))
+                    .map_err(|e| anyhow::anyhow!("Failed to open {p:?}: {e}"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Create output writers
         let (mut pool, mut writers) = self.create_writers()?;
@@ -466,6 +470,24 @@ mod tests {
         };
         let err = cmd.validate().unwrap_err();
         assert!(err.to_string().contains("Threads must be at least 2"), "{err}");
+    }
+
+    #[test]
+    fn test_validation_bad_compression_level() {
+        let tmp = TempDir::new().unwrap();
+        let lines = fq_lines_from_bases("r", &["ACGT"]);
+        let input = write_fastq(&tmp, "r1", &lines);
+        let cmd = Subsample {
+            inputs: vec![input],
+            output: tmp.path().join("out"),
+            fraction: 0.5,
+            threads: 2,
+            compression_level: 13,
+            seed: None,
+            disable_read_name_checking: false,
+        };
+        let err = cmd.validate().unwrap_err();
+        assert!(err.to_string().contains("Compression level must be 1-12"), "{err}");
     }
 
     // ---- functional tests ----
