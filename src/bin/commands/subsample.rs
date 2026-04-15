@@ -4,7 +4,6 @@ use clap::Parser;
 use fgoxide::io::Io;
 use log::info;
 use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
-use proglog::{CountFormatterKind, ProgLogBuilder};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -17,6 +16,19 @@ use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Formats a u64 with comma separators (e.g. 1,234,567).
+fn fmt_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
 
 /// Subsamples reads from one or more synchronized FASTQ files.
 ///
@@ -205,15 +217,7 @@ impl Command for Subsample {
             self.output,
         );
 
-        let logger = ProgLogBuilder::new()
-            .name("fqtk subsample")
-            .noun("records")
-            .verb("processed")
-            .unit(1_000_000)
-            .count_formatter(CountFormatterKind::Comma)
-            .level(log::Level::Info)
-            .build();
-
+        let log_unit: u64 = 5_000_000;
         let num_inputs = sources.len();
         let check_names = !self.disable_read_name_checking && num_inputs > 1;
         let mut expected_name: Vec<u8> = Vec::new();
@@ -266,7 +270,15 @@ impl Command for Subsample {
             if keep {
                 total_kept += 1;
             }
-            logger.record();
+            if total_read % log_unit == 0 {
+                let pct = total_kept as f64 / total_read as f64 * 100.0;
+                info!(
+                    "[fqtk subsample] Read {} record sets and wrote {} ({:.1}%).",
+                    fmt_count(total_read),
+                    fmt_count(total_kept),
+                    pct,
+                );
+            }
         }
 
         // Shut down writers and pool
@@ -276,11 +288,12 @@ impl Command for Subsample {
         }
         pool.stop_pool()?;
 
+        let pct = if total_read > 0 { total_kept as f64 / total_read as f64 * 100.0 } else { 0.0 };
         info!(
-            "Subsampling complete. Read {} records, kept {} ({:.2}%).",
-            total_read,
-            total_kept,
-            if total_read > 0 { total_kept as f64 / total_read as f64 * 100.0 } else { 0.0 },
+            "[fqtk subsample] Read {} record sets and wrote {} ({:.1}%).",
+            fmt_count(total_read),
+            fmt_count(total_kept),
+            pct,
         );
 
         Ok(())
