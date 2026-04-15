@@ -82,7 +82,7 @@ observed base is an N, it will only match expected sample barcrods with an N.  A
 observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 A and G (R/V/D/N are a superset of the bases compare to R).
 
-The read structures will be used to extract the observed sample barcode, template bases, 
+The read structures will be used to extract the observed sample barcode, template bases,
 molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
 be matched to the sample barcodes extracted from the bases in the sample metadata and associated
 read structures.
