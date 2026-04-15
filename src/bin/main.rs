@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use commands::command::Command;
 use commands::demux::Demux;
+use commands::subsample::Subsample;
 use enum_dispatch::enum_dispatch;
 use env_logger::Env;
 
@@ -23,6 +24,7 @@ struct Args {
 #[command(version)]
 enum Subcommand {
     Demux(Demux),
+    Subsample(Subsample),
 }
 
 fn main() -> Result<()> {
