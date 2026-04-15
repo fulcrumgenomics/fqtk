@@ -377,7 +377,9 @@ impl<W: Write> SampleWriters<W> {
     /// Destroys this struct and decomposes it into its component types. Used when swapping
     /// writers for pooled writers.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
+    fn into_parts(
+        self,
+    ) -> (String, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>, Option<Vec<W>>) {
         (
             self.name,
             self.template_writers,
@@ -419,10 +421,14 @@ impl SampleWriters<PooledWriter> {
     /// # Errors
     ///     - Will error if closing of the ``PooledWriter``s fails for any reason
     fn close(self) -> Result<()> {
-        for writers in
-            [self.template_writers, self.sample_barcode_writers, self.molecular_barcode_writers, self.cellular_barcode_writers]
-                .into_iter()
-                .flatten()
+        for writers in [
+            self.template_writers,
+            self.sample_barcode_writers,
+            self.molecular_barcode_writers,
+            self.cellular_barcode_writers,
+        ]
+        .into_iter()
+        .flatten()
         {
             writers.into_iter().try_for_each(PooledWriter::close)?;
         }
@@ -541,7 +547,7 @@ impl DemuxMetric {
 /// observed base is an R, it will match R, V, D, and N, since the latter IUPAC codes allow both
 /// A and G (R/V/D/N are a superset of the bases compare to R).
 ///
-/// The read structures will be used to extract the observed sample barcode, template bases, 
+/// The read structures will be used to extract the observed sample barcode, template bases,
 /// molecular identifiers, and cellular barcodes from each read.  The observed sample barcode will
 /// be matched to the sample barcodes extracted from the bases in the sample metadata and associated
 /// read structures.
@@ -758,7 +764,8 @@ impl Demux {
             .compression_level(u8::try_from(compression_level)?)?;
 
         for sample in sample_writers {
-            let (name, template_writers, barcode_writers, mol_writers, cb_writers) = sample.into_parts();
+            let (name, template_writers, barcode_writers, mol_writers, cb_writers) =
+                sample.into_parts();
             let mut new_template_writers = None;
             let mut new_sample_barcode_writers = None;
             let mut new_molecular_barcode_writers = None;
@@ -2218,9 +2225,7 @@ mod tests {
 
         let read_set = read_set(segments);
 
-        let expected = vec![
-            seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode),
-        ];
+        let expected = vec![seg("ACGTACGT".as_bytes(), SegmentType::CellularBarcode)];
 
         assert_eq!(expected, read_set.cellular_barcode_segments().cloned().collect::<Vec<_>>());
     }
