@@ -42,6 +42,8 @@ itertools = "0.14.0"
 log = "0.4.29"
 mimalloc = { version = "0.1.48", default-features = false }
 pooled-writer = "0.4.0"
+rand = "0.9"
+rand_chacha = "0.9"
 read-structure = "0.2.0"
 rstest = "0.26.1"
 serde = { version = "1.0.228", features = ["derive"] }
