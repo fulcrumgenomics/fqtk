@@ -45,7 +45,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.10"
 fgoxide = "0.6.0"
-flate2 = { version = "1.1.9", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
+flate2 = { version = "1.1.9", features = ["zlib-rs"] }  # Pure-Rust backend; ties or edges out zlib-ng with no C toolchain dependency
 itertools = "0.14.0"
 log = "0.4.29"
 mimalloc = { version = "0.1.48", default-features = false }
