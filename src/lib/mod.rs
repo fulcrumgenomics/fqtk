@@ -1,3 +1,4 @@
+pub mod adapter_db;
 pub mod barcode_matching;
 pub mod bitenc;
 pub mod samples;

@@ -1,4 +1,5 @@
 use crate::commands::command::Command;
+use crate::commands::utils::fmt_count;
 use anyhow::{Result, ensure};
 use clap::Parser;
 use fgoxide::io::Io;
@@ -16,19 +17,6 @@ use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
-
-/// Formats a u64 with comma separators (e.g. 1,234,567).
-fn fmt_count(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    result
-}
 
 /// Subsamples reads from one or more synchronized FASTQ files.
 ///
@@ -154,10 +142,11 @@ impl Subsample {
             errors.push(format!("Compression level must be 1-12, got {}.", self.compression_level));
         }
 
-        if let Some(parent) = self.output.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                errors.push(format!("Output parent directory {parent:?} does not exist."));
-            }
+        if let Some(parent) = self.output.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            errors.push(format!("Output parent directory {parent:?} does not exist."));
         }
 
         if errors.is_empty() {
@@ -274,7 +263,7 @@ impl Command for Subsample {
             if keep {
                 total_kept += 1;
             }
-            if total_read % log_unit == 0 {
+            if total_read.is_multiple_of(log_unit) {
                 let pct = total_kept as f64 / total_read as f64 * 100.0;
                 info!(
                     "[fqtk subsample] Read {} record sets and wrote {} ({:.1}%).",

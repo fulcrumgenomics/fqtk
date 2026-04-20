@@ -95,25 +95,25 @@ impl ReadSet {
     const PLUS: u8 = b'+';
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
-    fn template_segments(&self) -> SegmentIter {
+    fn template_segments(&self) -> SegmentIter<'_> {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::Template)
     }
 
     /// Produces an iterator over references to the sample barcode segments stored in this
     /// ``ReadSet``.
-    fn sample_barcode_segments(&self) -> SegmentIter {
+    fn sample_barcode_segments(&self) -> SegmentIter<'_> {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::SampleBarcode)
     }
 
     /// Produces an iterator over references to the molecular barcode segments stored in this
     /// ``ReadSet``.
-    fn molecular_barcode_segments(&self) -> SegmentIter {
+    fn molecular_barcode_segments(&self) -> SegmentIter<'_> {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::MolecularBarcode)
     }
 
     /// Produces an iterator over references to the cellular barcode segments stored in this
     /// ``ReadSet``.
-    fn cellular_barcode_segments(&self) -> SegmentIter {
+    fn cellular_barcode_segments(&self) -> SegmentIter<'_> {
         self.segments.iter().filter(|s| s.segment_type == SegmentType::CellularBarcode)
     }
 
