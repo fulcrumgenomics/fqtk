@@ -1,0 +1,26 @@
+# Baseline x86_64 release builds to x86-64-v3 (AVX2 + BMI1/BMI2 + FMA).
+#
+# AVX2 is present on effectively every x86_64 CPU shipped since 2013 (Intel
+# Haswell) / 2017 (AMD Zen) / 2021 (Intel Atom Gracemont+), and on essentially
+# 100% of cloud compute available today. Building to x86-64-v3 recovers ~6%
+# wall-time vs. the default x86-64 (SSE2) baseline on AVX2 hosts — per our
+# Granite Rapids EC2 benchmark — and costs nothing on them.
+#
+# Hosts without AVX2 (pre-Haswell Intel, pre-Zen AMD, pre-Gracemont Atom) will
+# SIGILL on illegal instruction. `src/bin/main.rs` runs a CPUID check at the
+# top of `main()` and prints a friendly error instead, though that check is
+# best-effort — if the Rust runtime emits AVX2 ops before `main()` runs, the
+# SIGILL comes first. Users on old hardware should rebuild with the default
+# portable baseline via `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release`.
+#
+# aarch64 targets (Apple Silicon, AWS Graviton) are untouched and keep their
+# native NEON baseline.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
