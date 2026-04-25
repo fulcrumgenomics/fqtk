@@ -97,6 +97,46 @@ The expected barcode sequence may contains Ns, which are not counted as mismatch
 of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 both the observed barcodes `AAA` and `AAN`).
 
+## Per-sample read structures
+
+In addition to the global `--read-structures`, the metadata TSV may include optional columns
+`read_structure_1`, `read_structure_2`, ..., `read_structure_<N>` (where `N` is the number of
+input FASTQs).  When any cell is non-empty for a sample, the per-sample read structures
+replace the global `--read-structures` for that sample — both for matching and for output
+extraction.
+
+Per-sample structures support per-cell fall-back to the global `--read-structures`:
+
+- A blank `read_structure_<i>` cell uses `--read-structures[i-1]` for that sample's input *i*.
+- A row whose `read_structure_<n>` cells are all blank uses `--read-structures` entirely for
+  that sample (equivalent to omitting the columns for that sample only).
+- The unmatched pseudo-sample always uses the global `--read-structures`.
+
+Constraints:
+
+1. The number of `read_structure_<n>` columns must equal `--read-structures.len()`.
+2. The concatenated `B`-segment length must equal the `barcode` column length for every
+   sample (computed from each sample's *effective* read structures, i.e. with fall-backs
+   applied).
+
+Different samples may have different per-input `(T, B, M, C)` segment counts (and hence
+produce different sets of output files).  This supports protocols with sample-dependent
+read structures (e.g. CODEC, where each sample may include a stagger spacer of varying
+length so that the position of the constant ligation base shifts per sample).
+
+During matching, each sample's expected pattern is constructed from its effective read
+structure by filling `B`-segment positions from the `barcode` column and treating
+`M`/`S`/`C` segment positions as `N` wildcards.  All patterns are padded with trailing `N`s
+to a per-input matching window equal to the longest pre-template prefix across samples.
+
+Example metadata TSV (CODEC stagger):
+
+```text
+sample_id  barcode         read_structure_1   read_structure_2
+S1         GATTACAGATTACA  3M7B1S+T           3M7B1S+T
+S2         TTTTTTTTTTTTTT  3M1S7B1S+T         3M1S7B1S+T
+```
+
 ## Outputs
 
 All outputs are generated in the provided `--output` directory.  For each sample plus the
@@ -136,7 +176,9 @@ Options:
           One or more input FASTQ files each corresponding to a sequencing read (e.g. R1, I1)
 
   -r, --read-structures <READ_STRUCTURES>...
-          The read structures, one per input FASTQ in the same order
+          The read structures, one per input FASTQ in the same order.
+
+          Per-sample read structures (see the `read_structure_<n>` metadata columns) take precedence for each matched sample, and a blank cell falls back to the corresponding `--read-structures` entry.  The unmatched pseudo-sample always uses `--read-structures` for its output extraction.  The number of `read_structure_<n>` columns must equal `--read-structures.len()`.
 
   -b, --output-types <OUTPUT_TYPES>...
           The read structure types to write to their own files (Must be one of T, B, M, or C for template reads, sample barcode reads, molecular barcode reads, or cellular barcode reads).

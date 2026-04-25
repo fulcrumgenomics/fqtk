@@ -76,13 +76,45 @@ impl FromStr for SkipReason {
     }
 }
 
+/// The raw bases and qualities of a single FASTQ record from one input file, retained so the
+/// record can be re-segmented per-sample when per-sample read structures are in use.
+#[derive(PartialEq, Eq, Debug, Clone)]
+struct RawInput {
+    bases: Vec<u8>,
+    quals: Vec<u8>,
+}
+
+/// Error returned by [`ReadSet::resegment`].  The two variants let callers distinguish reads
+/// that were too short to extract every segment (always recoverable by counting them as
+/// `TooFewBases` skips) from genuinely unexpected failures (which should abort the run).
+#[derive(Debug)]
+enum ResegmentError {
+    /// The raw bases were too short to extract one or more segments of the read structure.
+    TooShort(anyhow::Error),
+    /// An unexpected error other than insufficient length.
+    Other(anyhow::Error),
+}
+
+impl ResegmentError {
+    /// Consumes the error and returns the underlying [`anyhow::Error`].
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            ResegmentError::TooShort(e) | ResegmentError::Other(e) => e,
+        }
+    }
+}
+
 /// One unit of FASTQ records separated into their component read segments.
 #[derive(PartialEq, Debug, Clone)]
 struct ReadSet {
     /// Header of the FASTQ record
     header: Vec<u8>,
-    /// Segments of reads
+    /// Segments of reads (built using the global read structures).
     segments: Vec<FastqSegment>,
+    /// The raw bases / qualities from each input FASTQ, in input order.  Used to rebuild
+    /// segments when a matched sample has its own per-sample read structures.  Empty for the
+    /// no-per-sample-read-structures case (and for skipped reads).
+    raw_per_input: Vec<RawInput>,
     /// The reason the read should be skipped for demultiplexing, or None if it should be
     /// demultiplexed.
     skip_reason: Option<SkipReason>,
@@ -122,17 +154,103 @@ impl ReadSet {
         self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
     }
 
+    /// Returns a fixed-length, per-input prefix slice of the raw bases concatenated across all
+    /// input FASTQs, used to perform per-sample N-padded matching when per-sample read
+    /// structures are in use.  Callers are responsible for ensuring every input has at least
+    /// `prefix_lens[i]` bases — `ReadSetIterator` already gates each input on this length, so
+    /// any read reaching this method is guaranteed long enough.
+    ///
+    /// # Panics
+    ///   - In debug builds, panics if any input has fewer bases than its prefix length.
+    fn matching_window_bases(&self, prefix_lens: &[usize]) -> Vec<u8> {
+        let total: usize = prefix_lens.iter().sum();
+        let mut out = Vec::with_capacity(total);
+        for (raw, &plen) in self.raw_per_input.iter().zip(prefix_lens) {
+            debug_assert!(
+                raw.bases.len() >= plen,
+                "raw bases length {} < matching prefix length {}; ReadSetIterator should have \
+                 gated this read",
+                raw.bases.len(),
+                plen,
+            );
+            out.extend_from_slice(&raw.bases[..plen]);
+        }
+        out
+    }
+
+    /// Consumes this read set and returns a new one with `segments` extracted from
+    /// `raw_per_input` according to the supplied per-input read structures.  `raw_per_input`
+    /// is dropped (no longer needed once segments are built); `header` is moved through.
+    ///
+    /// # Errors
+    ///   - Returns [`ResegmentError::TooShort`] if any segment falls outside the available
+    ///     bases for that input (i.e. the read is shorter than the read structure requires).
+    ///   - Returns [`ResegmentError::Other`] for any other extraction failure.
+    /// # Panics
+    ///   - Will panic if `read_structures.len() != self.raw_per_input.len()`.
+    fn resegment(self, read_structures: &[ReadStructure]) -> Result<Self, ResegmentError> {
+        assert_eq!(
+            read_structures.len(),
+            self.raw_per_input.len(),
+            "resegment requires one read structure per input FASTQ ({} vs {})",
+            read_structures.len(),
+            self.raw_per_input.len(),
+        );
+        let total_segments: usize = read_structures.iter().map(|rs| rs.number_of_segments()).sum();
+        let mut segments = Vec::with_capacity(total_segments);
+        for (raw, rs) in self.raw_per_input.iter().zip(read_structures.iter()) {
+            for seg in rs.iter() {
+                let (s, q) = match seg.extract_bases_and_quals(&raw.bases, &raw.quals) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        let is_length_error = matches!(
+                            e,
+                            ReadStructureError::ReadEndsBeforeSegment(_)
+                                | ReadStructureError::ReadEndsAfterSegment(_)
+                        );
+                        let wrapped = anyhow!(
+                            "Error extracting bases (len: {}) for read structure ({}) from \
+                             FASTQ record {}: {}",
+                            raw.bases.len(),
+                            rs,
+                            String::from_utf8_lossy(&self.header),
+                            e,
+                        );
+                        return Err(if is_length_error {
+                            ResegmentError::TooShort(wrapped)
+                        } else {
+                            ResegmentError::Other(wrapped)
+                        });
+                    }
+                };
+                segments.push(FastqSegment {
+                    seq: s.to_vec(),
+                    quals: q.to_vec(),
+                    segment_type: seg.kind,
+                });
+            }
+        }
+        Ok(Self {
+            header: self.header,
+            segments,
+            raw_per_input: Vec::new(),
+            skip_reason: self.skip_reason,
+        })
+    }
+
     /// Combines ``ReadSet`` structs together into a single ``ReadSet``
     fn combine_readsets(readsets: Vec<Self>) -> Self {
+        assert!(!readsets.is_empty(), "Cannot call combine readsets on an empty vec!");
         let total_segments: usize = readsets.iter().map(|s| s.segments.len()).sum();
-        assert!(total_segments > 0, "Cannot call combine readsets on an empty vec!");
 
         let mut readset_iter = readsets.into_iter();
         let mut first = readset_iter.next().expect("Cannot call combine readsets on an empty vec!");
         first.segments.reserve_exact(total_segments - first.segments.len());
+        first.raw_per_input.reserve_exact(readset_iter.len());
 
         for next_readset in readset_iter {
             first.segments.extend(next_readset.segments);
+            first.raw_per_input.extend(next_readset.raw_per_input);
         }
 
         first
@@ -280,6 +398,13 @@ struct ReadSetIterator {
     source: FastqReader<Box<dyn BufRead + Send>>,
     /// Valid reasons for skipping reads, otherwise panic!
     skip_reasons: Vec<SkipReason>,
+    /// If true, the raw bases and qualities for each record will be retained on the resulting
+    /// `ReadSet` so that records can be re-segmented per-sample later.
+    keep_raw: bool,
+    /// The minimum number of bases required to extract every segment of `read_structure`.
+    /// Pre-computed once at construction time and used to short-circuit reads that are too
+    /// short.
+    min_len: usize,
 }
 
 impl Iterator for ReadSetIterator {
@@ -287,20 +412,17 @@ impl Iterator for ReadSetIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(rec) = self.source.next() {
-            let mut segments = Vec::with_capacity(self.read_structure.number_of_segments());
             let next_fq_rec = rec.expect("Unexpected error parsing FASTQs");
             let read_name = next_fq_rec.head();
             let bases = next_fq_rec.seq();
             let quals = next_fq_rec.qual();
 
-            // Check that we have enough bases for this segment. For variable length segments,
-            // we must have at least one base.
-            let min_len = self.read_structure.iter().map(|s| s.length().unwrap_or(1)).sum();
-            if bases.len() < min_len {
+            if bases.len() < self.min_len {
                 if self.skip_reasons.contains(&SkipReason::TooFewBases) {
                     return Some(ReadSet {
                         header: read_name.to_vec(),
                         segments: vec![],
+                        raw_per_input: vec![],
                         skip_reason: Some(SkipReason::TooFewBases),
                     });
                 }
@@ -308,13 +430,25 @@ impl Iterator for ReadSetIterator {
                     "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
                     String::from_utf8(read_name.to_vec()).unwrap(),
                     bases.len(),
-                    min_len,
+                    self.min_len,
                     self.read_structure
                 );
             }
 
+            // In keep_raw mode the caller will re-segment per-sample (or per-globals for
+            // unmatched) downstream, so skip the up-front extraction and just retain the raw
+            // bases/quals.
+            if self.keep_raw {
+                return Some(ReadSet {
+                    header: read_name.to_vec(),
+                    segments: vec![],
+                    raw_per_input: vec![RawInput { bases: bases.to_vec(), quals: quals.to_vec() }],
+                    skip_reason: None,
+                });
+            }
+
+            let mut segments = Vec::with_capacity(self.read_structure.number_of_segments());
             for (read_segment_index, read_segment) in self.read_structure.iter().enumerate() {
-                // Extract the bases and qualities for this segment
                 let (seq, quals) =
                     read_segment.extract_bases_and_quals(bases, quals).unwrap_or_else(|e| {
                         panic!(
@@ -328,14 +462,18 @@ impl Iterator for ReadSetIterator {
                             e
                         )
                     });
-                // Add a new FastqSegment
                 segments.push(FastqSegment {
                     seq: seq.to_vec(),
                     quals: quals.to_vec(),
                     segment_type: read_segment.kind,
                 });
             }
-            Some(ReadSet { header: read_name.to_vec(), segments, skip_reason: None })
+            Some(ReadSet {
+                header: read_name.to_vec(),
+                segments,
+                raw_per_input: vec![],
+                skip_reason: None,
+            })
         } else {
             None
         }
@@ -344,13 +482,18 @@ impl Iterator for ReadSetIterator {
 
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
-    /// structures
+    /// structures.  When `keep_raw` is true, segment extraction is deferred — the resulting
+    /// `ReadSet`s carry only the raw bases/quals per input so that callers can re-segment
+    /// per-sample (or per-globals) downstream.  `min_len` is the minimum number of bases a
+    /// record must have for this iterator to yield it (or skip it as `TooFewBases`).
     pub fn new(
         read_structure: ReadStructure,
         source: FastqReader<Box<dyn BufRead + Send>>,
         skip_reasons: Vec<SkipReason>,
+        keep_raw: bool,
+        min_len: usize,
     ) -> Self {
-        Self { read_structure, source, skip_reasons }
+        Self { read_structure, source, skip_reasons, keep_raw, min_len }
     }
 }
 
@@ -562,6 +705,46 @@ impl DemuxMetric {
 /// of the observed base (e.g. the expected barcode `AAN` will have zero mismatches relative to
 /// both the observed barcodes `AAA` and `AAN`).
 ///
+/// ## Per-sample read structures
+///
+/// In addition to the global `--read-structures`, the metadata TSV may include optional columns
+/// `read_structure_1`, `read_structure_2`, ..., `read_structure_<N>` (where `N` is the number of
+/// input FASTQs).  When any cell is non-empty for a sample, the per-sample read structures
+/// replace the global `--read-structures` for that sample — both for matching and for output
+/// extraction.
+///
+/// Per-sample structures support per-cell fall-back to the global `--read-structures`:
+///
+/// - A blank `read_structure_<i>` cell uses `--read-structures[i-1]` for that sample's input *i*.
+/// - A row whose `read_structure_<n>` cells are all blank uses `--read-structures` entirely for
+///   that sample (equivalent to omitting the columns for that sample only).
+/// - The unmatched pseudo-sample always uses the global `--read-structures`.
+///
+/// Constraints:
+///
+/// 1. The number of `read_structure_<n>` columns must equal `--read-structures.len()`.
+/// 2. The concatenated `B`-segment length must equal the `barcode` column length for every
+///    sample (computed from each sample's *effective* read structures, i.e. with fall-backs
+///    applied).
+///
+/// Different samples may have different per-input `(T, B, M, C)` segment counts (and hence
+/// produce different sets of output files).  This supports protocols with sample-dependent
+/// read structures (e.g. CODEC, where each sample may include a stagger spacer of varying
+/// length so that the position of the constant ligation base shifts per sample).
+///
+/// During matching, each sample's expected pattern is constructed from its effective read
+/// structure by filling `B`-segment positions from the `barcode` column and treating
+/// `M`/`S`/`C` segment positions as `N` wildcards.  All patterns are padded with trailing `N`s
+/// to a per-input matching window equal to the longest pre-template prefix across samples.
+///
+/// Example metadata TSV (CODEC stagger):
+///
+/// ```text
+/// sample_id  barcode         read_structure_1   read_structure_2
+/// S1         GATTACAGATTACA  3M7B1S+T           3M7B1S+T
+/// S2         TTTTTTTTTTTTTT  3M1S7B1S+T         3M1S7B1S+T
+/// ```
+///
 /// ## Outputs
 ///
 /// All outputs are generated in the provided `--output` directory.  For each sample plus the
@@ -603,6 +786,12 @@ pub(crate) struct Demux {
     inputs: Vec<PathBuf>,
 
     /// The read structures, one per input FASTQ in the same order.
+    ///
+    /// Per-sample read structures (see the `read_structure_<n>` metadata columns) take
+    /// precedence for each matched sample, and a blank cell falls back to the corresponding
+    /// `--read-structures` entry.  The unmatched pseudo-sample always uses
+    /// `--read-structures` for its output extraction.  The number of `read_structure_<n>`
+    /// columns must equal `--read-structures.len()`.
     #[clap(long, short = 'r' , required = true, num_args = 1..)]
     read_structures: Vec<ReadStructure>,
 
@@ -713,7 +902,9 @@ impl Demux {
     }
 
     /// Creates one writer per sample per read segment in the provided read structures for
-    /// requested output type.
+    /// requested output type.  Each sample's writers are created from its per-sample read
+    /// structures when present; otherwise the global `read_structures` are used.  The
+    /// unmatched pseudo-sample always uses the global `read_structures`.
     /// # Errors:
     ///     - Will error if opening the output fails for any reason.
     fn create_writers(
@@ -725,14 +916,15 @@ impl Demux {
     ) -> Result<Vec<SampleWriters<BufWriter<File>>>> {
         let mut samples_writers = Vec::with_capacity(sample_group.samples.len());
         for sample in &sample_group.samples {
+            let rs = sample.read_structures.as_deref().unwrap_or(read_structures);
             samples_writers.push(Self::create_sample_writers(
-                read_structures,
+                rs,
                 &sample.sample_id,
                 output_types,
                 output_dir,
             )?);
         }
-        // Add the unmatched 'sample'
+        // Add the unmatched 'sample' using the global read structures.
         samples_writers.push(Self::create_sample_writers(
             read_structures,
             unmatched_prefix,
@@ -881,7 +1073,7 @@ impl Command for Demux {
     fn execute(&self) -> Result<()> {
         let (fq_readers, output_segment_types) = self.validate_and_prepare_inputs()?;
 
-        let sample_group = SampleGroup::from_file(&self.sample_metadata)?;
+        let sample_group = SampleGroup::from_file(&self.sample_metadata, &self.read_structures)?;
         info!(
             "{} samples loaded from file {:?}",
             sample_group.samples.len(),
@@ -909,7 +1101,6 @@ impl Command for Demux {
         let unmatched_index = sample_writers.len() - 1;
         info!("Created sample and {} writers.", self.unmatched_prefix);
 
-        // Create the metrics as a Vec that is index sync'd with the sample group
         let mut sample_metrics = sample_group
             .samples
             .iter()
@@ -917,19 +1108,56 @@ impl Command for Demux {
             .collect_vec();
         let mut unmatched_metric = DemuxMetric::new(self.unmatched_prefix.as_str(), ".");
 
-        // Setup the barcode matcher - the primary return from here is the index of the samp
-        let mut barcode_matcher = BarcodeMatcher::new(
-            &sample_group.samples,
-            u8::try_from(self.max_mismatches)?,
-            u8::try_from(self.min_mismatch_delta)?,
-            true,
-        );
+        let per_sample_rs = sample_group.has_per_sample_read_structures();
+        let prefix_lens = if per_sample_rs {
+            sample_group.matching_prefix_lens(&self.read_structures)?
+        } else {
+            Vec::new()
+        };
+        let matching_patterns = if per_sample_rs {
+            sample_group.build_matching_patterns(&self.read_structures, &prefix_lens)?
+        } else {
+            Vec::new()
+        };
 
+        let mut barcode_matcher = if per_sample_rs {
+            BarcodeMatcher::with_patterns(
+                &sample_group.samples,
+                matching_patterns,
+                u8::try_from(self.max_mismatches)?,
+                u8::try_from(self.min_mismatch_delta)?,
+                true,
+            )
+        } else {
+            BarcodeMatcher::new(
+                &sample_group.samples,
+                u8::try_from(self.max_mismatches)?,
+                u8::try_from(self.min_mismatch_delta)?,
+                true,
+            )
+        };
+
+        // In per-sample mode the iterator gates on the per-input matching-window length
+        // (prefix_lens[i]); the global read structure's full min_len would over-reject reads
+        // that satisfy a sample's shorter structure.  Re-segmentation downstream re-checks
+        // length against the matched sample's structure.
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone())
-            .map(|(source, read_structure)| {
-                ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
-                    .read_ahead(1000, 1000)
+            .enumerate()
+            .map(|(i, (source, read_structure))| {
+                let min_len = if per_sample_rs {
+                    prefix_lens[i]
+                } else {
+                    read_structure.iter().map(|s| s.length().unwrap_or(1)).sum()
+                };
+                ReadSetIterator::new(
+                    read_structure,
+                    source,
+                    self.skip_reasons.clone(),
+                    per_sample_rs,
+                    min_len,
+                )
+                .read_ahead(1000, 1000)
             })
             .collect::<Vec<_>>();
 
@@ -941,6 +1169,7 @@ impl Command for Demux {
             .count_formatter(CountFormatterKind::Comma)
             .level(log::Level::Info)
             .build();
+        let allow_too_few = self.skip_reasons.contains(&SkipReason::TooFewBases);
         let mut skip_reasons: HashMap<SkipReason, usize> = HashMap::new();
         loop {
             let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
@@ -949,8 +1178,6 @@ impl Command for Demux {
                     next_read_sets.push(rec);
                 }
             }
-            // Either skip the reason if any FASTQ record could not be destructured, or break the
-            // loop if no read were found indicating EOF.
             if let Some(reason) = next_read_sets.iter().find_map(|read_set| read_set.skip_reason) {
                 let previous = skip_reasons.get(&reason).unwrap_or(&0);
                 skip_reasons.insert(reason, 1 + previous);
@@ -965,10 +1192,48 @@ impl Command for Demux {
                 next_read_sets
             );
             let read_set = ReadSet::combine_readsets(next_read_sets);
-            if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
-            {
-                sample_writers[barcode_match.best_match].write(&read_set)?;
-                sample_metrics[barcode_match.best_match].templates += 1;
+            let observed: Vec<u8> = if per_sample_rs {
+                read_set.matching_window_bases(&prefix_lens)
+            } else {
+                read_set.sample_barcode_sequence()
+            };
+            if let Some(barcode_match) = barcode_matcher.assign(&observed) {
+                let matched_idx = barcode_match.best_match;
+                if per_sample_rs {
+                    let rs_for_sample = sample_group.samples[matched_idx]
+                        .read_structures
+                        .as_deref()
+                        .unwrap_or(&self.read_structures);
+                    match read_set.resegment(rs_for_sample) {
+                        Ok(resegmented) => {
+                            sample_writers[matched_idx].write(&resegmented)?;
+                            sample_metrics[matched_idx].templates += 1;
+                        }
+                        Err(ResegmentError::TooShort(_)) if allow_too_few => {
+                            *skip_reasons.entry(SkipReason::TooFewBases).or_insert(0) += 1;
+                        }
+                        Err(e) => return Err(e.into_inner()),
+                    }
+                } else {
+                    sample_writers[matched_idx].write(&read_set)?;
+                    sample_metrics[matched_idx].templates += 1;
+                }
+            } else if per_sample_rs {
+                // Iterator gating in per-sample mode is loosened to the matching prefix length,
+                // so a read can satisfy the prefix gate while being too short for the global
+                // read structure.  Treat such reads as `TooFewBases` skips on the unmatched
+                // path regardless of `--skip-reasons` — legacy mode would have rejected them at
+                // the iterator and per-sample mode opts the user into heterogeneous lengths.
+                match read_set.resegment(&self.read_structures) {
+                    Ok(resegmented) => {
+                        sample_writers[unmatched_index].write(&resegmented)?;
+                        unmatched_metric.templates += 1;
+                    }
+                    Err(ResegmentError::TooShort(_)) => {
+                        *skip_reasons.entry(SkipReason::TooFewBases).or_insert(0) += 1;
+                    }
+                    Err(ResegmentError::Other(e)) => return Err(e),
+                }
             } else {
                 sample_writers[unmatched_index].write(&read_set)?;
                 unmatched_metric.templates += 1;
@@ -1093,7 +1358,12 @@ mod tests {
     }
 
     fn read_set(segments: Vec<FastqSegment>) -> ReadSet {
-        ReadSet { header: "NOT_IMPORTANT".as_bytes().to_owned(), segments, skip_reason: None }
+        ReadSet {
+            header: "NOT_IMPORTANT".as_bytes().to_owned(),
+            segments,
+            raw_per_input: vec![],
+            skip_reason: None,
+        }
     }
 
     // ############################################################################################
@@ -2321,5 +2591,276 @@ mod tests {
     #[should_panic(expected = "Cannot call combine readsets on an empty vec!")]
     fn test_combine_readsets_fails_on_empty_vector() {
         let _result = ReadSet::combine_readsets(Vec::new());
+    }
+
+    // ############################################################################################
+    // Tests for per-sample read structures (CODEC-style stagger).
+    // ############################################################################################
+
+    /// Writes a per-sample-read-structures metadata TSV with columns:
+    ///     sample_id, barcode, read_structure_1, ..., read_structure_<n>
+    /// `samples` is a slice of (sample_id, barcode, [read_structure_per_input...]).
+    fn metadata_file_with_rs(tmpdir: &TempDir, samples: &[(&str, &str, &[&str])]) -> PathBuf {
+        let n_inputs = samples[0].2.len();
+        let mut header = String::from("sample_id\tbarcode");
+        for i in 1..=n_inputs {
+            header.push('\t');
+            header.push_str(&format!("read_structure_{i}"));
+        }
+        let mut lines = vec![header];
+        for (sid, bc, structs) in samples {
+            assert_eq!(structs.len(), n_inputs);
+            let mut line = format!("{sid}\t{bc}");
+            for s in structs.iter() {
+                line.push('\t');
+                line.push_str(s);
+            }
+            lines.push(line);
+        }
+        let path = tmpdir.path().join("metadata.tsv");
+        Io::default().write_lines(&path, lines).unwrap();
+        path
+    }
+
+    /// End-to-end CODEC stagger test:
+    ///   Sample S1 (no stagger):  3M7B1S+T   barcode = GATTACA
+    ///   Sample S2 (1bp stagger): 3M1S7B1S+T barcode = TTTTTTT
+    /// One paired-end read per sample, each with a 50bp template after the constant `T`
+    /// stagger anchor.  Verifies that:
+    ///   1. Each read is assigned to the correct sample.
+    ///   2. The output template starts at the right position (no template haircut for the
+    ///      shorter-stagger sample).
+    ///   3. The UMI (M) and sample-barcode (B) outputs reflect the per-sample structure.
+    #[test]
+    fn test_demux_codec_per_sample_read_structures_paired_end() {
+        let tmp = TempDir::new().unwrap();
+
+        // The global `--read-structures` is provided but should not be used for matched
+        // samples (they have their own).  Its per-input segment signature can differ from the
+        // per-sample structures; the unmatched output uses globals independently.
+        let read_structures =
+            vec![ReadStructure::from_str("+T").unwrap(), ReadStructure::from_str("+T").unwrap()];
+
+        let s1_template_r1 = "A".repeat(50);
+        let s1_template_r2 = "C".repeat(50);
+        // Sample 1, no stagger: NNN GATTACA T <template>
+        let s1_r1 = format!("AAA{}T{}", "GATTACA", s1_template_r1);
+        let s1_r2 = format!("CCC{}T{}", "GATTACA", s1_template_r2);
+
+        let s2_template_r1 = "G".repeat(50);
+        let s2_template_r2 = "T".repeat(50);
+        // Sample 2, 1bp stagger: NNN A TTTTTTT T <template>
+        let s2_r1 = format!("GGGA{}T{}", "TTTTTTT", s2_template_r1);
+        let s2_r2 = format!("TTTA{}T{}", "TTTTTTT", s2_template_r2);
+
+        let r1_file = fastq_file(&tmp, "r1", "ex", &[s1_r1.as_str(), s2_r1.as_str()]);
+        let r2_file = fastq_file(&tmp, "r2", "ex", &[s1_r2.as_str(), s2_r2.as_str()]);
+
+        let sample_metadata = metadata_file_with_rs(
+            &tmp,
+            &[
+                ("S1", "GATTACAGATTACA", &["3M7B1S+T", "3M7B1S+T"]),
+                ("S2", "TTTTTTTTTTTTTT", &["3M1S7B1S+T", "3M1S7B1S+T"]),
+            ],
+        );
+
+        let output_dir = tmp.path().join("output");
+        let demux_inputs = Demux {
+            inputs: vec![r1_file, r2_file],
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B', 'M'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        // Sample 1: per-sample RS = 3M7B1S+T for both inputs.  Expect 50bp template per read,
+        // 7bp barcode per read, 3bp UMI per read.
+        let s1_r1_reads = read_fastq(&output_dir.join("S1.R1.fq.gz"));
+        let s1_r2_reads = read_fastq(&output_dir.join("S1.R2.fq.gz"));
+        let s1_b1_reads = read_fastq(&output_dir.join("S1.I1.fq.gz"));
+        let s1_b2_reads = read_fastq(&output_dir.join("S1.I2.fq.gz"));
+        let s1_m1_reads = read_fastq(&output_dir.join("S1.U1.fq.gz"));
+        let s1_m2_reads = read_fastq(&output_dir.join("S1.U2.fq.gz"));
+
+        assert_eq!(s1_r1_reads.len(), 1, "S1 R1 should have one read");
+        assert_eq!(s1_r1_reads[0].seq, s1_template_r1.as_bytes());
+        assert_eq!(s1_r2_reads[0].seq, s1_template_r2.as_bytes());
+        assert_eq!(s1_b1_reads[0].seq, b"GATTACA");
+        assert_eq!(s1_b2_reads[0].seq, b"GATTACA");
+        assert_eq!(s1_m1_reads[0].seq, b"AAA");
+        assert_eq!(s1_m2_reads[0].seq, b"CCC");
+
+        // Sample 2: per-sample RS = 3M1S7B1S+T for both inputs.
+        let s2_r1_reads = read_fastq(&output_dir.join("S2.R1.fq.gz"));
+        let s2_r2_reads = read_fastq(&output_dir.join("S2.R2.fq.gz"));
+        let s2_b1_reads = read_fastq(&output_dir.join("S2.I1.fq.gz"));
+        let s2_m1_reads = read_fastq(&output_dir.join("S2.U1.fq.gz"));
+
+        assert_eq!(s2_r1_reads.len(), 1, "S2 R1 should have one read");
+        assert_eq!(s2_r1_reads[0].seq, s2_template_r1.as_bytes());
+        assert_eq!(s2_r2_reads[0].seq, s2_template_r2.as_bytes());
+        assert_eq!(s2_b1_reads[0].seq, b"TTTTTTT");
+        assert_eq!(s2_m1_reads[0].seq, b"GGG");
+
+        // The unmatched outputs (using globals `+T +T`) only have R*.fq.gz files.  All reads
+        // matched, so they should be empty.
+        let unmatched_r1 = read_fastq(&output_dir.join("unmatched.R1.fq.gz"));
+        let unmatched_r2 = read_fastq(&output_dir.join("unmatched.R2.fq.gz"));
+        assert!(unmatched_r1.is_empty(), "unmatched R1 should be empty");
+        assert!(unmatched_r2.is_empty(), "unmatched R2 should be empty");
+    }
+
+    /// Ensures that when no per-sample read structures are present, behaviour is identical
+    /// to the legacy code path (uses global `--read-structures`).
+    #[test]
+    fn test_demux_falls_back_to_global_read_structures() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("17B100T").unwrap()];
+        let s1_barcode = "AAAAAAAAGATTACAGA";
+        let sample_metadata = metadata_file(
+            &tmp,
+            &[s1_barcode, "CCCCCCCCGATTACAGA", "GGGGGGGGGATTACAGA", "GGGGGGTTGATTACAGA"],
+        );
+        let input_files =
+            vec![fastq_file(&tmp, "ex", "ex", &[&(s1_barcode.to_owned() + &"A".repeat(100))])];
+
+        let output_dir = tmp.path().join("output");
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let fq_reads = read_fastq(&output_dir.join("Sample0000.R1.fq.gz"));
+        assert_eq!(fq_reads.len(), 1);
+        assert_eq!(fq_reads[0].seq, "A".repeat(100).as_bytes());
+    }
+
+    /// Errors when per-sample `read_structure_<n>` columns disagree with the number of
+    /// `--read-structures` entries.
+    #[test]
+    fn test_demux_errors_when_per_sample_input_count_mismatches_global() {
+        let tmp = TempDir::new().unwrap();
+        let r1_file =
+            fastq_file(&tmp, "r1", "ex", &[format!("AAAGATTACAT{}", "A".repeat(50)).as_str()]);
+        // Metadata declares 1 read_structure column, but globals declare 2 inputs.
+        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "GATTACA", &["3M7B1S+T"])]);
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file.clone(), r1_file],
+            read_structures: vec![
+                ReadStructure::from_str("3M7B+T").unwrap(),
+                ReadStructure::from_str("3M7B+T").unwrap(),
+            ],
+            sample_metadata,
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        let err = demux_inputs.execute().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`read_structure_<n>` column(s)") && msg.contains("--read-structures"),
+            "got: {msg}",
+        );
+    }
+
+    /// Per-sample read structures may have a different `(T, B, M, C)` segment signature than
+    /// the global `--read-structures` — different samples may produce different sets of
+    /// output files, and the unmatched output uses the global structures independently.
+    #[test]
+    fn test_demux_per_sample_signature_may_differ_from_global() {
+        let tmp = TempDir::new().unwrap();
+        // Per-sample has (T=1, B=1, M=1, C=0); global has (T=1, B=1, M=0, C=0) — M counts differ.
+        let r1 = format!("AAAGATTACAT{}", "A".repeat(50));
+        let r1_file = fastq_file(&tmp, "r1", "ex", &[r1.as_str()]);
+        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "GATTACA", &["3M7B1S+T"])]);
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file],
+            read_structures: vec![ReadStructure::from_str("7B+T").unwrap()],
+            sample_metadata,
+            output_types: vec!['T', 'M'],
+            output: tmp.path().join("output").clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+        };
+        let output_dir = demux_inputs.output.clone();
+        demux_inputs.execute().unwrap();
+        // S1 produces R1 + U1 (matches per-sample 3M7B1S+T → 1T, 1M).
+        let s1_r1 = read_fastq(&output_dir.join("S1.R1.fq.gz"));
+        let s1_u1 = read_fastq(&output_dir.join("S1.U1.fq.gz"));
+        assert_eq!(s1_r1.len(), 1);
+        assert_eq!(s1_u1.len(), 1);
+        assert_eq!(s1_u1[0].seq, b"AAA");
+        // Globals (7B+T) have no M segment, so unmatched only writes R1; the file may not even
+        // exist if no unmatched reads occurred.  In this test, the read matches S1, so there
+        // are no unmatched records.
+    }
+
+    /// Regression: in per-sample mode the iterator gates on the per-sample matching prefix,
+    /// which can be shorter than the global `--read-structures` minimum.  A read that satisfies
+    /// the prefix gate but does not match any sample reaches the unmatched branch where
+    /// resegmentation against the global structure would fail on length.  The run must not
+    /// abort; the read must be counted as a `TooFewBases` skip independently of `--skip-reasons`.
+    #[test]
+    fn test_demux_per_sample_unmatched_short_read_does_not_abort() {
+        let tmp = TempDir::new().unwrap();
+        // Global is 8B+T per input (min_len 9); sample S1 has 3B+T per input (prefix 3).
+        let read_structures = vec![
+            ReadStructure::from_str("8B+T").unwrap(),
+            ReadStructure::from_str("8B+T").unwrap(),
+        ];
+        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "AAAAAA", &["3B+T", "3B+T"])]);
+        // 3-byte reads per input that don't match S1's "AAA"+"AAA" matching pattern.
+        let r1_file = fastq_file(&tmp, "r1", "ex", &["TTT"]);
+        let r2_file = fastq_file(&tmp, "r2", "ex", &["TTT"]);
+
+        let output_dir = tmp.path().join("output");
+        let demux_inputs = Demux {
+            inputs: vec![r1_file, r2_file],
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            // Critically NOT requesting too-few-bases skip; legacy resegment path would abort.
+            skip_reasons: vec![],
+        };
+        demux_inputs.execute().unwrap();
+
+        let metrics_path = output_dir.join("demux-metrics.txt");
+        let metrics: Vec<DemuxMetric> = DelimFile::default().read_tsv(&metrics_path).unwrap();
+        let demuxed: usize = metrics.iter().map(|m| m.templates).sum();
+        assert_eq!(demuxed, 0, "no reads should be demuxed; the unmatched read is too short");
     }
 }
