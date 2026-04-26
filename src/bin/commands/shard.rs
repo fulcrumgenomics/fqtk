@@ -22,7 +22,7 @@ const BUFFER_SIZE: usize = 64 * 1024;
 
 /// Struct to hold all the output writers for a single shard
 struct ShardWriters<W: Write> {
-    /// Name of the sample this set of writers is for
+    /// ID of the shard this set of writers is for
     shard_number: usize,
     /// The set of writers for the shard
     writers: Vec<W>,
@@ -39,7 +39,7 @@ impl<W: Write> ShardWriters<W> {
     /// match the number of individual writers; if a mismatch is found an error will be raised.
     fn write(&mut self, reads: &[OwnedRecord]) -> Result<()> {
         if reads.len() != self.writers.len() {
-            return Err(anyhow!("Expected {} reads, got {}", self.shard_number, reads.len()));
+            return Err(anyhow!("Expected {} reads, got {}", self.writers.len(), reads.len()));
         }
 
         for (writer, read) in self.writers.iter_mut().zip(reads.iter()) {
@@ -104,7 +104,7 @@ pub(crate) struct Shard {
     #[clap(long, short = 's')]
     shards: usize,
 
-    /// The number of threads to use.
+    /// The number of threads to use for compressing output files.
     #[clap(long, short = 't', default_value = "8")]
     threads: usize,
 
@@ -204,9 +204,10 @@ impl Command for Shard {
         // shard.  Terminate cleanly when all input iterators are exhausted, or with error
         // if at least one, but not all input iterators are exhausted.
         let mut target_shard_idx: usize = 0;
+        let mut recs = Vec::with_capacity(fq_iters.len());
         loop {
             // Pull in the next set of reads
-            let mut recs = Vec::with_capacity(fq_iters.len());
+            recs.clear();
             for iter in &mut fq_iters {
                 if let Some(rec) = iter.next() {
                     recs.push(rec?);
@@ -217,12 +218,13 @@ impl Command for Shard {
                 break;
             }
 
-            assert_eq!(
-                recs.len(),
-                fq_iters.len(),
-                "FASTQ sources out of sync at records: {:?}",
-                recs
-            );
+            if recs.len() != fq_iters.len() {
+                return Err(anyhow!(
+                    "FASTQ sources out of sync; expected {} records but got {}.",
+                    fq_iters.len(),
+                    recs.len()
+                ));
+            }
 
             shard_writers[target_shard_idx].write(&recs)?;
             target_shard_idx = (target_shard_idx + 1) % self.shards;
@@ -254,19 +256,14 @@ mod tests {
     /// Writes zero or more records to a FASTQ file at `path`.  Bases and quals are randomly
     /// generated.  Read names are of the format `{prefix}{idx}{suffix}` where `idx` starts
     /// from the value of the `idx` parameter, and increases by one for each record.
-    fn build_fastq(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) -> () {
+    fn build_fastq(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) {
         let bases = "ACGT".as_bytes();
         let io = fgoxide::io::Io::new(1, 8 * 1024);
         let mut out = io.new_writer(path).unwrap();
         for i in idx..idx + count {
-            let seq = (0..30)
-                .into_iter()
-                .map(|_| rand::random_range(0..4))
-                .map(|i| bases[i])
-                .collect_vec();
+            let seq = (0..30).map(|_| rand::random_range(0..4)).map(|i| bases[i]).collect_vec();
 
-            let qual =
-                (0..30).into_iter().map(|_| rand::random_range(2u8..40u8) + 33).collect_vec();
+            let qual = (0..30).map(|_| rand::random_range(2u8..40u8) + 33).collect_vec();
 
             let rec = OwnedRecord {
                 head: format!("{}{}{}", prefix, suffix, i).as_bytes().to_owned(),
@@ -276,8 +273,6 @@ mod tests {
 
             rec.write(&mut out).unwrap();
         }
-
-        ()
     }
 
     /// Runs sharding and returns the outputs.  The returned Vec is nested as follows:
@@ -292,7 +287,7 @@ mod tests {
             output_prefix: prefix.clone(),
             shard_prefix: "shard".to_string(),
             read_number_prefix: "read".to_string(),
-            shards: shards,
+            shards,
             threads: 4,
             compression_level: 1,
         };
@@ -305,7 +300,7 @@ mod tests {
             for input_idx in 1..=inputs.len() {
                 let path_str = format!("{}.shard{}.read{}.fq.gz", prefix, shard, input_idx);
                 let path = Path::new(&path_str);
-                reads_vecs.push(read_fastq(&path));
+                reads_vecs.push(read_fastq(path));
             }
 
             results.push(reads_vecs);
@@ -345,7 +340,7 @@ mod tests {
     fn test_shard_multiple_files() {
         let tmp = TempDir::new().unwrap();
         let r1 = PathBuf::from(tmp.path()).join("r1.fq");
-        let r2 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
         build_fastq(r1.as_path(), "q", "/1", 1, 64);
         build_fastq(r2.as_path(), "q", "/2", 1, 64);
         let outputs = run_sharding(&tmp, &[&r1, &r2], 3);
