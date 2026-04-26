@@ -412,6 +412,7 @@ version = "0.3.2-rc.1"
 dependencies = [
  "ahash",
  "anyhow",
+ "bgzf",
  "bstr 1.12.1",
  "clap",
  "csv",
