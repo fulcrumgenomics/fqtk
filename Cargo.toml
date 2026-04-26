@@ -53,5 +53,6 @@ thiserror = "2.0.18"
 proglog = {version = "0.4.0", features = ["pretty_counts"] }
 
 [dev-dependencies]
+bgzf = "0.3.0"
 csv = "1.1.6"
 tempfile = "3.27.0"

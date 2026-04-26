@@ -1,6 +1,7 @@
 use crate::commands::command::Command;
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use clap::builder::RangedU64ValueParser;
 use fgoxide::io::Io;
 use fgoxide::iter::IntoChunkedReadAheadIterator;
 use itertools::Itertools;
@@ -78,7 +79,7 @@ impl ShardWriters<PooledWriter> {
 /// line parameters.  The `output_prefix` may contain an absolute path, or a relative path, with
 /// relative paths interpreted relative to the working directory where the command is run.
 ///
-/// Inputs may be uncompressed gzipped, or block-gzipped.  Output files are _always_ block gzipped.
+/// Inputs may be uncompressed, gzipped, or block-gzipped.  Output files are _always_ block gzipped.
 ///
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -101,11 +102,11 @@ pub(crate) struct Shard {
     read_number_prefix: String,
 
     /// Number of shards to generate
-    #[clap(long, short = 's')]
+    #[clap(long, short = 's', value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
     shards: usize,
 
-    /// The number of threads to use for compressing output files.
-    #[clap(long, short = 't', default_value = "8")]
+    /// The number of threads to use for compressing output files.  Minimum 2.
+    #[clap(long, short = 't', default_value = "8", value_parser = RangedU64ValueParser::<usize>::new().range(2..))]
     threads: usize,
 
     /// The level of compression to use to compress outputs.
@@ -155,10 +156,11 @@ impl Shard {
             shard_writers.push(ShardWriters { shard_number: shard, writers: ws });
         }
 
-        // Then construct the writer pool
+        // Then construct the writer pool, reserving one thread for the main loop.
+        let pool_threads = self.threads - 1;
         let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
-            .threads(self.threads)
-            .queue_size(self.threads * 50)
+            .threads(pool_threads)
+            .queue_size(pool_threads * 50)
             .compression_level(self.compression_level)?;
 
         // Then exchange the writers
@@ -250,29 +252,48 @@ mod tests {
     use rand;
     use seq_io::fastq::{OwnedRecord, Record};
     use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter, Write};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    /// Writes zero or more records to a FASTQ file at `path`.  Bases and quals are randomly
-    /// generated.  Read names are of the format `{prefix}{idx}{suffix}` where `idx` starts
+    /// Writes zero or more records to the given `Write`.  Bases and quals are randomly
+    /// generated.  Read names are of the format `{prefix}{suffix}{idx}` where `idx` starts
     /// from the value of the `idx` parameter, and increases by one for each record.
-    fn build_fastq(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) {
+    fn write_fastq_records<W: Write>(
+        out: &mut W,
+        prefix: &str,
+        suffix: &str,
+        idx: usize,
+        count: usize,
+    ) {
         let bases = "ACGT".as_bytes();
-        let io = fgoxide::io::Io::new(1, 8 * 1024);
-        let mut out = io.new_writer(path).unwrap();
         for i in idx..idx + count {
-            let seq = (0..30).map(|_| rand::random_range(0..4)).map(|i| bases[i]).collect_vec();
-
+            let seq = (0..30).map(|_| rand::random_range(0..4)).map(|j| bases[j]).collect_vec();
             let qual = (0..30).map(|_| rand::random_range(2u8..40u8) + 33).collect_vec();
-
             let rec = OwnedRecord {
-                head: format!("{}{}{}", prefix, suffix, i).as_bytes().to_owned(),
+                head: format!("{}{}{}", prefix, i, suffix).as_bytes().to_owned(),
                 seq,
                 qual,
             };
-
-            rec.write(&mut out).unwrap();
+            rec.write(&mut *out).unwrap();
         }
+    }
+
+    /// Writes records to a FASTQ file at `path`.  Compression is selected by file extension
+    /// (`.gz` produces gzip via fgoxide; otherwise plain text).
+    fn build_fastq(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) {
+        let io = fgoxide::io::Io::new(1, 8 * 1024);
+        let mut out = io.new_writer(path).unwrap();
+        write_fastq_records(&mut out, prefix, suffix, idx, count);
+    }
+
+    /// Writes records to a BGZF-compressed FASTQ file at `path`.
+    fn build_fastq_bgzf(path: &Path, prefix: &str, suffix: &str, idx: usize, count: usize) {
+        let file = BufWriter::new(File::create(path).unwrap());
+        let mut writer = bgzf::Writer::new(file, bgzf::CompressionLevel::new(3).unwrap());
+        write_fastq_records(&mut writer, prefix, suffix, idx, count);
+        writer.finish().unwrap().flush().unwrap();
     }
 
     /// Runs sharding and returns the outputs.  The returned Vec is nested as follows:
@@ -280,42 +301,74 @@ mod tests {
     ///  - Each entry in the second level vec is the sharded reads from a single input fastq
     ///  - Each entry in the third level vec is an individual fastq record
     fn run_sharding(tmp: &TempDir, inputs: &[&Path], shards: usize) -> Vec<Vec<Vec<OwnedRecord>>> {
-        let mut results: Vec<Vec<Vec<OwnedRecord>>> = Vec::with_capacity(shards);
         let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
-        let sharder = Shard {
+        build_sharder(inputs, &prefix, shards).execute().unwrap();
+        collect_shard_outputs(&prefix, inputs.len(), shards, read_fastq)
+    }
+
+    /// Builds a `Shard` instance for testing with the given inputs, output prefix, and shard count.
+    fn build_sharder(inputs: &[&Path], output_prefix: &str, shards: usize) -> Shard {
+        Shard {
             inputs: inputs.iter().map(|p| p.to_path_buf()).collect_vec(),
-            output_prefix: prefix.clone(),
+            output_prefix: output_prefix.to_string(),
             shard_prefix: "shard".to_string(),
             read_number_prefix: "read".to_string(),
             shards,
             threads: 4,
             compression_level: 1,
-        };
+        }
+    }
 
-        sharder.execute().unwrap();
-
+    /// Reads back the sharded outputs produced under `output_prefix`, using `reader` to parse each
+    /// individual output file.  Returns the same nested layout as `run_sharding`.
+    fn collect_shard_outputs<F>(
+        output_prefix: &str,
+        n_inputs: usize,
+        shards: usize,
+        reader: F,
+    ) -> Vec<Vec<Vec<OwnedRecord>>>
+    where
+        F: Fn(&Path) -> Vec<OwnedRecord>,
+    {
+        let mut results: Vec<Vec<Vec<OwnedRecord>>> = Vec::with_capacity(shards);
         for shard in 1..=shards {
-            let mut reads_vecs = Vec::with_capacity(inputs.len());
-
-            for input_idx in 1..=inputs.len() {
-                let path_str = format!("{}.shard{}.read{}.fq.gz", prefix, shard, input_idx);
-                let path = Path::new(&path_str);
-                reads_vecs.push(read_fastq(path));
+            let mut reads_vecs = Vec::with_capacity(n_inputs);
+            for input_idx in 1..=n_inputs {
+                let path_str = format!("{}.shard{}.read{}.fq.gz", output_prefix, shard, input_idx);
+                reads_vecs.push(reader(Path::new(&path_str)));
             }
-
             results.push(reads_vecs);
         }
-
         results
     }
 
-    /// Reads a FASTQ file into a vec of records
+    /// Reads a FASTQ file into a vec of records, transparently handling gzip via fgoxide.
     fn read_fastq(path: &Path) -> Vec<OwnedRecord> {
         let io = fgoxide::io::Io::new(1, 8 * 1024);
         let mut reader = io.new_reader(path).unwrap();
         let mut fq_reader = seq_io::fastq::Reader::with_capacity(&mut reader, 8 * 1024);
-        let records = fq_reader.records().map(|r| r.unwrap()).collect_vec();
-        records
+        fq_reader.records().map(|r| r.unwrap()).collect_vec()
+    }
+
+    /// Reads a FASTQ file into a vec of records, decompressing with the bgzf crate's `Reader`.
+    fn read_fastq_via_bgzf(path: &Path) -> Vec<OwnedRecord> {
+        let file = BufReader::new(File::open(path).unwrap());
+        let bgzf_reader = bgzf::Reader::new(file);
+        let mut fq_reader = seq_io::fastq::Reader::with_capacity(bgzf_reader, 8 * 1024);
+        fq_reader.records().map(|r| r.unwrap()).collect_vec()
+    }
+
+    /// Returns the integer index embedded in a read name by `build_fastq`.  Strips any
+    /// trailing `/N` read-end marker before parsing the trailing digits.
+    fn read_index(rec: &OwnedRecord) -> usize {
+        let head = rec.head.to_str().unwrap();
+        let trimmed = head
+            .rsplit_once('/')
+            .filter(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()))
+            .map(|(head, _)| head)
+            .unwrap_or(head);
+        let digits: String = trimmed.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+        digits.chars().rev().collect::<String>().parse().unwrap()
     }
 
     #[test]
@@ -354,10 +407,179 @@ mod tests {
         }
     }
 
-    // TODO: test with empty inputs
-    // TODO: test with uneven number of reads
-    // TODO: test with compressed inputs
-    // TODO: test with uncompressed inputs
-    // TODO: test with and without /1 and /2 on read names
-    // TODO: test fails when given mismatched fastq files
+    /// Verifies that the Nth input record (1-based) lands in shard ((N-1) % shards) + 1, and
+    /// that within a shard the records appear in input order.
+    #[test]
+    fn test_round_robin_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let n_reads = 20;
+        let n_shards = 4;
+        build_fastq(r1.as_path(), "q", "", 1, n_reads);
+        let outputs = run_sharding(&tmp, &[&r1], n_shards);
+
+        for (shard_idx, shard) in outputs.iter().enumerate() {
+            let expected: Vec<usize> =
+                (1..=n_reads).filter(|i| (i - 1) % n_shards == shard_idx).collect();
+            let actual: Vec<usize> = shard[0].iter().map(read_index).collect();
+            assert_eq!(actual, expected, "shard {} contents wrong", shard_idx + 1);
+        }
+    }
+
+    /// Verifies that for paired input, the j-th r1 record in any shard came from the same input
+    /// record-set as the j-th r2 record (i.e., they share an index).
+    #[test]
+    fn test_paired_records_stay_aligned() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "q", "/1", 1, 30);
+        build_fastq(r2.as_path(), "q", "/2", 1, 30);
+        let outputs = run_sharding(&tmp, &[&r1, &r2], 4);
+
+        for shard in outputs.iter() {
+            let r1_indices: Vec<usize> = shard[0].iter().map(read_index).collect();
+            let r2_indices: Vec<usize> = shard[1].iter().map(read_index).collect();
+            assert_eq!(r1_indices, r2_indices);
+        }
+    }
+
+    /// Every input read should appear in exactly one output shard, with no losses or duplicates.
+    #[test]
+    fn test_no_reads_lost_or_duplicated() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 100);
+        let outputs = run_sharding(&tmp, &[&r1], 7);
+
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        let expected: Vec<usize> = (1..=100).collect();
+        assert_eq!(all_indices, expected);
+    }
+
+    #[test]
+    fn test_single_shard() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 12);
+        let outputs = run_sharding(&tmp, &[&r1], 1);
+
+        assert_eq!(outputs.len(), 1);
+        let actual: Vec<usize> = outputs[0][0].iter().map(read_index).collect();
+        assert_eq!(actual, (1..=12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_more_shards_than_reads() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 3);
+        let outputs = run_sharding(&tmp, &[&r1], 5);
+
+        assert_eq!(outputs.len(), 5);
+        assert_eq!(outputs[0][0].len(), 1);
+        assert_eq!(outputs[1][0].len(), 1);
+        assert_eq!(outputs[2][0].len(), 1);
+        assert_eq!(outputs[3][0].len(), 0);
+        assert_eq!(outputs[4][0].len(), 0);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 0);
+        let outputs = run_sharding(&tmp, &[&r1], 4);
+
+        assert_eq!(outputs.len(), 4);
+        for shard in outputs.iter() {
+            assert_eq!(shard.len(), 1);
+            assert!(shard[0].is_empty());
+        }
+    }
+
+    #[test]
+    fn test_mismatched_input_lengths_fails() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "q", "/1", 1, 10);
+        build_fastq(r2.as_path(), "q", "/2", 1, 8);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let err = build_sharder(&[&r1, &r2], &prefix, 3).execute().unwrap_err();
+        assert!(err.to_string().contains("out of sync"), "unexpected error message: {}", err);
+    }
+
+    #[test]
+    fn test_gzip_compressed_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq.gz");
+        build_fastq(r1.as_path(), "q", "", 1, 25);
+        let outputs = run_sharding(&tmp, &[&r1], 5);
+
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        assert_eq!(all_indices, (1..=25).collect::<Vec<_>>());
+    }
+
+    /// Verifies that BGZF inputs spanning more than one block are read in full (i.e., we don't
+    /// stop after the first BGZF block).  `BGZF_BLOCK_SIZE` is ~64 KiB; we generate enough
+    /// records to comfortably exceed that uncompressed.
+    #[test]
+    fn test_bgzf_compressed_inputs_multiple_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq.gz");
+        // Each record is ~70-75 bytes; 1500 records ≈ 105 KiB uncompressed → multiple BGZF blocks.
+        let n_reads = 1500;
+        build_fastq_bgzf(r1.as_path(), "q", "", 1, n_reads);
+        let outputs = run_sharding(&tmp, &[&r1], 3);
+
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        assert_eq!(all_indices, (1..=n_reads).collect::<Vec<_>>());
+    }
+
+    /// Outputs are documented to always be BGZF — read one back with the bgzf crate's `Reader`
+    /// and check that the round-tripped contents match what we sent in.
+    #[test]
+    fn test_output_files_are_bgzf() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 30);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        build_sharder(&[&r1], &prefix, 3).execute().unwrap();
+
+        let outputs = collect_shard_outputs(&prefix, 1, 3, read_fastq_via_bgzf);
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        assert_eq!(all_indices, (1..=30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_custom_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 6);
+
+        let prefix = format!("{}/sample", tmp.path().to_str().unwrap());
+        let sharder = Shard {
+            inputs: vec![r1.clone()],
+            output_prefix: prefix.clone(),
+            shard_prefix: "chunk_".to_string(),
+            read_number_prefix: "R".to_string(),
+            shards: 2,
+            threads: 2,
+            compression_level: 1,
+        };
+        sharder.execute().unwrap();
+
+        for shard in 1..=2 {
+            let path = PathBuf::from(format!("{}.chunk_{}.R1.fq.gz", prefix, shard));
+            assert!(path.exists(), "expected output file does not exist: {}", path.display());
+            assert_eq!(read_fastq(&path).len(), 3);
+        }
+    }
 }
