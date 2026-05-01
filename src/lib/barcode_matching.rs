@@ -58,21 +58,63 @@ impl BarcodeMatcher {
         min_mismatch_delta: u8,
         use_cache: bool,
     ) -> Self {
+        let patterns: Vec<Vec<u8>> =
+            samples.iter().map(|s| s.barcode.as_bytes().to_vec()).collect();
+        Self::with_patterns(samples, patterns, max_mismatches, min_mismatch_delta, use_cache)
+    }
+
+    /// Instantiates a new ``BarcodeMatcher`` using user-supplied per-sample matching patterns
+    /// instead of `sample.barcode`. Patterns must be 1:1 with `samples`. The patterns may
+    /// contain `N` (and other IUPAC bases); `N`s in the expected pattern are treated as
+    /// wildcards by [`BarcodeMatcher::count_mismatches`].
+    ///
+    /// **Note:** the matcher's *internal* clone of each `Sample` has its `barcode` field
+    /// overwritten with the (uppercased) matching pattern, so that
+    /// [`Self::expected_barcode_length`] and any error messages reflect the pattern length
+    /// rather than the user-facing barcode length.  The caller's `samples` slice is not
+    /// modified.  The matching loop in `Demux::execute` relies on this: the observed bytes
+    /// it submits to [`Self::assign`] are the raw matching window (= pattern length), which
+    /// would otherwise mismatch the shorter user-facing barcode length.
+    ///
+    /// # Panics
+    /// - Will panic if `samples` is empty.
+    /// - Will panic if any pattern is the empty byte slice.
+    /// - Will panic if `patterns.len() != samples.len()`.
+    /// - Will panic if patterns are not all the same length.
+    #[must_use]
+    pub fn with_patterns(
+        samples: &[Sample],
+        patterns: Vec<Vec<u8>>,
+        max_mismatches: u8,
+        min_mismatch_delta: u8,
+        use_cache: bool,
+    ) -> Self {
         assert!(!samples.is_empty(), "Must provide at least one sample");
         assert!(
-            samples.iter().all(|b| !b.barcode.is_empty()),
-            "Sample barcode cannot be empty string"
+            patterns.len() == samples.len(),
+            "Number of patterns ({}) must match number of samples ({})",
+            patterns.len(),
+            samples.len(),
+        );
+        assert!(patterns.iter().all(|p| !p.is_empty()), "Sample barcode cannot be empty string");
+        let pattern_len = patterns[0].len();
+        assert!(
+            patterns.iter().all(|p| p.len() == pattern_len),
+            "All sample matching patterns must have the same length",
         );
 
         let mut max_ns_in_barcodes = 0;
         let mut modified_samples = samples.to_vec();
         let mut sample_barcodes = Vec::with_capacity(samples.len());
-        for sample in &mut modified_samples {
-            sample.barcode = sample.barcode.to_ascii_uppercase();
-            let bytes = sample.barcode.as_bytes();
-            let num_ns: usize = bytes.iter().filter(|&&b| byte_is_nocall(b)).count();
+        for (sample, pattern) in modified_samples.iter_mut().zip(patterns.into_iter()) {
+            let pattern_upper: Vec<u8> = pattern.iter().map(u8::to_ascii_uppercase).collect();
+            // Replace the in-matcher copy of `barcode` with the pattern so that error messages
+            // show what was actually being matched. The caller's samples are not modified.
+            sample.barcode = String::from_utf8(pattern_upper.clone())
+                .expect("matching pattern must be valid UTF-8");
+            let num_ns: usize = pattern_upper.iter().filter(|&&b| byte_is_nocall(b)).count();
             max_ns_in_barcodes = max_ns_in_barcodes.max(num_ns);
-            sample_barcodes.push(encode(bytes));
+            sample_barcodes.push(encode(&pattern_upper));
         }
         Self {
             samples: modified_samples,
@@ -197,6 +239,7 @@ mod tests {
         Sample {
             barcode: barcode.to_string(),
             sample_id: format!("sample_{idx}").to_string(),
+            read_structures: None,
             ordinal: idx,
         }
     }
