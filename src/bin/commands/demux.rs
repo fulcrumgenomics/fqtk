@@ -46,6 +46,8 @@ struct FastqSegment {
     quals: Vec<u8>,
     /// the type of segment being stored
     segment_type: SegmentType,
+    /// the index of the source FASTQ file this segment came from
+    source_index: usize,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -136,6 +138,29 @@ impl ReadSet {
         }
 
         first
+    }
+
+    /// Reconstructs a read for a given source index by concatenating segments of the specified
+    /// types from that source in order. Used for --template-types output.
+    ///
+    /// Note: Segments are concatenated in their original order (as they appear in the read
+    /// structure), preserving the physical arrangement of bases in the original read.
+    fn segments_for_source(
+        &self,
+        source_index: usize,
+        template_types: &HashSet<SegmentType>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut seq = Vec::new();
+        let mut quals = Vec::new();
+        for segment in &self.segments {
+            if segment.source_index == source_index
+                && template_types.contains(&segment.segment_type)
+            {
+                seq.extend_from_slice(&segment.seq);
+                quals.extend_from_slice(&segment.quals);
+            }
+        }
+        (seq, quals)
     }
 
     /// Writes the FASTQ header to the given writer.  Substitutes in the given read number into
@@ -280,6 +305,8 @@ struct ReadSetIterator {
     source: FastqReader<Box<dyn BufRead + Send>>,
     /// Valid reasons for skipping reads, otherwise panic!
     skip_reasons: Vec<SkipReason>,
+    /// The index of this FASTQ source (0-based), used for tracking original reads.
+    source_index: usize,
 }
 
 impl Iterator for ReadSetIterator {
@@ -333,6 +360,7 @@ impl Iterator for ReadSetIterator {
                     seq: seq.to_vec(),
                     quals: quals.to_vec(),
                     segment_type: read_segment.kind,
+                    source_index: self.source_index,
                 });
             }
             Some(ReadSet { header: read_name.to_vec(), segments, skip_reason: None })
@@ -344,13 +372,14 @@ impl Iterator for ReadSetIterator {
 
 impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
-    /// structures
+    /// structures.
     pub fn new(
         read_structure: ReadStructure,
         source: FastqReader<Box<dyn BufRead + Send>>,
         skip_reasons: Vec<SkipReason>,
+        source_index: usize,
     ) -> Self {
-        Self { read_structure, source, skip_reasons }
+        Self { read_structure, source, skip_reasons, source_index }
     }
 }
 
@@ -393,9 +422,40 @@ impl<W: Write> SampleWriters<W> {
     /// ``Self`` struct.
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
     /// checked at runtime as doing so substantially slows demulitplexing.
-    fn write(&mut self, read_set: &ReadSet) -> Result<()> {
+    ///
+    /// The `template_types` parameter specifies which segment types to include in the template
+    /// output. If it contains only Template, only template segments are written. If it contains
+    /// additional types (e.g. MolecularBarcode), those segments are concatenated with the template.
+    fn write(&mut self, read_set: &ReadSet, template_types: &HashSet<SegmentType>) -> Result<()> {
+        // Handle template writers separately to support template_types
+        if let Some(writers) = &mut self.template_writers {
+            // Check if we need to include non-template segments
+            let include_other_segments = template_types.iter().any(|t| *t != SegmentType::Template);
+
+            for (read_idx, (writer, segment)) in
+                writers.iter_mut().zip(read_set.template_segments()).enumerate()
+            {
+                read_set.write_header(writer, read_idx + 1)?;
+                writer.write_all(b"\n")?;
+                if include_other_segments {
+                    // Write segments of the requested types from this source
+                    let (seq, quals) =
+                        read_set.segments_for_source(segment.source_index, template_types);
+                    writer.write_all(&seq)?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(&quals)?;
+                } else {
+                    // Write just the template segment
+                    writer.write_all(segment.seq.as_slice())?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(segment.quals.as_slice())?;
+                }
+                writer.write_all(b"\n")?;
+            }
+        }
+
+        // Handle other segment types (barcodes, UMIs, etc.) - always write segments, not originals
         for (writers_opt, segments) in [
-            (&mut self.template_writers, &mut read_set.template_segments()),
             (&mut self.sample_barcode_writers, &mut read_set.sample_barcode_segments()),
             (&mut self.molecular_barcode_writers, &mut read_set.molecular_barcode_segments()),
             (&mut self.cellular_barcode_writers, &mut read_set.cellular_barcode_segments()),
@@ -649,6 +709,20 @@ pub(crate) struct Demux {
     ///    if a read is empty and the read structure is `+T`.
     #[clap(long, short = 'S')]
     skip_reasons: Vec<SkipReason>,
+
+    /// The read structure types to include in the template FASTQ output files.
+    ///
+    /// By default, only template (T) segments are included. To include additional segment types
+    /// (e.g. to preserve UMIs in the output reads), specify them here. For example,
+    /// `--template-types M T` will include both molecular barcode and template segments.
+    ///
+    /// To output the full original reads (all segments), specify all segment types present in
+    /// your read structure (e.g. `--template-types B M T`).
+    ///
+    /// Note: If `--template-types` includes any non-`T` type, `T` must be included in
+    /// `--output-types`.
+    #[clap(long, default_value = "T", num_args = 1..)]
+    template_types: Vec<char>,
 }
 
 impl Demux {
@@ -797,13 +871,33 @@ impl Demux {
         Ok((pool, new_sample_writers))
     }
 
+    /// Parses a list of segment type characters into a `HashSet<SegmentType>`, pushing an error
+    /// message to `errors` if any character is invalid.
+    fn parse_segment_types(
+        chars: &[char],
+        error_prefix: &str,
+        errors: &mut Vec<String>,
+    ) -> Result<HashSet<SegmentType>, ReadStructureError> {
+        let result = chars
+            .iter()
+            .map(|&c| SegmentType::try_from(c))
+            .collect::<Result<HashSet<_>, ReadStructureError>>();
+        if let Err(e) = &result {
+            errors.push(format!("{}: {}", error_prefix, e));
+        }
+        result
+    }
+
     /// Checks that inputs to demux are valid and returns open file handles for the inputs.
     /// Checks:
     ///     - That the number of input files and number of read structs provided are the same
     ///     - That the output directory is not read-only
     ///     - That the input files exist
     ///     - That the input files have read permissions.
-    fn validate_and_prepare_inputs(&self) -> Result<(VecOfReaders, HashSet<SegmentType>)> {
+    ///     - That template_types requires T in output_types
+    fn validate_and_prepare_inputs(
+        &self,
+    ) -> Result<(VecOfReaders, HashSet<SegmentType>, HashSet<SegmentType>)> {
         let mut constraint_errors = vec![];
 
         if self.inputs.len() != self.read_structures.len() {
@@ -826,13 +920,50 @@ impl Demux {
                 .push(format!("Ouput directory {:#?} cannot be read-only", self.output));
         }
 
-        let output_segment_types_result = self
-            .output_types
-            .iter()
-            .map(|&c| SegmentType::try_from(c))
-            .collect::<Result<HashSet<_>, ReadStructureError>>();
-        if let Err(e) = &output_segment_types_result {
-            constraint_errors.push(format!("Error parsing segment types to report: {}", e));
+        let output_segment_types_result = Self::parse_segment_types(
+            &self.output_types,
+            "Error parsing segment types to report",
+            &mut constraint_errors,
+        );
+        let template_segment_types_result = Self::parse_segment_types(
+            &self.template_types,
+            "Error parsing template segment types",
+            &mut constraint_errors,
+        );
+
+        // Validate template_types constraints
+        if let (Ok(output_types), Ok(template_types)) =
+            (&output_segment_types_result, &template_segment_types_result)
+        {
+            // template_types must always contain T (the template segment)
+            if !template_types.contains(&SegmentType::Template) {
+                constraint_errors
+                    .push("--template-types must include T (template segment)".to_owned());
+            }
+
+            // If template_types includes non-T segments, output_types must include T
+            // (otherwise there's no template file to write the combined segments to)
+            let has_non_template = template_types.iter().any(|t| *t != SegmentType::Template);
+            if has_non_template && !output_types.contains(&SegmentType::Template) {
+                constraint_errors.push(
+                    "--template-types with non-T segments requires T in --output-types".to_owned(),
+                );
+            }
+
+            // If template_types includes non-T segments, reject read structures with multiple
+            // template segments in a single source, as segments_for_source would produce
+            // duplicated output for each template writer.
+            if has_non_template {
+                for rs in &self.read_structures {
+                    let template_count = rs.segments_by_type(SegmentType::Template).count();
+                    if template_count > 1 {
+                        constraint_errors.push(
+                            "--template-types with non-T segments is not supported when a read structure has multiple template segments".to_owned(),
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         for input in &self.inputs {
@@ -858,13 +989,14 @@ impl Demux {
 
         if constraint_errors.is_empty() {
             let output_segment_types = output_segment_types_result?;
+            let template_segment_types = template_segment_types_result?;
             if output_segment_types.is_empty() {
                 constraint_errors.push(
                     "No output types requested, must request at least one output segment type."
                         .to_owned(),
                 );
             } else {
-                return Ok((fq_readers_result?, output_segment_types));
+                return Ok((fq_readers_result?, output_segment_types, template_segment_types));
             }
         }
         let mut details = "Inputs failed validation!\n".to_owned();
@@ -879,7 +1011,8 @@ impl Command for Demux {
     #[allow(clippy::too_many_lines)]
     /// Executes the demux command
     fn execute(&self) -> Result<()> {
-        let (fq_readers, output_segment_types) = self.validate_and_prepare_inputs()?;
+        let (fq_readers, output_segment_types, template_segment_types) =
+            self.validate_and_prepare_inputs()?;
 
         let sample_group = SampleGroup::from_file(&self.sample_metadata)?;
         info!(
@@ -927,9 +1060,15 @@ impl Command for Demux {
 
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone())
-            .map(|(source, read_structure)| {
-                ReadSetIterator::new(read_structure, source, self.skip_reasons.clone())
-                    .read_ahead(1000, 1000)
+            .enumerate()
+            .map(|(source_index, (source, read_structure))| {
+                ReadSetIterator::new(
+                    read_structure,
+                    source,
+                    self.skip_reasons.clone(),
+                    source_index,
+                )
+                .read_ahead(1000, 1000)
             })
             .collect::<Vec<_>>();
 
@@ -967,10 +1106,11 @@ impl Command for Demux {
             let read_set = ReadSet::combine_readsets(next_read_sets);
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
             {
-                sample_writers[barcode_match.best_match].write(&read_set)?;
+                sample_writers[barcode_match.best_match]
+                    .write(&read_set, &template_segment_types)?;
                 sample_metrics[barcode_match.best_match].templates += 1;
             } else {
-                sample_writers[unmatched_index].write(&read_set)?;
+                sample_writers[unmatched_index].write(&read_set, &template_segment_types)?;
                 unmatched_metric.templates += 1;
             }
             logger.record();
@@ -1130,6 +1270,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1173,6 +1314,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1212,6 +1354,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -1250,6 +1393,7 @@ mod tests {
             threads: 2,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1285,6 +1429,7 @@ mod tests {
             threads: 2,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1315,6 +1460,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1327,6 +1473,332 @@ mod tests {
             &OwnedRecord {
                 head: b"ex_0 1:N:0:AAAAAAAAGATTACAGA".to_vec(),
                 seq: "A".repeat(100).as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_template_types_includes_barcode() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("17B100T").unwrap()];
+        let s1_barcode = "AAAAAAAAGATTACAGA";
+        let template_seq = "T".repeat(100);
+        let full_read = s1_barcode.to_owned() + &template_seq;
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &[&full_read])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        // With template_types B T, the output should be the full original read (barcode + template)
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAAAGATTACAGA".to_vec(),
+                seq: full_read.as_bytes().to_vec(),
+                qual: ";".repeat(117).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_template_types_with_paired_reads() {
+        let tmp = TempDir::new().unwrap();
+        // R1 has inline barcode, R2 is pure template
+        let read_structures = vec![
+            ReadStructure::from_str("8B92T").unwrap(),
+            ReadStructure::from_str("100T").unwrap(),
+        ];
+        let s1_barcode = "AAAAAAAA";
+        let r1_full = s1_barcode.to_owned() + &"A".repeat(92);
+        let r2_full = "T".repeat(100);
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![
+            fastq_file(&tmp, "ex_R1", "ex", &[&r1_full]),
+            fastq_file(&tmp, "ex_R2", "ex", &[&r2_full]),
+        ];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+
+        // R1 output should be full 100bp read (barcode + template)
+        let r1_path = output_dir.join("Sample0000.R1.fq.gz");
+        let r1_reads = read_fastq(&r1_path);
+        assert_eq!(r1_reads.len(), 1);
+        assert_equal(
+            &r1_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 1:N:0:AAAAAAAA".to_vec(),
+                seq: r1_full.as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+
+        // R2 output should be full 100bp read (same as template since no barcode)
+        let r2_path = output_dir.join("Sample0000.R2.fq.gz");
+        let r2_reads = read_fastq(&r2_path);
+        assert_eq!(r2_reads.len(), 1);
+        assert_equal(
+            &r2_reads[0],
+            &OwnedRecord {
+                head: b"ex_0 2:N:0:AAAAAAAA".to_vec(),
+                seq: r2_full.as_bytes().to_vec(),
+                qual: ";".repeat(100).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_template_types_with_umi() {
+        let tmp = TempDir::new().unwrap();
+        // Read structure with barcode, UMI, and template
+        let read_structures = vec![ReadStructure::from_str("8B8M84T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let umi = "GGGGGGGG";
+        let template = "T".repeat(84);
+        let full_read = s1_barcode.to_owned() + umi + &template;
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &[&full_read])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // Include only M and T (UMI + template), exclude barcode
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['M', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        // With template_types M T, the output should be UMI + template (no barcode)
+        let expected_seq = umi.to_owned() + &template;
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:GGGGGGGG 1:N:0:AAAAAAAA".to_vec(),
+                seq: expected_seq.as_bytes().to_vec(),
+                qual: ";".repeat(92).as_bytes().to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "--template-types with non-T segments requires T in --output-types")]
+    fn test_template_types_requires_template_in_output_types() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("8B92T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &["A".repeat(100).as_str()])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // This should fail: output_types has only B, but template_types has B T
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['B'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "--template-types must include T (template segment)")]
+    fn test_template_types_must_include_template() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("8B8M84T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &["A".repeat(100).as_str()])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // This should fail: template_types doesn't include T
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'M'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "Error parsing template segment types")]
+    fn test_template_types_invalid_segment_type() {
+        let tmp = TempDir::new().unwrap();
+        let read_structures = vec![ReadStructure::from_str("8B92T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &["A".repeat(100).as_str()])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // This should fail: 'X' is not a valid segment type
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['X', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "--template-types with non-T segments is not supported when a read structure has multiple template segments"
+    )]
+    fn test_template_types_non_t_rejects_multi_template_read_structure() {
+        let tmp = TempDir::new().unwrap();
+        // Read structure with multiple T segments in one source
+        let read_structures = vec![ReadStructure::from_str("8B20T20S20T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(
+            &tmp,
+            "ex",
+            "ex",
+            &[&(s1_barcode.to_owned()
+                + &"A".repeat(20)
+                + &"C".repeat(20)
+                + &"T".repeat(20))],
+        )];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // This should fail: template_types includes B (non-T) and read structure has multiple T segments
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    fn test_template_types_all_segments_with_skip() {
+        let tmp = TempDir::new().unwrap();
+        // Read structure with barcode, skip, UMI, and template
+        let read_structures = vec![ReadStructure::from_str("8B4S8M80T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let skip = "NNNN";
+        let umi = "GGGGGGGG";
+        let template = "T".repeat(80);
+        let full_read = s1_barcode.to_owned() + skip + umi + &template;
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &[&full_read])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        // Include all segment types including skip
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['B', 'S', 'M', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+
+        let output_path = output_dir.join("Sample0000.R1.fq.gz");
+        let fq_reads = read_fastq(&output_path);
+
+        assert_eq!(fq_reads.len(), 1);
+        // With all template_types, the output should be the full original read
+        assert_equal(
+            &fq_reads[0],
+            &OwnedRecord {
+                head: b"ex_0:GGGGGGGG 1:N:0:AAAAAAAA".to_vec(),
+                seq: full_read.as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             },
         );
@@ -1364,6 +1836,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1440,6 +1913,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1496,6 +1970,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1569,6 +2044,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1641,6 +2117,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1706,6 +2183,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux.execute().unwrap();
 
@@ -1770,6 +2248,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux.execute().unwrap();
 
@@ -1834,6 +2313,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -1908,6 +2388,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1942,6 +2423,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -1976,6 +2458,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -2015,6 +2498,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
     }
@@ -2051,6 +2535,7 @@ mod tests {
             threads: 5,
             compression_level: 5,
             skip_reasons: vec![SkipReason::TooFewBases],
+            template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
@@ -2078,7 +2563,7 @@ mod tests {
 
     fn seg(bases: &[u8], segment_type: SegmentType) -> FastqSegment {
         let quals = vec![b'#'; bases.len()];
-        FastqSegment { seq: bases.to_vec(), quals, segment_type }
+        FastqSegment { seq: bases.to_vec(), quals, segment_type, source_index: 0 }
     }
 
     #[test]
