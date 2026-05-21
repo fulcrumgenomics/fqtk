@@ -3,7 +3,7 @@
 function banner() {
     echo
     echo "================================================================================"
-    echo $*
+    echo "$*"
     echo "================================================================================"
     echo
 }
@@ -24,9 +24,9 @@ function run() {
     set -e
 
     if [[ $exit_code == 0 ]]; then
-        echo Passed $name: "[$cmd]"
+        echo "Passed $name: [$cmd]"
     else
-        echo Failed $name: "[$cmd]"
+        echo "Failed $name: [$cmd]"
         if [ -z "$failures" ]; then
             failures="$failures $name"
         else

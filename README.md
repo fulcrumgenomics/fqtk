@@ -239,6 +239,7 @@ cargo build --release
 
 fqtk is developed in Rust and follows the conventions of using `rustfmt` and `clippy` to ensure both code quality and standardized formatting.
 When working on fqtk, before pushing any commits, please first run `./ci/check.sh` and resolve any issues that are reported.
+Note that `./ci/check.sh` only checks formatting; to auto-fix formatting issues, run `cargo fmt --all`.
 
 ## Releasing a New Version
 
