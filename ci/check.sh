@@ -3,7 +3,7 @@
 function banner() {
     echo
     echo "================================================================================"
-    echo $*
+    echo "$*"
     echo "================================================================================"
     echo
 }
@@ -24,9 +24,9 @@ function run() {
     set -e
 
     if [[ $exit_code == 0 ]]; then
-        echo Passed $name: "[$cmd]"
+        echo "Passed $name: [$cmd]"
     else
-        echo Failed $name: "[$cmd]"
+        echo "Failed $name: [$cmd]"
         if [ -z "$failures" ]; then
             failures="$failures $name"
         else
@@ -35,12 +35,9 @@ function run() {
     fi
 }
 
-parent=$(cd $(dirname $0) && pwd -P)
-repo_root=$(cd $(dirname $0)/.. && pwd -P)
-
-run "Formatting"  "cargo fmt"
-run "Clippy"      "cargo clippy --all-features --all-targets -- -D warnings"
-run "Unit Tests"  "cargo test"
+run "Formatting"  "cargo fmt --check --all"
+run "Clippy"      "cargo clippy --locked --all-features --all-targets -- -D warnings"
+run "Unit Tests"  "cargo test --locked"
 
 if [ -z "$failures" ]; then
     banner "Checks Passed"
