@@ -1,115 +1,15 @@
 use crate::commands::command::Command;
+use crate::commands::fastq_readahead::ReadAheadBuilder;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
-use fgoxide::io::Io;
-use fgoxide::iter::{ChunkedReadAheadIterator, IntoChunkedReadAheadIterator};
 use itertools::Itertools;
 use log::info;
 use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
 use proglog::{CountFormatterKind, ProgLogBuilder};
-use seq_io::fastq::Reader as FastqReader;
-use std::cmp::min;
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-
-/// Buffer size used when opening BufReads for input files
-const BUFFER_SIZE: usize = 1024 * 1024;
-
-/// A decompressed chunk of input bytes shuttled from a decompression thread to the main
-/// (parsing) thread, or an I/O error encountered while decompressing.
-type ByteChunk = io::Result<Vec<u8>>;
-
-/// Read-ahead stream of decompressed input byte chunks produced on a background thread.
-type ByteChunkStream = ChunkedReadAheadIterator<ByteChunk>;
-
-/// A FASTQ reader whose records are parsed on the consuming thread from a [`ByteChunkStream`].
-type InputReader = FastqReader<ChunkReader>;
-
-/// Iterator that reads fixed-size chunks of decompressed bytes from an input reader.
-///
-/// The wrapped reader decompresses lazily as it is read, so running this iterator on a
-/// background (read-ahead) thread keeps gzip inflation off the main thread.  Each chunk ends on
-/// an arbitrary byte boundary; records that span two chunks are stitched back together
-/// downstream by [`ChunkReader`] before `seq_io` parses them.
-struct ByteChunker {
-    /// The decompressing input reader.
-    reader: Box<dyn BufRead + Send>,
-    /// Target size, in bytes, of each emitted chunk.
-    chunk_size: usize,
-    /// Set once the underlying reader is exhausted or has errored.
-    done: bool,
-}
-
-impl Iterator for ByteChunker {
-    type Item = ByteChunk;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        // Fill a fresh buffer as fully as possible; a single `read` on a decompressing reader
-        // often returns less than requested, so loop until full or the input is exhausted.
-        let mut buf = vec![0u8; self.chunk_size];
-        let mut filled = 0;
-        while filled < self.chunk_size {
-            match self.reader.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            }
-        }
-        if filled == 0 {
-            self.done = true;
-            None
-        } else {
-            buf.truncate(filled);
-            Some(Ok(buf))
-        }
-    }
-}
-
-/// A [`Read`] adapter over a [`ByteChunkStream`] that serves the decompressed bytes received
-/// from the decompression thread.  This is the seam that lets FASTQ parsing run on the consuming
-/// thread while decompression runs upstream.
-struct ChunkReader {
-    /// The stream of decompressed byte chunks from the decompression thread.
-    chunks: ByteChunkStream,
-    /// The chunk currently being served from.
-    current: Vec<u8>,
-    /// Offset of the next unserved byte within `current`.
-    pos: usize,
-}
-
-impl Read for ChunkReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Per the `Read` contract a zero-length buffer must return `Ok(0)` without consuming
-        // input; without this guard the loop below could block fetching the next chunk.
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            if self.pos < self.current.len() {
-                let n = min(buf.len(), self.current.len() - self.pos);
-                buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
-                self.pos += n;
-                return Ok(n);
-            }
-            match self.chunks.next() {
-                Some(Ok(chunk)) => {
-                    self.current = chunk;
-                    self.pos = 0;
-                }
-                Some(Err(e)) => return Err(e),
-                None => return Ok(0),
-            }
-        }
-    }
-}
 
 /// Holds the set of output writers for a single shard, one per input FASTQ.
 struct ShardWriters<W: Write> {
@@ -195,26 +95,6 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
-    /// Opens one FASTQ reader per input path, splitting decompression and parsing across threads.
-    ///
-    /// For each input, a background read-ahead thread decompresses the file into fixed-size byte
-    /// chunks (sized by `--chunk-size`, with `--chunk-count` chunks in flight); the returned
-    /// readers parse those bytes into records on the consuming thread.  This keeps gzip inflation
-    /// off the main thread, leaving it free to parse and route records to the compression pool.
-    fn build_record_readers(&self) -> Result<Vec<InputReader>> {
-        let fgio = Io::new(5, BUFFER_SIZE);
-        let mut readers = Vec::with_capacity(self.inputs.len());
-        for path in &self.inputs {
-            let decompressed = fgio.new_reader(path)?;
-            let chunker =
-                ByteChunker { reader: decompressed, chunk_size: self.chunk_size, done: false };
-            let chunks = chunker.read_ahead(1, self.chunk_count);
-            let chunk_reader = ChunkReader { chunks, current: Vec::new(), pos: 0 };
-            readers.push(FastqReader::with_capacity(chunk_reader, BUFFER_SIZE));
-        }
-        Ok(readers)
-    }
-
     /// Builds the fastq writers for each output file and shard, and then instantiates
     /// a writer pool using block-gzip compression.  Returns the writer Pool itself along
     /// with a Vec of `ShardWriters` each of which can accept and write `Vec`s of fastq records
@@ -270,7 +150,17 @@ impl Command for Shard {
         // input and hands decompressed byte chunks to these readers, which parse records here on
         // the main thread.  Keeping inflation off the main thread lets it spend its time parsing
         // and routing records to keep the compression pool fed.
-        let mut readers = self.build_record_readers()?;
+        let mut readers = Vec::with_capacity(self.inputs.len());
+        for path in &self.inputs {
+            readers.push(
+                ReadAheadBuilder {
+                    path: path.clone(),
+                    chunk_size: self.chunk_size,
+                    chunk_count: self.chunk_count,
+                }
+                .build()?,
+            );
+        }
         let n_inputs = readers.len();
 
         let (mut pool, mut shard_writers) = self.build_writer_pool()?;
