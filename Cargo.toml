@@ -37,7 +37,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.10"
 fgoxide = "0.6.0"
-flate2 = { version = "1.1.9", features = ["zlib-ng"] }  # Force the faster backend that requires a C compiler
+flate2 = { version = "1.1.9", features = ["zlib-rs"] }  # Pure-Rust zlib-rs backend; faster inflate, no C compiler needed
 itertools = "0.14.0"
 log = "0.4.29"
 mimalloc = { version = "0.1.48", default-features = false }
@@ -53,5 +53,6 @@ thiserror = "2.0.18"
 proglog = {version = "0.4.0", features = ["pretty_counts"] }
 
 [dev-dependencies]
+bgzf = "0.3.0"
 csv = "1.1.6"
 tempfile = "3.27.0"
