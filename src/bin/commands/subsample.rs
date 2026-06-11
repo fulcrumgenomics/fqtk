@@ -1,21 +1,18 @@
 use crate::commands::command::Command;
-use anyhow::{Result, ensure};
+use crate::commands::fastq_readahead::ReadAheadBuilder;
+use anyhow::Result;
 use clap::Parser;
-use fgoxide::io::Io;
 use log::info;
 use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufWriter};
+use std::io::BufWriter;
 use std::path::PathBuf;
-
-const BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Formats a u64 with comma separators (e.g. 1,234,567).
 fn fmt_count(n: u64) -> String {
@@ -199,17 +196,14 @@ impl Command for Subsample {
         info!("Using random seed: {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // Open input FASTQ readers
-        let fgio = Io::new(5, BUFFER_SIZE);
-        let mut sources: Vec<FastqReader<Box<dyn BufRead + Send>>> = self
-            .inputs
-            .iter()
-            .map(|p| {
-                fgio.new_reader(p)
-                    .map(|r| FastqReader::with_capacity(r, BUFFER_SIZE))
-                    .map_err(|e| anyhow::anyhow!("Failed to open {p:?}: {e}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Open one reader per input.  Decompression runs on a background read-ahead thread per
+        // input and hands decompressed byte chunks to these readers, which parse records here on
+        // the main thread.  Keeping inflation off the main thread leaves it free to parse records
+        // and run the per-record RNG draw and read-name sync checks.
+        let mut sources = Vec::with_capacity(self.inputs.len());
+        for path in &self.inputs {
+            sources.push(ReadAheadBuilder { path: path.clone(), ..Default::default() }.build()?);
+        }
 
         // Create output writers
         let (mut pool, mut writers) = self.create_writers()?;
@@ -228,69 +222,95 @@ impl Command for Subsample {
         let mut total_read: u64 = 0;
         let mut total_kept: u64 = 0;
 
-        loop {
-            let keep = rng.random::<f64>() < self.fraction;
-            let mut records_found = 0usize;
+        // Process records in lockstep across all inputs.  The result is captured rather than
+        // returned directly so the writer pool is always shut down afterwards (below), even on
+        // error -- flushing queued output and surfacing any finalization error instead of leaving
+        // it to a panicking drop.  A processing error takes precedence over a cleanup error.
+        let process_result: Result<()> = 'process: {
+            loop {
+                let keep = rng.random::<f64>() < self.fraction;
 
-            for (i, source) in sources.iter_mut().enumerate() {
-                if let Some(result) = source.next() {
-                    let rec = result?;
-                    records_found += 1;
+                // Pull one record from each input *before* writing any of them, mirroring shard.
+                // Validating the whole set up front means a failure partway through a set (read
+                // error or premature EOF) is surfaced without leaving a half-written, misaligned
+                // set in the output files.
+                let records: Vec<_> = sources.iter_mut().map(|source| source.next()).collect();
 
-                    if keep {
-                        if check_names {
-                            let name = base_read_name(rec.head());
-                            if i == 0 {
-                                expected_name.clear();
-                                expected_name.extend_from_slice(name);
-                            } else if name != expected_name.as_slice() {
-                                anyhow::bail!(
-                                    "Read name mismatch at read {}: file 0={:?}, file {i}={:?}",
-                                    total_read + 1,
-                                    String::from_utf8_lossy(&expected_name),
-                                    String::from_utf8_lossy(name),
-                                );
-                            }
-                        }
-
-                        rec.write_unchanged(&mut writers[i])?;
+                for result in records.iter().flatten() {
+                    if let Err(e) = result {
+                        break 'process Err(anyhow::anyhow!("Error reading FASTQ input: {e}"));
                     }
                 }
-            }
 
-            if records_found == 0 {
-                break;
-            }
+                let records_found = records.iter().filter(|slot| slot.is_some()).count();
+                if records_found == 0 {
+                    break; // all inputs exhausted together: a clean end of input
+                }
+                if records_found != num_inputs {
+                    break 'process Err(anyhow::anyhow!(
+                        "FASTQ files are out of sync: {} of {} files had a record at read {}",
+                        records_found,
+                        num_inputs,
+                        total_read + 1,
+                    ));
+                }
 
-            ensure!(
-                records_found == num_inputs,
-                "FASTQ files are out of sync: {} of {} files had a record at read {}",
-                records_found,
-                num_inputs,
-                total_read + 1,
-            );
+                // Read-name checking and writing happen only for kept sets.  The name check still
+                // runs before any write so a mismatch can't leave a half-written, misaligned set.
+                if keep {
+                    if check_names {
+                        for (i, slot) in records.iter().enumerate() {
+                            if let Some(Ok(rec)) = slot {
+                                let name = base_read_name(rec.head());
+                                if i == 0 {
+                                    expected_name.clear();
+                                    expected_name.extend_from_slice(name);
+                                } else if name != expected_name.as_slice() {
+                                    break 'process Err(anyhow::anyhow!(
+                                        "Read name mismatch at read {}: file 0={:?}, file {i}={:?}",
+                                        total_read + 1,
+                                        String::from_utf8_lossy(&expected_name),
+                                        String::from_utf8_lossy(name),
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
-            total_read += 1;
-            if keep {
-                total_kept += 1;
-            }
-            if total_read % log_unit == 0 {
-                let pct = total_kept as f64 / total_read as f64 * 100.0;
-                info!(
-                    "[fqtk subsample] Read {} record sets and wrote {} ({:.1}%).",
-                    fmt_count(total_read),
-                    fmt_count(total_kept),
-                    pct,
-                );
-            }
-        }
+                    for (slot, writer) in records.iter().zip(writers.iter_mut()) {
+                        if let Some(Ok(rec)) = slot {
+                            if let Err(e) = rec.write_unchanged(&mut *writer) {
+                                break 'process Err(e.into());
+                            }
+                        }
+                    }
+                }
 
-        // Shut down writers and pool
+                total_read += 1;
+                if keep {
+                    total_kept += 1;
+                }
+                if total_read % log_unit == 0 {
+                    let pct = total_kept as f64 / total_read as f64 * 100.0;
+                    info!(
+                        "[fqtk subsample] Read {} record sets and wrote {} ({:.1}%).",
+                        fmt_count(total_read),
+                        fmt_count(total_kept),
+                        pct,
+                    );
+                }
+            }
+            Ok(())
+        };
+
+        // Always shut the pool down so queued output is flushed and any finalization error is
+        // propagated, regardless of whether record processing succeeded.  A processing error
+        // takes precedence over a cleanup error.
         info!("Finished reading input FASTQs.");
-        for writer in writers {
-            writer.close()?;
-        }
-        pool.stop_pool()?;
+        let close_result =
+            writers.into_iter().try_for_each(PooledWriter::close).map_err(anyhow::Error::from);
+        let stop_result = pool.stop_pool().map_err(anyhow::Error::from);
+        process_result.and(close_result).and(stop_result)?;
 
         let pct = if total_read > 0 { total_kept as f64 / total_read as f64 * 100.0 } else { 0.0 };
         info!(
@@ -307,7 +327,9 @@ impl Command for Subsample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgoxide::io::Io;
     use seq_io::fastq::OwnedRecord;
+    use seq_io::fastq::Reader as FastqReader;
     use tempfile::TempDir;
 
     /// Creates FASTQ content lines from the given read name prefix and base sequences.
@@ -837,5 +859,44 @@ mod tests {
         };
         // Should succeed with name checking disabled
         cmd.execute().unwrap();
+    }
+
+    /// When paired inputs have different lengths the run must error *and* must not leave a
+    /// half-written, misaligned set: the kept R1/R2 outputs must hold equal record counts (the
+    /// orphan record from the longer input must not have been written before the error).
+    #[test]
+    fn test_out_of_sync_inputs_leave_no_orphan_record() {
+        let tmp = TempDir::new().unwrap();
+        // Same read names so the name check passes; R1 has one extra record so the third set is
+        // out of sync.  At fraction 1.0 every in-sync set is kept, so without validate-before-write
+        // the orphan R1 record would be emitted before the mismatch is detected.
+        let lines_r1 = fq_lines_from_bases("r", &make_bases(3));
+        let lines_r2 = fq_lines_from_bases("r", &make_bases(2));
+        let input_r1 = write_fastq(&tmp, "r1", &lines_r1);
+        let input_r2 = write_fastq(&tmp, "r2", &lines_r2);
+        let output = tmp.path().join("out");
+
+        let cmd = Subsample {
+            inputs: vec![input_r1, input_r2],
+            output: output.clone(),
+            fraction: 1.0,
+            threads: 2,
+            compression_level: 1,
+            seed: Some(42),
+            disable_read_name_checking: false,
+        };
+        let err = cmd.execute().unwrap_err();
+        assert!(err.to_string().contains("out of sync"), "unexpected error: {err}");
+
+        let r1 = read_fastq(&PathBuf::from(format!("{}.R1.fq.gz", output.display())));
+        let r2 = read_fastq(&PathBuf::from(format!("{}.R2.fq.gz", output.display())));
+        assert_eq!(
+            r1.len(),
+            r2.len(),
+            "R1/R2 outputs left misaligned on the out-of-sync error path"
+        );
+        // The two in-sync pairs must be kept (fraction 1.0) and only the orphan third read
+        // rejected -- guards against the assertion passing vacuously if both outputs were empty.
+        assert_eq!(r1.len(), 2, "expected the two in-sync pairs to be preserved");
     }
 }
