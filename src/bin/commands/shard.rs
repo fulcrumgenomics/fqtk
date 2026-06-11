@@ -121,7 +121,7 @@ impl Shard {
             .collect::<Result<Vec<_>, fgoxide::FgError>>()?;
 
         let fq_readers =
-            readers.into_iter().map(|r| FastqReader::with_capacity(r, 10)).collect_vec();
+            readers.into_iter().map(|r| FastqReader::with_capacity(r, BUFFER_SIZE)).collect_vec();
 
         Ok(fq_readers)
     }
