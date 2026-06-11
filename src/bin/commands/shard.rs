@@ -13,13 +13,10 @@ use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// Buffer size used when opening BufReads for input files
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Struct to hold all the output writers for a single shard
 struct ShardWriters<W: Write> {
@@ -30,7 +27,7 @@ struct ShardWriters<W: Write> {
 }
 
 impl<W: Write> ShardWriters<W> {
-    /// Destroys this struct and decomposes it into its component types. Used when swapping
+    /// Consumes this struct and decomposes it into its component parts. Used when swapping
     /// writers for pooled writers.
     fn into_parts(self) -> (usize, Vec<W>) {
         (self.shard_number, self.writers)
@@ -55,7 +52,7 @@ impl ShardWriters<PooledWriter> {
     /// Attempts to gracefully shut down the writers in this struct, consuming the struct in the
     /// process. Will error if closing of the `PooledWriter`s fails for any reason.
     fn close(self) -> Result<()> {
-        self.writers.into_iter().map(|w| w.close()).collect::<Result<Vec<_>, io::Error>>()?;
+        self.writers.into_iter().try_for_each(PooledWriter::close)?;
         Ok(())
     }
 }
@@ -235,7 +232,7 @@ impl Command for Shard {
 
         // Shut down the pool
         info!("Finished reading input FASTQs.");
-        shard_writers.into_iter().map(|w| w.close()).collect::<Result<Vec<_>>>()?;
+        shard_writers.into_iter().try_for_each(ShardWriters::close)?;
         pool.stop_pool()?;
         info!("Output FASTQ writing complete.");
 
