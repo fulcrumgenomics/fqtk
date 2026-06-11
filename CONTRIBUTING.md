@@ -84,6 +84,7 @@ This project follows the [Fulcrum Genomics Code of Conduct](https://github.com/f
    - `cargo fmt` - Code formatting
    - `cargo clippy` - Linting
    - `cargo test` - Unit tests
+   - README usage check - verifies the embedded `fqtk demux` usage is up to date
 
 ### Committing Changes
 
@@ -143,7 +144,7 @@ fqtk follows standard Rust conventions and uses automated tools to ensure consis
 - **Formatting**: Use `cargo fmt` to format your code
 - **Linting**: Use `cargo clippy` and resolve all warnings
 
-Both are run (along with the tests) by `./ci/check.sh`; run it before pushing. Note that CI enforces a few additional checks not covered by this script — notably that the README usage is up to date (see [Updating the README](#updating-the-readme)).
+These, the tests, and the README usage check (see [Updating the README](#updating-the-readme)) are all run by `./ci/check.sh`, which mirrors the checks CI enforces; run it before pushing.
 
 ### Best Practices
 
@@ -194,7 +195,7 @@ When updating the tool's arguments or docstring, refresh the README by running t
 bash .github/scripts/update-docs.sh
 ```
 
-GitHub Actions will verify that the README remains up-to-date, and commits with outdated usage will fail CI.
+GitHub Actions will verify that the README remains up-to-date, and commits with outdated usage will fail CI. Running `./ci/check.sh` performs this same check locally.
 
 ### Code Documentation
 
