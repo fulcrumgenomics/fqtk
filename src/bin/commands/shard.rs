@@ -106,20 +106,10 @@ impl Read for ChunkReader {
     }
 }
 
-/// Struct to hold all the output writers for a single shard
+/// Holds the set of output writers for a single shard, one per input FASTQ.
 struct ShardWriters<W: Write> {
-    /// ID of the shard this set of writers is for
-    shard_number: usize,
-    /// The set of writers for the shard
+    /// The output writers for this shard, one per input FASTQ.
     writers: Vec<W>,
-}
-
-impl<W: Write> ShardWriters<W> {
-    /// Consumes this struct and decomposes it into its component parts. Used when swapping
-    /// writers for pooled writers.
-    fn into_parts(self) -> (usize, Vec<W>) {
-        (self.shard_number, self.writers)
-    }
 }
 
 impl ShardWriters<PooledWriter> {
@@ -183,7 +173,8 @@ pub(crate) struct Shard {
     /// The level of compression to use to compress outputs.  Defaults to 1 because sharded FASTQs
     /// are typically short-lived intermediates, where write throughput matters more than squeezing
     /// out the last few percent of file size.
-    #[clap(long, short = 'c', default_value = "1")]
+    #[clap(long, short = 'c', default_value = "1",
+           value_parser = RangedU64ValueParser::<u8>::new().range(1..=12))]
     compression_level: u8,
 
     /// (hidden) Size, in bytes, of each decompressed input chunk passed from a per-input
@@ -243,7 +234,7 @@ impl Shard {
                 ws.push(writer);
             }
 
-            shard_writers.push(ShardWriters { shard_number: shard, writers: ws });
+            shard_writers.push(ShardWriters { writers: ws });
         }
 
         // Then construct the writer pool, reserving one thread for the main loop.
@@ -253,14 +244,12 @@ impl Shard {
             .queue_size(pool_threads * 50)
             .compression_level(self.compression_level)?;
 
-        // Then exchange the writers
+        // Then exchange the file writers for pooled (compressing) writers.
         let mut pooled_shard_writers = Vec::with_capacity(shard_writers.len());
         for shard_writer in shard_writers.into_iter() {
-            let (shard, writers) = shard_writer.into_parts();
             let pooled_writers =
-                writers.into_iter().map(|w| pool_builder.exchange(w)).collect_vec();
-            pooled_shard_writers
-                .push(ShardWriters { shard_number: shard, writers: pooled_writers });
+                shard_writer.writers.into_iter().map(|w| pool_builder.exchange(w)).collect_vec();
+            pooled_shard_writers.push(ShardWriters { writers: pooled_writers });
         }
 
         let pool = pool_builder.build()?;
@@ -296,28 +285,34 @@ impl Command for Shard {
         // inputs are exhausted together, or with an error if some -- but not all -- run dry.
         let mut target_shard_idx: usize = 0;
         loop {
-            let target = &mut shard_writers[target_shard_idx];
-            let mut n_written = 0;
-            for (writer, reader) in target.writers.iter_mut().zip(readers.iter_mut()) {
-                match reader.next() {
-                    Some(Ok(record)) => {
-                        record.write_unchanged(&mut *writer)?;
-                        n_written += 1;
-                    }
-                    Some(Err(e)) => return Err(anyhow!("Error reading FASTQ input: {e}")),
-                    None => {}
+            // Pull one record from each input *before* writing any of them.  Validating the whole
+            // set up front means an out-of-sync set (one input short of the others) is rejected
+            // without leaving a half-written, misaligned record set in the output files.
+            let records: Vec<_> = readers.iter_mut().map(|reader| reader.next()).collect();
+
+            for result in records.iter().flatten() {
+                if let Err(e) = result {
+                    return Err(anyhow!("Error reading FASTQ input: {e}"));
                 }
             }
 
-            if n_written == 0 {
-                break;
+            let present = records.iter().filter(|slot| slot.is_some()).count();
+            if present == 0 {
+                break; // all inputs exhausted together: a clean end of input
             }
-            if n_written != n_inputs {
+            if present != n_inputs {
                 return Err(anyhow!(
                     "FASTQ sources out of sync; expected {} records but got {}.",
                     n_inputs,
-                    n_written
+                    present
                 ));
+            }
+
+            let target = &mut shard_writers[target_shard_idx];
+            for (slot, writer) in records.iter().zip(target.writers.iter_mut()) {
+                if let Some(Ok(record)) = slot {
+                    record.write_unchanged(&mut *writer)?;
+                }
             }
 
             target_shard_idx = (target_shard_idx + 1) % self.shards;
@@ -605,6 +600,43 @@ mod tests {
         let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
         let err = build_sharder(&[&r1, &r2], &prefix, 3).execute().unwrap_err();
         assert!(err.to_string().contains("out of sync"), "unexpected error message: {}", err);
+    }
+
+    /// When paired inputs have different lengths the run must error *and* must not leave a
+    /// half-written, misaligned set: the per-shard R1/R2 files should hold equal record counts
+    /// (the orphan record from the longer input must not have been written).
+    #[test]
+    fn test_out_of_sync_inputs_leave_no_orphan_record() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "q", "/1", 1, 3);
+        build_fastq(r2.as_path(), "q", "/2", 1, 2);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let err = build_sharder(&[&r1, &r2], &prefix, 1).execute().unwrap_err();
+        assert!(err.to_string().contains("out of sync"), "unexpected error message: {}", err);
+
+        let r1_out = read_fastq(Path::new(&format!("{}.shard1.read1.fq.gz", prefix)));
+        let r2_out = read_fastq(Path::new(&format!("{}.shard1.read2.fq.gz", prefix)));
+        assert_eq!(
+            r1_out.len(),
+            r2_out.len(),
+            "R1/R2 outputs left misaligned on the out-of-sync error path"
+        );
+    }
+
+    /// A corrupt or truncated gzip input must surface as an error rather than hanging or silently
+    /// producing empty output -- this exercises the ByteChunker -> ChunkReader error propagation.
+    #[test]
+    fn test_decompression_error_surfaces() {
+        let tmp = TempDir::new().unwrap();
+        let bad = PathBuf::from(tmp.path()).join("bad.fq.gz");
+        std::fs::write(&bad, b"this is definitely not valid gzip content\n").unwrap();
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let result = build_sharder(&[bad.as_path()], &prefix, 2).execute();
+        assert!(result.is_err(), "expected a decompression error but the run succeeded");
     }
 
     #[test]
