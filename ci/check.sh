@@ -35,9 +35,21 @@ function run() {
     fi
 }
 
+#####################################################################
+# Regenerates the `fqtk demux` usage embedded in the README and fails
+# if it leaves the working tree dirty (i.e. the README was out of
+# date). Mirrors the README sync check enforced in CI.
+#####################################################################
+function check_docs() {
+    cargo build --locked || return 1
+    bash .github/scripts/update-docs.sh || return 1
+    git diff --exit-code -- README.md
+}
+
 run "Formatting"  "cargo fmt --check --all"
 run "Clippy"      "cargo clippy --locked --all-features --all-targets -- -D warnings"
 run "Unit Tests"  "cargo test --locked"
+run "Docs"        "check_docs"
 
 if [ -z "$failures" ]; then
     banner "Checks Passed"
