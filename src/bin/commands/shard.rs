@@ -87,6 +87,11 @@ struct ChunkReader {
 
 impl Read for ChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Per the `Read` contract a zero-length buffer must return `Ok(0)` without consuming
+        // input; without this guard the loop below could block fetching the next chunk.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.pos < self.current.len() {
                 let n = min(buf.len(), self.current.len() - self.pos);
@@ -283,46 +288,58 @@ impl Command for Shard {
         // shard.  Records are emitted verbatim via `write_unchanged`, which blits the original
         // record bytes rather than re-serializing field by field.  Terminate cleanly when all
         // inputs are exhausted together, or with an error if some -- but not all -- run dry.
+        //
+        // The processing result is captured rather than returned directly so the writer pool is
+        // always shut down afterwards (below), even on error -- flushing queued output and
+        // surfacing any finalization error instead of leaving it to a panicking drop.
         let mut target_shard_idx: usize = 0;
-        loop {
-            // Pull one record from each input *before* writing any of them.  Validating the whole
-            // set up front means an out-of-sync set (one input short of the others) is rejected
-            // without leaving a half-written, misaligned record set in the output files.
-            let records: Vec<_> = readers.iter_mut().map(|reader| reader.next()).collect();
+        let process_result: Result<()> = 'process: {
+            loop {
+                // Pull one record from each input *before* writing any of them.  Validating the
+                // whole set up front means an out-of-sync set (one input short of the others) is
+                // rejected without leaving a half-written, misaligned set in the output files.
+                let records: Vec<_> = readers.iter_mut().map(|reader| reader.next()).collect();
 
-            for result in records.iter().flatten() {
-                if let Err(e) = result {
-                    return Err(anyhow!("Error reading FASTQ input: {e}"));
+                for result in records.iter().flatten() {
+                    if let Err(e) = result {
+                        break 'process Err(anyhow!("Error reading FASTQ input: {e}"));
+                    }
                 }
-            }
 
-            let present = records.iter().filter(|slot| slot.is_some()).count();
-            if present == 0 {
-                break; // all inputs exhausted together: a clean end of input
-            }
-            if present != n_inputs {
-                return Err(anyhow!(
-                    "FASTQ sources out of sync; expected {} records but got {}.",
-                    n_inputs,
-                    present
-                ));
-            }
-
-            let target = &mut shard_writers[target_shard_idx];
-            for (slot, writer) in records.iter().zip(target.writers.iter_mut()) {
-                if let Some(Ok(record)) = slot {
-                    record.write_unchanged(&mut *writer)?;
+                let present = records.iter().filter(|slot| slot.is_some()).count();
+                if present == 0 {
+                    break; // all inputs exhausted together: a clean end of input
                 }
+                if present != n_inputs {
+                    break 'process Err(anyhow!(
+                        "FASTQ sources out of sync; expected {} records but got {}.",
+                        n_inputs,
+                        present
+                    ));
+                }
+
+                let target = &mut shard_writers[target_shard_idx];
+                for (slot, writer) in records.iter().zip(target.writers.iter_mut()) {
+                    if let Some(Ok(record)) = slot {
+                        if let Err(e) = record.write_unchanged(&mut *writer) {
+                            break 'process Err(e.into());
+                        }
+                    }
+                }
+
+                target_shard_idx = (target_shard_idx + 1) % self.shards;
+                logger.record();
             }
+            Ok(())
+        };
 
-            target_shard_idx = (target_shard_idx + 1) % self.shards;
-            logger.record();
-        }
-
-        // Shut down the pool
+        // Always shut the pool down so queued output is flushed and any finalization error is
+        // propagated, regardless of whether record processing succeeded.  A processing error
+        // takes precedence over a cleanup error.
         info!("Finished reading input FASTQs.");
-        shard_writers.into_iter().try_for_each(ShardWriters::close)?;
-        pool.stop_pool()?;
+        let close_result = shard_writers.into_iter().try_for_each(ShardWriters::close);
+        let stop_result = pool.stop_pool().map_err(anyhow::Error::from);
+        process_result.and(close_result).and(stop_result)?;
         info!("Output FASTQ writing complete.");
 
         Ok(())
