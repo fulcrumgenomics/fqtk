@@ -182,13 +182,23 @@ impl ReadSet {
     /// Where
     ///   name = @<instrument>:<run number>:<flowcell ID>:<lane>:<tile>:<x-pos>:<y-pos>:<UMI>
     ///   comment = <read>:<is filtered>:<control number>:<index>
-    fn write_header<W: Write>(&self, writer: &mut W, read_num: usize) -> Result<()> {
+    ///
+    /// When `include_umi` is false, UMI (M) segments are not folded into the read name; this is
+    /// used when the UMI bases are instead written into the template output bases, to avoid
+    /// emitting the same bases in both the header and the bases.
+    fn write_header<W: Write>(
+        &self,
+        writer: &mut W,
+        read_num: usize,
+        include_umi: bool,
+    ) -> Result<()> {
         Self::write_header_internal(
             writer,
             read_num,
             self.header.as_slice(),
             self.sample_barcode_segments(),
             self.molecular_barcode_segments(),
+            include_umi,
         )
     }
 
@@ -198,6 +208,7 @@ impl ReadSet {
         header: &[u8],
         sample_barcode_segments: SegmentIter,
         mut molecular_barcode_segments: SegmentIter,
+        include_umi: bool,
     ) -> Result<()> {
         // Extract the name and optionally the comment
         let (name, comment) = match header.find_byte(Self::SPACE) {
@@ -207,9 +218,11 @@ impl ReadSet {
 
         writer.write_all(&[Self::PREFIX])?;
 
-        // Handle the 'name' component of the header.  If we don't have any UMI segments
-        // we can emit the name part as is.  Otherwise we need to append the UMIs to the name.
-        if let Some(first_seg) = molecular_barcode_segments.next() {
+        // Handle the 'name' component of the header.  If we don't have any UMI segments (or UMIs
+        // are being written into the template bases instead) we can emit the name part as is.
+        // Otherwise we need to append the UMIs to the name.
+        let first_umi_segment = if include_umi { molecular_barcode_segments.next() } else { None };
+        if let Some(first_seg) = first_umi_segment {
             let sep_count = name.iter().filter(|c| **c == Self::COLON).count();
             ensure!(
                 sep_count <= 7,
@@ -383,6 +396,32 @@ impl ReadSetIterator {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// TemplateOutput
+////////////////////////////////////////////////////////////////////////////////
+
+/// How segments are routed into the template output bases and the read header, derived once from
+/// `--template-types` and reused for every record.
+struct TemplateOutput {
+    /// Segment types to concatenate into the template read bases. Always includes Template (T).
+    types: HashSet<SegmentType>,
+    /// Whether any non-template segment types are folded into the template bases. When false, the
+    /// template writer emits just the template segment (the default behavior).
+    include_other_segments: bool,
+    /// Whether UMI (M) segments should be written into the read header. False when UMIs are folded
+    /// into the template bases, so the same bases are not written in both the header and the bases.
+    umi_in_header: bool,
+}
+
+impl TemplateOutput {
+    /// Derives the template output routing from the set of `--template-types` segment types.
+    fn from_types(types: HashSet<SegmentType>) -> Self {
+        let include_other_segments = types.iter().any(|t| *t != SegmentType::Template);
+        let umi_in_header = !types.contains(&SegmentType::MolecularBarcode);
+        Self { types, include_other_segments, umi_in_header }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // SampleWriters and it's impls
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -422,24 +461,22 @@ impl<W: Write> SampleWriters<W> {
     /// Reads in the read set should be 1:1 with writers in the writer set however this is not
     /// checked at runtime as doing so substantially slows demulitplexing.
     ///
-    /// The `template_types` parameter specifies which segment types to include in the template
-    /// output. If it contains only Template, only template segments are written. If it contains
-    /// additional types (e.g. MolecularBarcode), those segments are concatenated with the template.
-    fn write(&mut self, read_set: &ReadSet, template_types: &HashSet<SegmentType>) -> Result<()> {
-        // Handle template writers separately to support template_types
+    /// The `template` parameter specifies how segments are routed into the template output. If it
+    /// includes only Template, only template segments are written. If it includes additional types
+    /// (e.g. MolecularBarcode), those segments are concatenated with the template, and UMIs are
+    /// omitted from the read header so the same bases are not written twice.
+    fn write(&mut self, read_set: &ReadSet, template: &TemplateOutput) -> Result<()> {
+        // Handle template writers separately to support template output routing
         if let Some(writers) = &mut self.template_writers {
-            // Check if we need to include non-template segments
-            let include_other_segments = template_types.iter().any(|t| *t != SegmentType::Template);
-
             for (read_idx, (writer, segment)) in
                 writers.iter_mut().zip(read_set.template_segments()).enumerate()
             {
-                read_set.write_header(writer, read_idx + 1)?;
+                read_set.write_header(writer, read_idx + 1, template.umi_in_header)?;
                 writer.write_all(b"\n")?;
-                if include_other_segments {
+                if template.include_other_segments {
                     // Write segments of the requested types from this source
                     let (seq, quals) =
-                        read_set.segments_for_source(segment.source_index, template_types);
+                        read_set.segments_for_source(segment.source_index, &template.types);
                     writer.write_all(&seq)?;
                     writer.write_all(b"\n+\n")?;
                     writer.write_all(&quals)?;
@@ -461,7 +498,7 @@ impl<W: Write> SampleWriters<W> {
         ] {
             if let Some(writers) = writers_opt {
                 for (read_idx, (writer, segment)) in writers.iter_mut().zip(segments).enumerate() {
-                    read_set.write_header(writer, read_idx + 1)?;
+                    read_set.write_header(writer, read_idx + 1, template.umi_in_header)?;
                     writer.write_all(b"\n")?;
                     writer.write_all(segment.seq.as_slice())?;
                     writer.write_all(b"\n+\n")?;
@@ -712,14 +749,22 @@ pub(crate) struct Demux {
     /// The read structure types to include in the template FASTQ output files.
     ///
     /// By default, only template (T) segments are included. To include additional segment types
-    /// (e.g. to preserve UMIs in the output reads), specify them here. For example,
-    /// `--template-types M T` will include both molecular barcode and template segments.
+    /// (e.g. to preserve UMIs in the output read bases), specify them here. For example,
+    /// `--template-types M T` will concatenate the molecular barcode and template segments.
     ///
     /// To output the full original reads (all segments), specify all segment types present in
     /// your read structure (e.g. `--template-types B M T`).
     ///
+    /// Segments are only merged *within the same physical read*: a non-`T` segment is folded into
+    /// the template bases only when it is co-located with a `T` in the same read structure (e.g.
+    /// `8M84T`). A segment on a separate read (e.g. a UMI on its own index read) is never merged
+    /// into a template on another read; route it via `--output-types` instead, or leave it in the
+    /// read header. When a UMI (M) is included here it is written into the template bases and is
+    /// therefore omitted from the read header (it is not written in both places).
+    ///
     /// Note: If `--template-types` includes any non-`T` type, `T` must be included in
-    /// `--output-types`, and each read structure must contain at most one `T` segment.
+    /// `--output-types`; each requested non-`T` type must be co-located with a `T` in every read
+    /// structure where it appears; and each read structure must contain at most one `T` segment.
     #[clap(long, default_value = "T", num_args = 1..)]
     template_types: Vec<char>,
 }
@@ -881,7 +926,7 @@ impl Demux {
         match chars.iter().map(|&c| SegmentType::try_from(c)).collect::<Result<HashSet<_>, _>>() {
             Ok(set) => Some(set),
             Err(e) => {
-                errors.push(format!("{}: {}", error_prefix, e));
+                errors.push(format!("{error_prefix}: {e}"));
                 None
             }
         }
@@ -966,20 +1011,52 @@ impl Demux {
                     }
                 }
 
-                // Each requested non-T type must appear in at least one read structure, else the
-                // request is silently a no-op (segments_for_source emits only the template).
+                // A non-T type is folded into the template bases only when it is co-located with
+                // a T in the *same* physical read; segments are never merged across reads. Require
+                // each requested non-T type to (a) appear in at least one read structure, and (b)
+                // share every read structure it appears in with a T. Otherwise its bases would be
+                // neither merged into a template nor written anywhere, i.e. silently dropped.
                 for segment_type in template_types.iter().filter(|t| **t != SegmentType::Template) {
-                    let present = self
+                    let type_char = segment_type.value();
+                    let present_anywhere = self
                         .read_structures
                         .iter()
                         .any(|rs| rs.segments_by_type(*segment_type).count() > 0);
-                    if !present {
+                    if !present_anywhere {
                         constraint_errors.push(format!(
-                            "--template-types includes {} but no read structure contains that segment type",
-                            segment_type.value()
+                            "--template-types includes {type_char} but no read structure contains that segment type"
                         ));
+                        continue;
+                    }
+                    for (idx, rs) in self.read_structures.iter().enumerate() {
+                        let has_type = rs.segments_by_type(*segment_type).count() > 0;
+                        let has_template = rs.segments_by_type(SegmentType::Template).count() > 0;
+                        if has_type && !has_template {
+                            constraint_errors.push(format!(
+                                "--template-types includes {type_char} but read structure #{} contains {type_char} with no template (T) segment to merge it into (segments are only merged within the same read); add {type_char} to --output-types, or remove it from --template-types so it is written to the read header instead",
+                                idx + 1
+                            ));
+                        }
                     }
                 }
+            }
+
+            // Every segment type present in the read structures must have a destination so its
+            // bases are not silently lost. Template (T) is forced into output, sample barcode (B)
+            // and molecular barcode (M) fall back to the read header, and Skip (S) is discarded by
+            // design. Cellular barcode (C) has no read-header field, so it must be routed
+            // explicitly to either an output file or the template bases.
+            let cellular_present = self
+                .read_structures
+                .iter()
+                .any(|rs| rs.segments_by_type(SegmentType::CellularBarcode).count() > 0);
+            if cellular_present
+                && !output_types.contains(&SegmentType::CellularBarcode)
+                && !template_types.contains(&SegmentType::CellularBarcode)
+            {
+                constraint_errors.push(
+                    "Cellular barcode (C) segments are present but assigned to neither --output-types nor --template-types, and have no read-header field; add C to one of them".to_owned(),
+                );
             }
         }
 
@@ -1034,6 +1111,7 @@ impl Command for Demux {
     fn execute(&self) -> Result<()> {
         let (fq_readers, output_segment_types, template_segment_types) =
             self.validate_and_prepare_inputs()?;
+        let template_output = TemplateOutput::from_types(template_segment_types);
 
         let sample_group = SampleGroup::from_file(&self.sample_metadata)?;
         info!(
@@ -1127,11 +1205,10 @@ impl Command for Demux {
             let read_set = ReadSet::combine_readsets(next_read_sets);
             if let Some(barcode_match) = barcode_matcher.assign(&read_set.sample_barcode_sequence())
             {
-                sample_writers[barcode_match.best_match]
-                    .write(&read_set, &template_segment_types)?;
+                sample_writers[barcode_match.best_match].write(&read_set, &template_output)?;
                 sample_metrics[barcode_match.best_match].templates += 1;
             } else {
-                sample_writers[unmatched_index].write(&read_set, &template_segment_types)?;
+                sample_writers[unmatched_index].write(&read_set, &template_output)?;
                 unmatched_metric.templates += 1;
             }
             logger.record();
@@ -1639,12 +1716,14 @@ mod tests {
         let fq_reads = read_fastq(&output_path);
 
         assert_eq!(fq_reads.len(), 1);
-        // With template_types M T, the output should be UMI + template (no barcode)
+        // With template_types M T, the output bases should be UMI + template (no barcode). Because
+        // the UMI is written into the bases, it is *not* also appended to the read name (no
+        // trailing `:GGGGGGGG` on the name), so the same bases are not emitted twice.
         let expected_seq = umi.to_owned() + &template;
         assert_equal(
             &fq_reads[0],
             &OwnedRecord {
-                head: b"ex_0:GGGGGGGG 1:N:0:AAAAAAAA".to_vec(),
+                head: b"ex_0 1:N:0:AAAAAAAA".to_vec(),
                 seq: expected_seq.as_bytes().to_vec(),
                 qual: ";".repeat(92).as_bytes().to_vec(),
             },
@@ -1808,6 +1887,75 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "--template-types includes M but read structure #1 contains M with no template (T) segment to merge it into"
+    )]
+    fn test_template_types_non_colocated_segment_rejected() {
+        let tmp = TempDir::new().unwrap();
+        // The UMI (M) is on its own read (R1), separate from the template (R2). Since segments are
+        // only merged within the same read, M cannot be folded into the template and the request
+        // must be rejected rather than silently dropping the UMI bases.
+        let read_structures =
+            vec![ReadStructure::from_str("8M").unwrap(), ReadStructure::from_str("100T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![
+            fastq_file(&tmp, "r1", "r1", &["GGGGGGGG"]),
+            fastq_file(&tmp, "r2", "r2", &["A".repeat(100).as_str()]),
+        ];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['M', 'T'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Cellular barcode (C) segments are present but assigned to neither --output-types nor --template-types"
+    )]
+    fn test_cellular_barcode_without_destination_rejected() {
+        let tmp = TempDir::new().unwrap();
+        // A cellular barcode (C) is present but routed to neither --output-types nor
+        // --template-types, and has no read-header field, so its bases would be silently lost.
+        let read_structures = vec![ReadStructure::from_str("8B7C85T").unwrap()];
+        let s1_barcode = "AAAAAAAA";
+        let sample_metadata = metadata_file(&tmp, &[s1_barcode]);
+        let input_files = vec![fastq_file(&tmp, "ex", "ex", &["A".repeat(100).as_str()])];
+
+        let output_dir = tmp.path().to_path_buf().join("output");
+
+        let demux_inputs = Demux {
+            inputs: input_files,
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+        };
+        demux_inputs.execute().unwrap();
+    }
+
+    #[test]
     fn test_template_types_all_segments_with_skip() {
         let tmp = TempDir::new().unwrap();
         // Read structure with barcode, skip, UMI, and template
@@ -1843,11 +1991,12 @@ mod tests {
         let fq_reads = read_fastq(&output_path);
 
         assert_eq!(fq_reads.len(), 1);
-        // With all template_types, the output should be the full original read
+        // With all template_types, the output should be the full original read. The UMI (M) is
+        // folded into the bases, so it is not also appended to the read name.
         assert_equal(
             &fq_reads[0],
             &OwnedRecord {
-                head: b"ex_0:GGGGGGGG 1:N:0:AAAAAAAA".to_vec(),
+                head: b"ex_0 1:N:0:AAAAAAAA".to_vec(),
                 seq: full_read.as_bytes().to_vec(),
                 qual: ";".repeat(100).as_bytes().to_vec(),
             },
@@ -2688,6 +2837,7 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -2707,6 +2857,29 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_omits_umi_when_in_template_bases() {
+        // When include_umi is false (UMI bases are written into the template output instead), the
+        // UMI must not be appended to the read name, but sample barcodes are still appended.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108 1:Y:0:0";
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108 2:Y:0:ACGT+GGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            2,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            false,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -2727,6 +2900,7 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -2746,6 +2920,7 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -2765,6 +2940,7 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
         )
         .unwrap();
     }
@@ -2783,6 +2959,7 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
+            true,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
