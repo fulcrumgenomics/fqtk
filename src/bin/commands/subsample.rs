@@ -232,8 +232,8 @@ impl Command for Subsample {
 
                 // Pull one record from each input *before* writing any of them, mirroring shard.
                 // Validating the whole set up front means a failure partway through a set (read
-                // error, premature EOF, or read-name mismatch) is surfaced without leaving a
-                // half-written, misaligned set in the output files.
+                // error or premature EOF) is surfaced without leaving a half-written, misaligned
+                // set in the output files.
                 let records: Vec<_> = sources.iter_mut().map(|source| source.next()).collect();
 
                 for result in records.iter().flatten() {
@@ -255,27 +255,28 @@ impl Command for Subsample {
                     ));
                 }
 
-                if check_names {
-                    for (i, slot) in records.iter().enumerate() {
-                        if let Some(Ok(rec)) = slot {
-                            let name = base_read_name(rec.head());
-                            if i == 0 {
-                                expected_name.clear();
-                                expected_name.extend_from_slice(name);
-                            } else if name != expected_name.as_slice() {
-                                break 'process Err(anyhow::anyhow!(
-                                    "Read name mismatch at read {}: file 0={:?}, file {i}={:?}",
-                                    total_read + 1,
-                                    String::from_utf8_lossy(&expected_name),
-                                    String::from_utf8_lossy(name),
-                                ));
+                // Read-name checking and writing happen only for kept sets.  The name check still
+                // runs before any write so a mismatch can't leave a half-written, misaligned set.
+                if keep {
+                    if check_names {
+                        for (i, slot) in records.iter().enumerate() {
+                            if let Some(Ok(rec)) = slot {
+                                let name = base_read_name(rec.head());
+                                if i == 0 {
+                                    expected_name.clear();
+                                    expected_name.extend_from_slice(name);
+                                } else if name != expected_name.as_slice() {
+                                    break 'process Err(anyhow::anyhow!(
+                                        "Read name mismatch at read {}: file 0={:?}, file {i}={:?}",
+                                        total_read + 1,
+                                        String::from_utf8_lossy(&expected_name),
+                                        String::from_utf8_lossy(name),
+                                    ));
+                                }
                             }
                         }
                     }
-                }
 
-                // Only after the whole set is validated do we write the kept records.
-                if keep {
                     for (slot, writer) in records.iter().zip(writers.iter_mut()) {
                         if let Some(Ok(rec)) = slot {
                             if let Err(e) = rec.write_unchanged(&mut *writer) {

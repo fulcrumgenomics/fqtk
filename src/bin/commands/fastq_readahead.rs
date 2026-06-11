@@ -54,7 +54,9 @@ impl ReadAheadBuilder {
     /// This keeps gzip inflation off the consuming thread, leaving it free to parse and route
     /// records.
     pub(crate) fn build(self) -> Result<FastqReader<ChunkReader>> {
-        let decompressed = Io::new(5, BUFFER_SIZE).new_reader(&self.path)?;
+        let decompressed = Io::new(5, BUFFER_SIZE)
+            .new_reader(&self.path)
+            .map_err(|e| anyhow::anyhow!("Failed to open {:?}: {e}", self.path))?;
         let chunker =
             ByteChunker { reader: decompressed, chunk_size: self.chunk_size, done: false };
         let chunks = chunker.read_ahead(1, self.chunk_count);
