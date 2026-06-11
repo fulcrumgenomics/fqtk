@@ -26,13 +26,21 @@ A toolkit for working with FASTQ files, written in Rust.
 <a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
 <a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
 
-Currently `fqtk` contains a single tool, `demux` for demultiplexing FASTQ files based on sample barcodes.
-`fqtk demux` can be used to demultiplex one or more FASTQ files (e.g. a set of R1, R2 and I1 FASTQ files) with any number of sample barcodes at fixed locations within the reads.
-It is highly efficient and multi-threaded for high performance.
+`fqtk` provides several tools for working with FASTQ files:
+
+- **`demux`** — demultiplex one or more FASTQ files into per-sample FASTQs using sample barcodes at fixed positions within the reads.
+- **`shard`** — split one or more matched FASTQs (e.g. R1/R2) into N shards, assigning reads round-robin so each input read ends up in exactly one output FASTQ.
+- **`subsample`** — randomly subsample reads from one or more synchronized FASTQs.
+
+All tools are highly efficient and multi-threaded for high performance.
+
+## `fqtk demux`
+
+`fqtk demux` demultiplexes one or more FASTQ files (e.g. a set of R1, R2 and I1 FASTQ files) with any number of sample barcodes at fixed locations within the reads.
 
 Usage for `fqtk demux` follows:
 
-<!-- start usage -->
+<!-- start usage:demux -->
 ````console
 
 Performs sample demultiplexing on FASTQs.
@@ -187,7 +195,147 @@ Options:
   -V, --version
           Print version
 ````
-<!-- end usage -->
+<!-- end usage:demux -->
+
+## `fqtk shard`
+
+`fqtk shard` splits one or more matched FASTQs (e.g. R1 and R2) into N output shards, assigning reads to shards on a round-robin basis so that each input read ends up in exactly one output FASTQ.  This is useful for splitting large FASTQs into evenly sized pieces for parallel downstream processing.
+
+Usage for `fqtk shard` follows:
+
+<!-- start usage:shard -->
+````console
+
+Shards a set of FASTQs into N output shards.
+
+Shards a set of matched FASTQs (e.g. R1 and R2) into one or more set of FASTQs where each
+input read ends up in exactly one output FASTQ. Reads are assigned to shards on a round-robin
+basis, so e.g. if using `--shards 10` the first read in the input files will end up in the
+first shard, the second read in the second shard ... and the tenth read in the tenth shard.
+
+Each shard will contain one output FASTQ file per input FASTQ files.  Output files are named
+as follows:
+
+```
+{output_prefix}.{shard_prefix}{shard_num}.{read_number_prefix}{read_num}.fq.gz
+```
+
+where `shard_num` is n for the nth shard (starting at 1), `read_num` corresponds to the nth
+file in the `inputs` list (starting at 1), and all other values in `{}` are named command
+line parameters.  The `output_prefix` may contain an absolute path, or a relative path, with
+relative paths interpreted relative to the working directory where the command is run.
+
+Inputs may be uncompressed, gzipped, or block-gzipped.  Output files are _always_ block gzipped.
+
+Usage: fqtk shard [OPTIONS] --inputs <INPUTS>... --output-prefix <OUTPUT_PREFIX> --shards <SHARDS>
+
+Options:
+  -i, --inputs <INPUTS>...
+          One or more input FASTQ files each corresponding to a sequencing read (e.g. R1, R2)
+
+  -o, --output-prefix <OUTPUT_PREFIX>
+          Output prefix for sharded FASTQ file(s)
+
+  -S, --shard-prefix <SHARD_PREFIX>
+          Prefix to place before the shard number in the generated output file names
+
+          [default: s]
+
+  -R, --read-number-prefix <READ_NUMBER_PREFIX>
+          Prefix to place before the read number in the generated output file names
+
+          [default: r]
+
+  -s, --shards <SHARDS>
+          Number of shards to generate
+
+  -t, --threads <THREADS>
+          The number of threads to use for compressing output files.  Minimum 2
+
+          [default: 8]
+
+  -c, --compression-level <COMPRESSION_LEVEL>
+          The level of compression to use to compress outputs.  Defaults to 1 because sharded FASTQs are typically short-lived intermediates, where write throughput matters more than squeezing out the last few percent of file size
+
+          [default: 1]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+````
+<!-- end usage:shard -->
+
+## `fqtk subsample`
+
+`fqtk subsample` reads one or more synchronized FASTQs (e.g. R1 and R2) and writes a randomly chosen subset of the reads, keeping or discarding each read across all files together so paired reads stay in sync.
+
+Usage for `fqtk subsample` follows:
+
+<!-- start usage:subsample -->
+````console
+
+Subsamples reads from one or more synchronized FASTQ files.
+
+Reads one or more FASTQ files (e.g. paired-end R1 and R2) and writes a
+random subset of reads to output files. All input files must contain the
+same number of reads in the same order; each read is either kept or
+discarded across all files simultaneously.
+
+Output files are named `{output}.R1.fq.gz`, `{output}.R2.fq.gz`, etc.
+and are always BGZF compressed.
+
+Each read is independently retained with probability equal to `--fraction`,
+giving an approximate subsample without needing to know the total read count
+upfront. When no explicit `--seed` is provided, a deterministic seed is
+derived from all input parameters, so identical inputs and parameters always
+produce identical output.
+
+# Example
+
+```bash
+fqtk subsample \
+    --input r1.fq.gz r2.fq.gz \
+    --output subsampled \
+    --fraction 0.1
+```
+
+Usage: fqtk subsample [OPTIONS] --inputs <INPUTS>... --output <OUTPUT> --fraction <FRACTION>
+
+Options:
+  -i, --inputs <INPUTS>...
+          One or more input FASTQ files (may be gzipped). All files must have the same number of reads in the same order
+
+  -o, --output <OUTPUT>
+          Output path prefix. Files will be named {output}.R1.fq.gz, etc
+
+  -f, --fraction <FRACTION>
+          Fraction of reads to retain, in the range [0.0, 1.0]
+
+  -t, --threads <THREADS>
+          Number of threads for compression. Minimum 2
+
+          [default: 8]
+
+  -c, --compression-level <COMPRESSION_LEVEL>
+          BGZF compression level for output files
+
+          [default: 5]
+
+  -s, --seed <SEED>
+          Explicit RNG seed for reproducibility. When omitted, a deterministic seed is derived from all other parameters
+
+      --disable-read-name-checking
+          Disable checking that read names are in sync across input files
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+````
+<!-- end usage:subsample -->
 
 ## Installing
 
