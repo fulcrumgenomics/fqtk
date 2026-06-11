@@ -3,20 +3,108 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
 use fgoxide::io::Io;
-use fgoxide::iter::IntoChunkedReadAheadIterator;
+use fgoxide::iter::{ChunkedReadAheadIterator, IntoChunkedReadAheadIterator};
 use itertools::Itertools;
 use log::info;
 use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
 use proglog::{CountFormatterKind, ProgLogBuilder};
-use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::Reader as FastqReader;
-use seq_io::fastq::Record;
+use std::cmp::min;
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Buffer size used when opening BufReads for input files
 const BUFFER_SIZE: usize = 1024 * 1024;
+
+/// A decompressed chunk of input bytes shuttled from a decompression thread to the main
+/// (parsing) thread, or an I/O error encountered while decompressing.
+type ByteChunk = io::Result<Vec<u8>>;
+
+/// Read-ahead stream of decompressed input byte chunks produced on a background thread.
+type ByteChunkStream = ChunkedReadAheadIterator<ByteChunk>;
+
+/// A FASTQ reader whose records are parsed on the consuming thread from a [`ByteChunkStream`].
+type InputReader = FastqReader<ChunkReader>;
+
+/// Iterator that reads fixed-size chunks of decompressed bytes from an input reader.
+///
+/// The wrapped reader decompresses lazily as it is read, so running this iterator on a
+/// background (read-ahead) thread keeps gzip inflation off the main thread.  Each chunk ends on
+/// an arbitrary byte boundary; records that span two chunks are stitched back together
+/// downstream by [`ChunkReader`] before `seq_io` parses them.
+struct ByteChunker {
+    /// The decompressing input reader.
+    reader: Box<dyn BufRead + Send>,
+    /// Target size, in bytes, of each emitted chunk.
+    chunk_size: usize,
+    /// Set once the underlying reader is exhausted or has errored.
+    done: bool,
+}
+
+impl Iterator for ByteChunker {
+    type Item = ByteChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        // Fill a fresh buffer as fully as possible; a single `read` on a decompressing reader
+        // often returns less than requested, so loop until full or the input is exhausted.
+        let mut buf = vec![0u8; self.chunk_size];
+        let mut filled = 0;
+        while filled < self.chunk_size {
+            match self.reader.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        if filled == 0 {
+            self.done = true;
+            None
+        } else {
+            buf.truncate(filled);
+            Some(Ok(buf))
+        }
+    }
+}
+
+/// A [`Read`] adapter over a [`ByteChunkStream`] that serves the decompressed bytes received
+/// from the decompression thread.  This is the seam that lets FASTQ parsing run on the consuming
+/// thread while decompression runs upstream.
+struct ChunkReader {
+    /// The stream of decompressed byte chunks from the decompression thread.
+    chunks: ByteChunkStream,
+    /// The chunk currently being served from.
+    current: Vec<u8>,
+    /// Offset of the next unserved byte within `current`.
+    pos: usize,
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pos < self.current.len() {
+                let n = min(buf.len(), self.current.len() - self.pos);
+                buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.chunks.next() {
+                Some(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.pos = 0;
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Ok(0),
+            }
+        }
+    }
+}
 
 /// Struct to hold all the output writers for a single shard
 struct ShardWriters<W: Write> {
@@ -31,20 +119,6 @@ impl<W: Write> ShardWriters<W> {
     /// writers for pooled writers.
     fn into_parts(self) -> (usize, Vec<W>) {
         (self.shard_number, self.writers)
-    }
-
-    /// Writes a set of FASTQ records out.  The number of reads (i.e. `reads.len()`) must
-    /// match the number of individual writers; if a mismatch is found an error will be raised.
-    fn write(&mut self, reads: &[OwnedRecord]) -> Result<()> {
-        if reads.len() != self.writers.len() {
-            return Err(anyhow!("Expected {} reads, got {}", self.writers.len(), reads.len()));
-        }
-
-        for (writer, read) in self.writers.iter_mut().zip(reads.iter()) {
-            read.write(writer)?;
-        }
-
-        Ok(())
     }
 }
 
@@ -106,24 +180,43 @@ pub(crate) struct Shard {
     #[clap(long, short = 't', default_value = "8", value_parser = RangedU64ValueParser::<usize>::new().range(2..))]
     threads: usize,
 
-    /// The level of compression to use to compress outputs.
-    #[clap(long, short = 'c', default_value = "5")]
+    /// The level of compression to use to compress outputs.  Defaults to 1 because sharded FASTQs
+    /// are typically short-lived intermediates, where write throughput matters more than squeezing
+    /// out the last few percent of file size.
+    #[clap(long, short = 'c', default_value = "1")]
     compression_level: u8,
+
+    /// (hidden) Size, in bytes, of each decompressed input chunk passed from a per-input
+    /// decompression thread to the main parsing thread.
+    #[clap(long, hide = true, default_value = "131072",
+           value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
+    chunk_size: usize,
+
+    /// (hidden) Number of decompressed input chunks to keep in flight per input file.
+    #[clap(long, hide = true, default_value = "32",
+           value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
+    chunk_count: usize,
 }
 
 impl Shard {
-    /// Opens a FASTQ reader per input path.  Handles uncompressed and gzipped FASTQ files.
-    fn build_readers(paths: &[PathBuf]) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
+    /// Opens one FASTQ reader per input path, splitting decompression and parsing across threads.
+    ///
+    /// For each input, a background read-ahead thread decompresses the file into fixed-size byte
+    /// chunks (sized by `--chunk-size`, with `--chunk-count` chunks in flight); the returned
+    /// readers parse those bytes into records on the consuming thread.  This keeps gzip inflation
+    /// off the main thread, leaving it free to parse and route records to the compression pool.
+    fn build_record_readers(&self) -> Result<Vec<InputReader>> {
         let fgio = Io::new(5, BUFFER_SIZE);
-        let readers = paths
-            .iter()
-            .map(|p| fgio.new_reader(p))
-            .collect::<Result<Vec<_>, fgoxide::FgError>>()?;
-
-        let fq_readers =
-            readers.into_iter().map(|r| FastqReader::with_capacity(r, BUFFER_SIZE)).collect_vec();
-
-        Ok(fq_readers)
+        let mut readers = Vec::with_capacity(self.inputs.len());
+        for path in &self.inputs {
+            let decompressed = fgio.new_reader(path)?;
+            let chunker =
+                ByteChunker { reader: decompressed, chunk_size: self.chunk_size, done: false };
+            let chunks = chunker.read_ahead(1, self.chunk_count);
+            let chunk_reader = ChunkReader { chunks, current: Vec::new(), pos: 0 };
+            readers.push(FastqReader::with_capacity(chunk_reader, BUFFER_SIZE));
+        }
+        Ok(readers)
     }
 
     /// Builds the fastq writers for each output file and shard, and then instantiates
@@ -176,17 +269,15 @@ impl Shard {
 }
 
 impl Command for Shard {
-    #[allow(clippy::too_many_lines)]
     fn execute(&self) -> Result<()> {
         info!("Reading {} input FASTQs and generating {} shards.", self.inputs.len(), self.shards);
 
-        // Open the input FASTQ files and from each file generate a chunked read-ahead iterator
-        // to ensure that the reading of the input files is not the bottleneck.  We don't count
-        // the read-ahead threads as consuming from the thread-count as they will consume minimal
-        // CPU and are mostly going to be doing/blocking on I/O.
-        let fq_readers = Self::build_readers(&self.inputs)?;
-        let fq_iters = fq_readers.into_iter().map(|r| r.into_records()).collect_vec();
-        let mut fq_iters = fq_iters.into_iter().map(|i| i.read_ahead(128, 48)).collect_vec();
+        // Open one reader per input.  Decompression runs on a background read-ahead thread per
+        // input and hands decompressed byte chunks to these readers, which parse records here on
+        // the main thread.  Keeping inflation off the main thread lets it spend its time parsing
+        // and routing records to keep the compression pool fed.
+        let mut readers = self.build_record_readers()?;
+        let n_inputs = readers.len();
 
         let (mut pool, mut shard_writers) = self.build_writer_pool()?;
 
@@ -199,33 +290,36 @@ impl Command for Shard {
             .level(log::Level::Info)
             .build();
 
-        // Loop, consuming one read from each input file, and writing to the appropriate
-        // shard.  Terminate cleanly when all input iterators are exhausted, or with error
-        // if at least one, but not all input iterators are exhausted.
+        // Loop, consuming one record from each input file and writing the set to the current
+        // shard.  Records are emitted verbatim via `write_unchanged`, which blits the original
+        // record bytes rather than re-serializing field by field.  Terminate cleanly when all
+        // inputs are exhausted together, or with an error if some -- but not all -- run dry.
         let mut target_shard_idx: usize = 0;
-        let mut recs = Vec::with_capacity(fq_iters.len());
         loop {
-            // Pull in the next set of reads
-            recs.clear();
-            for iter in &mut fq_iters {
-                if let Some(rec) = iter.next() {
-                    recs.push(rec?);
+            let target = &mut shard_writers[target_shard_idx];
+            let mut n_written = 0;
+            for (writer, reader) in target.writers.iter_mut().zip(readers.iter_mut()) {
+                match reader.next() {
+                    Some(Ok(record)) => {
+                        record.write_unchanged(&mut *writer)?;
+                        n_written += 1;
+                    }
+                    Some(Err(e)) => return Err(anyhow!("Error reading FASTQ input: {e}")),
+                    None => {}
                 }
             }
 
-            if recs.is_empty() {
+            if n_written == 0 {
                 break;
             }
-
-            if recs.len() != fq_iters.len() {
+            if n_written != n_inputs {
                 return Err(anyhow!(
                     "FASTQ sources out of sync; expected {} records but got {}.",
-                    fq_iters.len(),
-                    recs.len()
+                    n_inputs,
+                    n_written
                 ));
             }
 
-            shard_writers[target_shard_idx].write(&recs)?;
             target_shard_idx = (target_shard_idx + 1) % self.shards;
             logger.record();
         }
@@ -313,6 +407,10 @@ mod tests {
             shards,
             threads: 4,
             compression_level: 1,
+            // Deliberately small so most records straddle chunk boundaries, exercising the
+            // ChunkReader reassembly path across the test suite.
+            chunk_size: 100,
+            chunk_count: 8,
         }
     }
 
@@ -570,6 +668,8 @@ mod tests {
             shards: 2,
             threads: 2,
             compression_level: 1,
+            chunk_size: 64 * 1024,
+            chunk_count: 4,
         };
         sharder.execute().unwrap();
 
@@ -578,5 +678,62 @@ mod tests {
             assert!(path.exists(), "expected output file does not exist: {}", path.display());
             assert_eq!(read_fastq(&path).len(), 3);
         }
+    }
+
+    /// With a pathologically small chunk size, individual records (and the boundaries between
+    /// them) span many decompressed chunks, so the `ChunkReader` must stitch bytes back together
+    /// before the parser sees them.  Every read should still round-trip exactly once.
+    #[test]
+    fn test_tiny_chunk_size_reassembles_records() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 40);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let sharder = Shard {
+            inputs: vec![r1.clone()],
+            output_prefix: prefix.clone(),
+            shard_prefix: "shard".to_string(),
+            read_number_prefix: "read".to_string(),
+            shards: 3,
+            threads: 4,
+            compression_level: 1,
+            chunk_size: 3,
+            chunk_count: 2,
+        };
+        sharder.execute().unwrap();
+
+        let outputs = collect_shard_outputs(&prefix, 1, 3, read_fastq);
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        assert_eq!(all_indices, (1..=40).collect::<Vec<_>>());
+    }
+
+    /// With a chunk size larger than the whole input, every record arrives within a single chunk
+    /// and no cross-chunk reassembly is needed -- the opposite extreme from the tiny-chunk case.
+    #[test]
+    fn test_large_chunk_size_single_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 20);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let sharder = Shard {
+            inputs: vec![r1.clone()],
+            output_prefix: prefix.clone(),
+            shard_prefix: "shard".to_string(),
+            read_number_prefix: "read".to_string(),
+            shards: 2,
+            threads: 2,
+            compression_level: 1,
+            chunk_size: 8 * 1024 * 1024,
+            chunk_count: 4,
+        };
+        sharder.execute().unwrap();
+
+        let outputs = collect_shard_outputs(&prefix, 1, 2, read_fastq);
+        let all_indices: Vec<usize> =
+            outputs.iter().flatten().flatten().map(read_index).sorted().collect();
+        assert_eq!(all_indices, (1..=20).collect::<Vec<_>>());
     }
 }
