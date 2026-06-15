@@ -23,8 +23,8 @@ A toolkit for working with FASTQ files, written in Rust.
 
 [Visit us at Fulcrum Genomics](https://www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with fqtk and beyond.
 
-<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
-<a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
+<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img alt="Email Fulcrum Genomics" src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
+<a href="https://www.fulcrumgenomics.com"><img alt="Visit Fulcrum Genomics" src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
 
 `fqtk` provides several tools for working with FASTQ files:
 
@@ -188,6 +188,19 @@ Options:
           Skip demultiplexing reads for any of the following reasons, otherwise panic.
 
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
+
+      --template-types <TEMPLATE_TYPES>...
+          The read structure types to include in the template FASTQ output files.
+
+          By default, only template (T) segments are included. To include additional segment types (e.g. to preserve UMIs in the output read bases), specify them here. For example, `--template-types M T` will concatenate the molecular barcode and template segments.
+
+          To output the full original reads (all segments), specify all segment types present in your read structure (e.g. `--template-types B M T`).
+
+          Segments are only merged *within the same physical read*: a non-`T` segment is folded into the template bases only when it is co-located with a `T` in the same read structure (e.g. `8M84T`). A segment on a separate read (e.g. a UMI on its own index read) is never merged into a template on another read; route it via `--output-types` instead, or leave it in the read header. When a UMI (M) is included here it is written into the template bases and is therefore omitted from the read header (it is not written in both places).
+
+          Note: If `--template-types` includes any non-`T` type, `T` must be included in `--output-types`; each requested non-`T` type must be co-located with a `T` in every read structure where it appears; and each read structure must contain at most one `T` segment.
+
+          [default: T]
 
   -h, --help
           Print help (see a summary with '-h')
