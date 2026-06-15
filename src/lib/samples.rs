@@ -108,29 +108,29 @@ impl SampleGroup {
     /// the total length of all sample-barcode (`B`) segments per sample must equal the
     /// `barcode` column for that sample (and barcodes are required to be the same length).
     ///
-    /// # Panics
-    ///   - Will panic if sample metadata sheet is improperly formatted.
-    ///   - Will panic if there are duplicate sample names provided.
-    ///   - Will panic if there are duplicate barcodes provided.
-    ///   - Will panic if barcodes don't all have the same length.
-    ///   - Will panic if any sample's per-sample sample-barcode (`B`) segment lengths don't
+    /// # Errors
+    ///   - Will error if no samples are provided.
+    ///   - Will error if there are duplicate sample names provided.
+    ///   - Will error if there are duplicate barcodes provided.
+    ///   - Will error if barcodes don't all have the same length.
+    ///   - Will error if any sample's per-sample sample-barcode (`B`) segment is not fixed length.
+    ///   - Will error if any sample's per-sample sample-barcode (`B`) segment lengths don't
     ///     sum to that sample's `barcode` column length.
-    #[must_use]
-    pub fn from_samples(samples: &[Sample]) -> Self {
-        assert!(!samples.is_empty(), "Must provide one or more sample");
+    pub fn from_samples(samples: &[Sample]) -> Result<Self> {
+        ensure!(!samples.is_empty(), "Must provide one or more sample");
 
-        assert!(
+        ensure!(
             samples.iter().map(|s| &s.sample_id).all_unique(),
             "Each sample name must be unique, duplicate identified"
         );
 
-        assert!(
+        ensure!(
             samples.iter().map(|s| &s.barcode).all_unique(),
             "Each sample barcode must be unique, duplicate identified",
         );
 
         let first_barcode_length = samples[0].barcode.len();
-        assert!(
+        ensure!(
             samples.iter().map(|s| &s.barcode).all(|b| b.len() == first_barcode_length),
             "All barcodes must have the same length",
         );
@@ -139,17 +139,18 @@ impl SampleGroup {
         // the sample's `barcode` column length.  Sample-barcode segments must be fixed-length.
         for sample in samples {
             let Some(rs) = sample.read_structures.as_ref() else { continue };
-            let b_len: usize = rs
-                .iter()
-                .flat_map(|r| r.segments_by_type(SegmentType::SampleBarcode))
-                .map(|seg| {
-                    seg.length.expect(
-                        "sample barcode segments in per-sample read structures must be fixed \
-                         length",
+            let mut b_len: usize = 0;
+            for seg in rs.iter().flat_map(|r| r.segments_by_type(SegmentType::SampleBarcode)) {
+                let len = seg.length.ok_or_else(|| {
+                    anyhow!(
+                        "Sample {}: sample-barcode (B) segments in per-sample read structures \
+                         must be fixed length",
+                        sample.sample_id,
                     )
-                })
-                .sum();
-            assert!(
+                })?;
+                b_len += len;
+            }
+            ensure!(
                 b_len == sample.barcode.len(),
                 "Sample {}: total sample-barcode (B) length across per-sample read structures \
                  is {} but barcode column has {} bases",
@@ -159,7 +160,7 @@ impl SampleGroup {
             );
         }
 
-        Self {
+        Ok(Self {
             samples: samples
                 .iter()
                 .enumerate()
@@ -172,7 +173,7 @@ impl SampleGroup {
                     )
                 })
                 .collect(),
-        }
+        })
     }
 
     /// Attempts to load a [`Self`] object from a tab-delimited file.  The file must have a header
@@ -196,8 +197,8 @@ impl SampleGroup {
     ///   - Will error if `read_structure_<n>` columns are non-contiguous or don't match
     ///     `globals.len()` (when present).
     ///   - Will error if any `read_structure_<n>` cell has a value that fails to parse.
-    /// # Panics
-    ///   - Will panic if [`SampleGroup::from_samples`] panics on the parsed records.
+    ///   - Will error if [`SampleGroup::from_samples`] rejects the parsed records (e.g. duplicate
+    ///     names/barcodes, inconsistent barcode lengths, or barcode/`B`-segment length mismatch).
     pub fn from_file<P: AsRef<Path>>(path: P, globals: &[ReadStructure]) -> Result<SampleGroup> {
         let path = path.as_ref();
         let io = Io::default();
@@ -283,7 +284,7 @@ impl SampleGroup {
         if samples.is_empty() {
             bail!("sample metadata file {path:?} contained no sample rows");
         }
-        Ok(Self::from_samples(&samples))
+        Self::from_samples(&samples)
     }
 
     /// Returns true if this group has per-sample read structures (i.e. at least one sample
@@ -317,8 +318,21 @@ impl SampleGroup {
                 n,
             );
             for (i, rs) in rs_for_sample.iter().enumerate() {
-                let plen = pre_template_fixed_len(rs)
-                    .with_context(|| format!("sample {} input {}", sample.sample_id, i + 1))?;
+                let plen = pre_template_fixed_len(rs).with_context(|| {
+                    let source = if sample.read_structures.is_some() {
+                        format!("sample {}'s `read_structure_{}`", sample.sample_id, i + 1)
+                    } else {
+                        format!(
+                            "the `--read-structures` fallback for sample {} (input {})",
+                            sample.sample_id,
+                            i + 1,
+                        )
+                    };
+                    format!(
+                        "per-sample demultiplexing requires a fixed-length matching window, so \
+                         every segment before the template in {source} must have a fixed length"
+                    )
+                })?;
                 if plen > maxes[i] {
                     maxes[i] = plen;
                 }
@@ -360,6 +374,50 @@ impl SampleGroup {
                 rs_for_sample.len(),
                 prefix_lens.len(),
             );
+
+            // All sample-barcode (B) segments must precede the template (T): a B positioned after
+            // the template falls outside the matching window and can never be used to assign the
+            // read, so reject it explicitly rather than failing later with a confusing count.
+            for (input_idx, rs) in rs_for_sample.iter().enumerate() {
+                let total_b = rs.segments_by_type(SegmentType::SampleBarcode).count();
+                let b_before_template = rs
+                    .iter()
+                    .take_while(|seg| seg.kind != SegmentType::Template)
+                    .filter(|seg| seg.kind == SegmentType::SampleBarcode)
+                    .count();
+                ensure!(
+                    total_b == b_before_template,
+                    "sample {}: all sample-barcode (B) segments must precede the template (T) in \
+                     read structure {} (input {})",
+                    sample.sample_id,
+                    rs,
+                    input_idx + 1,
+                );
+            }
+
+            // The effective read structures' total sample-barcode (B) length must equal the
+            // barcode column length.  This also validates global-only samples in mixed mode, whose
+            // effective structure is the `--read-structures` fallback (a case `from_samples` cannot
+            // check because it has no access to the global structures).
+            let expected_barcode_len: usize = rs_for_sample
+                .iter()
+                .flat_map(|rs| rs.segments_by_type(SegmentType::SampleBarcode))
+                .map(|seg| seg.length.unwrap_or(0))
+                .sum();
+            ensure!(
+                expected_barcode_len == sample.barcode.len(),
+                "sample {}: {}read structure(s) declare {} sample-barcode (B) base(s) but the \
+                 barcode column has {} base(s)",
+                sample.sample_id,
+                if sample.read_structures.is_none() {
+                    "(using --read-structures fallback) "
+                } else {
+                    ""
+                },
+                expected_barcode_len,
+                sample.barcode.len(),
+            );
+
             let mut pattern = Vec::with_capacity(total_len);
             let mut barcode_cursor = 0usize;
             let barcode_bytes = sample.barcode.as_bytes();
@@ -619,6 +677,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reading_from_file_with_duplicate_barcodes_errors() {
+        // A malformed user TSV (duplicate barcodes) must return a clean error, not panic.
+        let lines = vec!["sample_id\tbarcode", "sample1\tGATTACA", "sample2\tGATTACA"];
+        let tempdir = TempDir::new().unwrap();
+        let f1 = tempdir.path().join("sample_metadata.tsv");
+
+        let io = Io::default();
+        io.write_lines(&f1, &lines).unwrap();
+        let err = SampleGroup::from_file(&f1, &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Each sample barcode must be unique"), "got: {msg}");
+    }
+
+    #[test]
     fn test_reading_non_existent_file() {
         let tempdir = TempDir::new().unwrap();
         let f1 = tempdir.path().join("sample_metadata.tsv");
@@ -671,7 +743,7 @@ mod tests {
     fn test_from_samples_sample_group_pass1_single_sample() {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let samples_vec = vec![sample1.clone()];
-        let sample_group = SampleGroup::from_samples(&samples_vec);
+        let sample_group = SampleGroup::from_samples(&samples_vec).unwrap();
 
         assert_eq!(sample_group, SampleGroup { samples: vec![sample1] });
     }
@@ -681,7 +753,7 @@ mod tests {
         let sample1 = Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned());
         let sample2 = Sample::new(1, "sample_2".to_owned(), "CATGGAT".to_owned());
         let samples_vec = vec![sample1.clone(), sample2.clone()];
-        let sample_group = SampleGroup::from_samples(&samples_vec);
+        let sample_group = SampleGroup::from_samples(&samples_vec).unwrap();
 
         assert_eq!(sample_group, SampleGroup { samples: vec![sample1, sample2] });
     }
@@ -692,49 +764,55 @@ mod tests {
         let sample2_before = Sample::new(2, "sample_2".to_owned(), "CATGGAT".to_owned());
         let sample2_after = Sample::new(1, "sample_2".to_owned(), "CATGGAT".to_owned());
         let samples_vec = vec![sample1.clone(), sample2_before];
-        let sample_group = SampleGroup::from_samples(&samples_vec);
+        let sample_group = SampleGroup::from_samples(&samples_vec).unwrap();
 
         assert_eq!(sample_group, SampleGroup { samples: vec![sample1, sample2_after] });
     }
 
     // ############################################################################################
-    // Test [`SampleGroup::from_samples`] - expected to panic
+    // Test [`SampleGroup::from_samples`] - expected to error
     // ############################################################################################
     #[test]
-    #[should_panic(expected = "Must provide one or more sample")]
     fn test_from_samples_sample_group_fail1_no_samples() {
         let samples = vec![];
-        let _sample_group = SampleGroup::from_samples(&samples);
+        let err = SampleGroup::from_samples(&samples).unwrap_err();
+        assert!(err.to_string().contains("Must provide one or more sample"), "got: {err:#}");
     }
 
     #[test]
-    #[should_panic(expected = "Each sample name must be unique, duplicate identified")]
-    fn test_from_samples_sample_group_fail2_duplicate_barcodes() {
+    fn test_from_samples_sample_group_fail2_duplicate_sample_names() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_1".to_owned(), "CATGGAT".to_owned()),
         ];
-        let _sample_group = SampleGroup::from_samples(&samples);
+        let err = SampleGroup::from_samples(&samples).unwrap_err();
+        assert!(
+            err.to_string().contains("Each sample name must be unique, duplicate identified"),
+            "got: {err:#}",
+        );
     }
 
     #[test]
-    #[should_panic(expected = "Each sample barcode must be unique, duplicate identified")]
-    fn test_from_samples_sample_group_fail3_duplicate_sample_names() {
+    fn test_from_samples_sample_group_fail3_duplicate_barcodes() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "GATTACA".to_owned()),
         ];
-        let _sample_group = SampleGroup::from_samples(&samples);
+        let err = SampleGroup::from_samples(&samples).unwrap_err();
+        assert!(
+            err.to_string().contains("Each sample barcode must be unique, duplicate identified"),
+            "got: {err:#}",
+        );
     }
 
     #[test]
-    #[should_panic(expected = "All barcodes must have the same length")]
     fn test_from_samples_sample_group_fail4_barcodes_of_different_lengths() {
         let samples = vec![
             Sample::new(0, "sample_1".to_owned(), "GATTACA".to_owned()),
             Sample::new(0, "sample_2".to_owned(), "CATGGA".to_owned()),
         ];
-        let _sample_group = SampleGroup::from_samples(&samples);
+        let err = SampleGroup::from_samples(&samples).unwrap_err();
+        assert!(err.to_string().contains("All barcodes must have the same length"), "got: {err:#}");
     }
 
     // ############################################################################################
@@ -781,7 +859,7 @@ mod tests {
         // S1 has one B-segment of length 14; S2 has two B-segments (7+7) of total length 14.
         let s1 = sample_with_rs("S1", "GATTACAACGTACG", &["3M14B+T"]);
         let s2 = sample_with_rs("S2", "TTTTTTTGGGGGGG", &["3M7B7B+T"]);
-        let group = SampleGroup::from_samples(&[s1, s2]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
         assert!(group.has_per_sample_read_structures());
     }
 
@@ -790,18 +868,18 @@ mod tests {
     fn test_per_sample_read_structures_mixed_with_global_only_samples() {
         let s1 = sample_with_rs("S1", "GATTACA", &["3M7B1S+T"]);
         let s2 = Sample::new(0, "S2".to_owned(), "CCCCCCC".to_owned());
-        let group = SampleGroup::from_samples(&[s1, s2]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
         assert!(group.has_per_sample_read_structures());
         assert!(group.samples[0].read_structures.is_some());
         assert!(group.samples[1].read_structures.is_none());
     }
 
     #[test]
-    #[should_panic(expected = "barcode column has")]
     fn test_per_sample_read_structures_barcode_length_mismatch() {
         // S1 declares 7B + 7B = 14 bases of barcode but provides only 7 in the column.
         let s1 = sample_with_rs("S1", "GATTACA", &["3M7B1S+T", "3M7B1S+T"]);
-        let _ = SampleGroup::from_samples(&[s1]);
+        let err = SampleGroup::from_samples(&[s1]).unwrap_err();
+        assert!(err.to_string().contains("barcode column has"), "got: {err:#}");
     }
 
     #[test]
@@ -809,7 +887,7 @@ mod tests {
         // S1 prefix per input: 3+7+1 = 11; S2 prefix: 3+1+7+1 = 12
         let s1 = sample_with_rs("S1", "GATTACA", &["3M7B1S+T"]);
         let s2 = sample_with_rs("S2", "GGGGGGG", &["3M1S7B1S+T"]);
-        let group = SampleGroup::from_samples(&[s1, s2]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
         let defaults = vec![make_rs("3M9B+T")];
         let lens = group.matching_prefix_lens(&defaults).unwrap();
         assert_eq!(lens, vec![12]);
@@ -819,7 +897,7 @@ mod tests {
     fn test_build_matching_patterns_codec_two_samples() {
         let s1 = sample_with_rs("S1", "GATTACA", &["3M7B1S+T"]);
         let s2 = sample_with_rs("S2", "GGGGGGG", &["3M1S7B1S+T"]);
-        let group = SampleGroup::from_samples(&[s1, s2]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
         let defaults = vec![make_rs("3M9B+T")];
         let lens = group.matching_prefix_lens(&defaults).unwrap();
         let patterns = group.build_matching_patterns(&defaults, &lens).unwrap();
@@ -833,7 +911,7 @@ mod tests {
     #[test]
     fn test_build_matching_patterns_falls_back_to_defaults_when_no_per_sample() {
         let s1 = Sample::new(0, "S1".to_owned(), "GATTACA".to_owned());
-        let group = SampleGroup::from_samples(&[s1]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
         let defaults = vec![make_rs("3M7B1S+T")];
         let lens = group.matching_prefix_lens(&defaults).unwrap();
         assert_eq!(lens, vec![11]);
@@ -847,7 +925,7 @@ mod tests {
         // two B-segments left-to-right across inputs.
         let s1 = sample_with_rs("S1", "GATTACAACGTACG", &["3M7B1S+T", "7B+T"]);
         let s2 = sample_with_rs("S2", "GGGGGGGTTTTTTT", &["3M1S7B1S+T", "1S7B+T"]);
-        let group = SampleGroup::from_samples(&[s1, s2]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
         let defaults = vec![make_rs("3M9B+T"), make_rs("9B+T")];
         let lens = group.matching_prefix_lens(&defaults).unwrap();
         // Input 1: max(11, 12) = 12; Input 2: max(7, 8) = 8.
@@ -867,7 +945,7 @@ mod tests {
     #[test]
     fn test_build_matching_patterns_b_segment_crossing_window_errors() {
         let s1 = sample_with_rs("S1", "GATTACA", &["3M7B1S+T"]);
-        let group = SampleGroup::from_samples(&[s1]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
         let defaults = vec![make_rs("3M7B1S+T")];
         let lens = vec![5usize]; // forced narrow window for the test
         let err = group.build_matching_patterns(&defaults, &lens).unwrap_err();
@@ -877,7 +955,7 @@ mod tests {
 
     /// A `SampleGroup` constructed directly (bypassing `from_samples`' barcode-length
     /// validation) whose barcode is shorter than its read structure's sample-barcode
-    /// segments surfaces a clean error rather than panicking on an out-of-bounds slice.
+    /// segments surfaces a clean error naming the declared vs. provided barcode lengths.
     #[test]
     fn test_build_matching_patterns_barcode_shorter_than_b_segments_errors() {
         // `3M7B1S+T` requires 7 barcode bases, but the barcode column only has 3.
@@ -887,7 +965,52 @@ mod tests {
         let lens = vec![11usize];
         let err = group.build_matching_patterns(&defaults, &lens).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("shorter than the total sample-barcode length"), "got: {msg}");
+        assert!(
+            msg.contains("declare 7 sample-barcode (B) base(s) but the barcode column has 3"),
+            "got: {msg}",
+        );
+    }
+
+    /// A sample-barcode (B) segment positioned after the template is rejected with a clear
+    /// message rather than the cryptic "only consumed N of M barcode bases".
+    #[test]
+    fn test_build_matching_patterns_barcode_after_template_errors() {
+        // 4B10T8B: barcode segments straddle the template; the trailing 8B can never match.
+        let s1 = sample_with_rs("S1", "ACGTACGTACGT", &["4B10T8B"]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        let defaults = vec![make_rs("4B10T8B")];
+        let lens = group.matching_prefix_lens(&defaults).unwrap();
+        let err = group.build_matching_patterns(&defaults, &lens).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("must precede the template"), "got: {msg}");
+    }
+
+    /// A global-only sample (mixed mode) whose barcode length doesn't match the global
+    /// `--read-structures` B-length is rejected with a message pointing at the fallback.
+    #[test]
+    fn test_build_matching_patterns_global_only_barcode_mismatch_errors() {
+        // S1 (per-sample 6B) and S2 (global-only) both have 6-base barcodes, but the global
+        // structure declares 7 B bases, so S2's effective structure doesn't match its barcode.
+        let s1 = sample_with_rs("S1", "GATTAC", &["3M6B1S+T"]);
+        let s2 = Sample::new(0, "S2".to_owned(), "CCCCCC".to_owned());
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
+        let defaults = vec![make_rs("3M7B1S+T")];
+        let lens = group.matching_prefix_lens(&defaults).unwrap();
+        let err = group.build_matching_patterns(&defaults, &lens).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--read-structures fallback") && msg.contains("S2"), "got: {msg}",);
+    }
+
+    /// In per-sample mode every input's pre-template segments must be fixed length; a variable
+    /// pre-template segment yields a message explaining the fixed-window requirement.
+    #[test]
+    fn test_matching_prefix_lens_variable_pre_template_errors() {
+        let s1 = sample_with_rs("S1", "ACGTACGT", &["8B+M"]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        let defaults = vec![make_rs("8B+M")];
+        let err = group.matching_prefix_lens(&defaults).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("fixed-length matching window"), "got: {msg}");
     }
 
     // ############################################################################################
@@ -999,7 +1122,7 @@ mod tests {
     fn test_matching_prefix_lens_errors_on_rs_count_mismatch() {
         // Sample declares two read structures; defaults provide only one.
         let s1 = sample_with_rs("S1", "GATTACAGGGGGGG", &["3M7B1S+T", "7B+T"]);
-        let group = SampleGroup::from_samples(&[s1]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
         let defaults = vec![make_rs("3M7B+T")];
         let err = group.matching_prefix_lens(&defaults).unwrap_err();
         let msg = format!("{err:#}");

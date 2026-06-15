@@ -97,14 +97,10 @@ enum ResegmentError {
     Other(anyhow::Error),
 }
 
-impl ResegmentError {
-    /// Consumes the error and returns the underlying [`anyhow::Error`].
-    fn into_inner(self) -> anyhow::Error {
-        match self {
-            ResegmentError::TooShort(e) | ResegmentError::Other(e) => e,
-        }
-    }
-}
+/// Hint appended to a too-short-read abort, pointing the user at the flag that converts the
+/// abort into a counted skip.
+const TOO_FEW_BASES_HINT: &str =
+    "pass `--skip-reasons too-few-bases` to skip reads that are too short instead of aborting";
 
 /// One unit of FASTQ records separated into their component read segments.
 #[derive(PartialEq, Debug, Clone)]
@@ -227,6 +223,19 @@ impl ReadSet {
                         });
                     }
                 };
+                // A variable-length template (`+T`) extracts to zero bases when the read ends
+                // exactly at the template's start.  The read-structure crate returns `Ok(empty)`
+                // rather than a length error, but emitting a zero-length FASTQ record is invalid,
+                // so treat such a read as too short (consistent with a genuinely truncated read).
+                if seg.kind == SegmentType::Template && s.is_empty() {
+                    return Err(ResegmentError::TooShort(anyhow!(
+                        "Read structure ({}) produced a zero-length template for FASTQ record {} \
+                         (len: {})",
+                        rs,
+                        String::from_utf8_lossy(&self.header),
+                        raw.bases.len(),
+                    )));
+                }
                 segments.push(FastqSegment {
                     seq: s.to_vec(),
                     quals: q.to_vec(),
@@ -1449,7 +1458,10 @@ impl Command for Demux {
                         Err(ResegmentError::TooShort(_)) if allow_too_few => {
                             *skip_reasons.entry(SkipReason::TooFewBases).or_insert(0) += 1;
                         }
-                        Err(e) => return Err(e.into_inner()),
+                        Err(ResegmentError::TooShort(e)) => {
+                            return Err(e.context(TOO_FEW_BASES_HINT));
+                        }
+                        Err(ResegmentError::Other(e)) => return Err(e),
                     }
                 } else {
                     sample_writers[matched_idx].write(&read_set, &template_output)?;
@@ -1457,18 +1469,19 @@ impl Command for Demux {
                 }
             } else if per_sample_rs {
                 // Iterator gating in per-sample mode is loosened to the matching prefix length,
-                // so a read can satisfy the prefix gate while being too short for the global
-                // read structure.  Treat such reads as `TooFewBases` skips on the unmatched
-                // path regardless of `--skip-reasons` — legacy mode would have rejected them at
-                // the iterator and per-sample mode opts the user into heterogeneous lengths.
+                // so a read can clear the prefix gate while being too short for the global read
+                // structure used on the unmatched path.  Honor `--skip-reasons too-few-bases`
+                // exactly as the matched and legacy paths do: skip when requested, otherwise
+                // abort with a remedy hint.
                 match read_set.resegment(&self.read_structures) {
                     Ok(resegmented) => {
                         sample_writers[unmatched_index].write(&resegmented, &template_output)?;
                         unmatched_metric.templates += 1;
                     }
-                    Err(ResegmentError::TooShort(_)) => {
+                    Err(ResegmentError::TooShort(_)) if allow_too_few => {
                         *skip_reasons.entry(SkipReason::TooFewBases).or_insert(0) += 1;
                     }
+                    Err(ResegmentError::TooShort(e)) => return Err(e.context(TOO_FEW_BASES_HINT)),
                     Err(ResegmentError::Other(e)) => return Err(e),
                 }
             } else {
@@ -3513,13 +3526,18 @@ mod tests {
         let s2_r1_reads = read_fastq(&output_dir.join("S2.R1.fq.gz"));
         let s2_r2_reads = read_fastq(&output_dir.join("S2.R2.fq.gz"));
         let s2_b1_reads = read_fastq(&output_dir.join("S2.I1.fq.gz"));
+        let s2_b2_reads = read_fastq(&output_dir.join("S2.I2.fq.gz"));
         let s2_m1_reads = read_fastq(&output_dir.join("S2.U1.fq.gz"));
+        let s2_m2_reads = read_fastq(&output_dir.join("S2.U2.fq.gz"));
 
         assert_eq!(s2_r1_reads.len(), 1, "S2 R1 should have one read");
         assert_eq!(s2_r1_reads[0].seq, s2_template_r1.as_bytes());
         assert_eq!(s2_r2_reads[0].seq, s2_template_r2.as_bytes());
         assert_eq!(s2_b1_reads[0].seq, b"TTTTTTT");
+        // Second input's barcode/UMI must also be resegmented per the staggered structure.
+        assert_eq!(s2_b2_reads[0].seq, b"TTTTTTT");
         assert_eq!(s2_m1_reads[0].seq, b"GGG");
+        assert_eq!(s2_m2_reads[0].seq, b"TTT");
 
         // The unmatched outputs (using globals `+T +T`) only have R*.fq.gz files.  All reads
         // matched, so they should be empty.
@@ -3527,6 +3545,61 @@ mod tests {
         let unmatched_r2 = read_fastq(&output_dir.join("unmatched.R2.fq.gz"));
         assert!(unmatched_r1.is_empty(), "unmatched R1 should be empty");
         assert!(unmatched_r2.is_empty(), "unmatched R2 should be empty");
+    }
+
+    /// End-to-end single-input CODEC-style test with two samples at different staggers (the most
+    /// common inline-index layout).  Exercises heterogeneous per-sample prefix lengths within a
+    /// single input and verifies that the shorter-stagger sample's template is not haircut to the
+    /// longer matching window.
+    #[test]
+    fn test_demux_codec_per_sample_single_input() {
+        let tmp = TempDir::new().unwrap();
+        // Global is only used for unmatched reads.
+        let read_structures = vec![ReadStructure::from_str("+T").unwrap()];
+
+        let s1_template = "A".repeat(30);
+        let s2_template = "C".repeat(30);
+        // S1, no stagger:  NNN GATTACA T <template>          (pre-template = 11)
+        let s1_r1 = format!("AAA{}T{}", "GATTACA", s1_template);
+        // S2, 1bp stagger: NNN A TTTTTTT T <template>        (pre-template = 12)
+        let s2_r1 = format!("GGGA{}T{}", "TTTTTTT", s2_template);
+        let r1_file = fastq_file(&tmp, "r1", "ex", &[s1_r1.as_str(), s2_r1.as_str()]);
+
+        let sample_metadata = metadata_file_with_rs(
+            &tmp,
+            &[("S1", "GATTACA", &["3M7B1S+T"]), ("S2", "TTTTTTT", &["3M1S7B1S+T"])],
+        );
+
+        let output_dir = tmp.path().join("output");
+        let demux_inputs = Demux {
+            inputs: vec![r1_file],
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B', 'M'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+        };
+        demux_inputs.execute().unwrap();
+
+        // S1 (shorter stagger): template must start at offset 11, not the 12-base window.
+        let s1_r1_reads = read_fastq(&output_dir.join("S1.R1.fq.gz"));
+        assert_eq!(s1_r1_reads.len(), 1, "S1 should have one read");
+        assert_eq!(s1_r1_reads[0].seq, s1_template.as_bytes(), "S1 template must not be haircut");
+        assert_eq!(read_fastq(&output_dir.join("S1.I1.fq.gz"))[0].seq, b"GATTACA");
+        assert_eq!(read_fastq(&output_dir.join("S1.U1.fq.gz"))[0].seq, b"AAA");
+
+        // S2 (longer stagger): template starts at offset 12.
+        let s2_r1_reads = read_fastq(&output_dir.join("S2.R1.fq.gz"));
+        assert_eq!(s2_r1_reads.len(), 1, "S2 should have one read");
+        assert_eq!(s2_r1_reads[0].seq, s2_template.as_bytes());
+        assert_eq!(read_fastq(&output_dir.join("S2.I1.fq.gz"))[0].seq, b"TTTTTTT");
+        assert_eq!(read_fastq(&output_dir.join("S2.U1.fq.gz"))[0].seq, b"GGG");
     }
 
     /// Ensures that when no per-sample read structures are present, behaviour is identical
@@ -3638,28 +3711,123 @@ mod tests {
         // are no unmatched records.
     }
 
-    /// Regression: in per-sample mode the iterator gates on the per-sample matching prefix,
-    /// which can be shorter than the global `--read-structures` minimum.  A read that satisfies
-    /// the prefix gate but does not match any sample reaches the unmatched branch where
-    /// resegmentation against the global structure would fail on length.  The run must not
-    /// abort; the read must be counted as a `TooFewBases` skip independently of `--skip-reasons`.
-    #[test]
-    fn test_demux_per_sample_unmatched_short_read_does_not_abort() {
-        let tmp = TempDir::new().unwrap();
-        // Global is 8B+T per input (min_len 9); sample S1 has 3B+T per input (prefix 3).
+    /// Builds a per-sample demux scenario in which a read clears the (loosened) per-sample
+    /// prefix gate, matches no sample, and is too short for the global `--read-structures` when
+    /// resegmented on the unmatched path.  `skip_reasons` is supplied by the caller.
+    fn unmatched_short_read_demux(tmp: &TempDir, skip_reasons: Vec<SkipReason>) -> Demux {
+        // Global is 8B+T per input; sample S1 has 3B+T per input (prefix 3).
         let read_structures = vec![
             ReadStructure::from_str("8B+T").unwrap(),
             ReadStructure::from_str("8B+T").unwrap(),
         ];
-        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "AAAAAA", &["3B+T", "3B+T"])]);
+        let sample_metadata = metadata_file_with_rs(tmp, &[("S1", "AAAAAA", &["3B+T", "3B+T"])]);
         // 3-byte reads per input that don't match S1's "AAA"+"AAA" matching pattern.
-        let r1_file = fastq_file(&tmp, "r1", "ex", &["TTT"]);
-        let r2_file = fastq_file(&tmp, "r2", "ex", &["TTT"]);
+        let r1_file = fastq_file(tmp, "r1", "ex", &["TTT"]);
+        let r2_file = fastq_file(tmp, "r2", "ex", &["TTT"]);
+
+        Demux {
+            inputs: vec![r1_file, r2_file],
+            read_structures,
+            sample_metadata,
+            output_types: vec!['T', 'B'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons,
+            template_types: vec!['T'],
+        }
+    }
+
+    /// In per-sample mode the iterator gates on the per-sample matching prefix, which can be
+    /// shorter than the global `--read-structures` minimum.  A read that clears the prefix gate
+    /// but matches no sample reaches the unmatched branch, where resegmentation against the
+    /// global structure fails on length.  Without `--skip-reasons too-few-bases` this is fatal
+    /// (consistent with the matched and legacy paths) and the error names the remedy.
+    #[test]
+    fn test_demux_per_sample_unmatched_short_read_aborts_without_flag() {
+        let tmp = TempDir::new().unwrap();
+        let demux_inputs = unmatched_short_read_demux(&tmp, vec![]);
+        let err = demux_inputs.execute().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--skip-reasons too-few-bases"), "got: {msg}");
+    }
+
+    /// With `--skip-reasons too-few-bases`, the same too-short unmatched read is counted as a
+    /// skip rather than aborting, and the run completes with no reads demultiplexed.
+    #[test]
+    fn test_demux_per_sample_unmatched_short_read_skipped_with_flag() {
+        let tmp = TempDir::new().unwrap();
+        let demux_inputs = unmatched_short_read_demux(&tmp, vec![SkipReason::TooFewBases]);
+        let output_dir = demux_inputs.output.clone();
+        demux_inputs.execute().unwrap();
+
+        let metrics_path = output_dir.join("demux-metrics.txt");
+        let metrics: Vec<DemuxMetric> = DelimFile::default().read_tsv(&metrics_path).unwrap();
+        let demuxed: usize = metrics.iter().map(|m| m.templates).sum();
+        assert_eq!(demuxed, 0, "no reads should be demuxed; the unmatched read is too short");
+    }
+
+    /// A read whose bases end exactly at the start of a variable-length template (`+T`) has zero
+    /// template bases.  The underlying read-structure crate returns an empty slice (not an error)
+    /// for the trailing `+T`, so without an explicit guard `resegment` would emit a zero-length
+    /// FASTQ record.  Such a read must instead be treated as `TooShort`.
+    #[test]
+    fn test_resegment_zero_length_template_is_too_short() {
+        let read_set = ReadSet {
+            header: b"ex".to_vec(),
+            segments: vec![],
+            raw_per_input: vec![RawInput {
+                bases: b"ACGTACGT".to_vec(),
+                quals: b"FFFFFFFF".to_vec(),
+            }],
+            skip_reason: None,
+        };
+        // 8B consumes all 8 bases, leaving the `+T` template with zero bases.
+        let read_structures = vec![ReadStructure::from_str("8B+T").unwrap()];
+        let result = read_set.resegment(&read_structures);
+        assert!(
+            matches!(result, Err(ResegmentError::TooShort(_))),
+            "expected TooShort for a read with no template bases, got {result:?}",
+        );
+    }
+
+    /// A variable-length template with at least one base resegments normally (guards against the
+    /// zero-length fix over-rejecting non-empty templates).
+    #[test]
+    fn test_resegment_one_base_template_is_ok() {
+        let read_set = ReadSet {
+            header: b"ex".to_vec(),
+            segments: vec![],
+            raw_per_input: vec![RawInput {
+                bases: b"ACGTACGTT".to_vec(),
+                quals: b"FFFFFFFFF".to_vec(),
+            }],
+            skip_reason: None,
+        };
+        // 8B consumes 8 bases, leaving a single `T` base for the template.
+        let read_structures = vec![ReadStructure::from_str("8B+T").unwrap()];
+        let resegmented = read_set.resegment(&read_structures).expect("should resegment");
+        let template: Vec<u8> =
+            resegmented.template_segments().flat_map(|s| s.seq.clone()).collect();
+        assert_eq!(template, b"T");
+    }
+
+    /// End-to-end: a matched per-sample read whose bases end exactly at the template start must be
+    /// counted as a `TooFewBases` skip, not written as a zero-length template record.
+    #[test]
+    fn test_demux_per_sample_zero_length_template_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        // Per-sample RS 8B+T (prefix 8); the read is exactly 8 bases (barcode only, no template).
+        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "ACGTACGT", &["8B+T"])]);
+        let r1_file = fastq_file(&tmp, "r1", "ex", &["ACGTACGT"]);
 
         let output_dir = tmp.path().join("output");
         let demux_inputs = Demux {
-            inputs: vec![r1_file, r2_file],
-            read_structures,
+            inputs: vec![r1_file],
+            read_structures: vec![ReadStructure::from_str("8B+T").unwrap()],
             sample_metadata,
             output_types: vec!['T', 'B'],
             output: output_dir.clone(),
@@ -3668,15 +3836,19 @@ mod tests {
             min_mismatch_delta: 2,
             threads: 5,
             compression_level: 5,
-            // Critically NOT requesting too-few-bases skip; legacy resegment path would abort.
-            skip_reasons: vec![],
+            // Tolerate the too-short read so the matched path skips rather than aborts.
+            skip_reasons: vec![SkipReason::TooFewBases],
             template_types: vec!['T'],
         };
         demux_inputs.execute().unwrap();
 
+        // No template record should have been written for S1 (no zero-length record).
+        let s1_r1 = read_fastq(&output_dir.join("S1.R1.fq.gz"));
+        assert!(s1_r1.is_empty(), "no zero-length template record should be written");
+
         let metrics_path = output_dir.join("demux-metrics.txt");
         let metrics: Vec<DemuxMetric> = DelimFile::default().read_tsv(&metrics_path).unwrap();
         let demuxed: usize = metrics.iter().map(|m| m.templates).sum();
-        assert_eq!(demuxed, 0, "no reads should be demuxed; the unmatched read is too short");
+        assert_eq!(demuxed, 0, "the boundary read must be skipped, not demuxed");
     }
 }
