@@ -1,0 +1,12 @@
+[workspace]
+# path of the git-cliff configuration
+changelog_config = "cliff.toml"
+# update dependencies with `cargo update`
+dependencies_update = true
+# labels for the release PR
+pr_labels = ["release"]
+# disable git releases (handled by the publish workflow's "Create GitHub release" step)
+git_release_enable = false
+# disable running `cargo-semver-checks` for now; enable after verifying
+# semver compatibility against the current crates.io release
+semver_check = false

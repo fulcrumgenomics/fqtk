@@ -446,68 +446,33 @@ Note that `./ci/check.sh` only checks formatting; to auto-fix formatting issues,
 
 ## Releasing a New Version
 
-### Pre-requisites
-
-Install [`cargo-release`][cargo-release-link]
-
-```console
-cargo install cargo-release
-```
-
-### Prior to Any Release
-
-Create a release that will not try to push to `crates.io` and verify the command:
-
-```console
-cargo release [major,minor,patch,release,rc...] --no-publish
-```
-
-Note: "dry-run" is the default for cargo release.
-
-See the [`cargo-release` reference documentation][cargo-release-docs-link] for more information
+Releases are automated with [`release-plz`][release-plz-link], driven by the
+[`.github/workflows/release.yml`](.github/workflows/release.yml) workflow that runs on every push to `main`.
 
 ### Semantic Versioning
 
-This tool follows [Semantic Versioning](https://semver.org/).  In brief:
+This tool follows [Semantic Versioning](https://semver.org/):
 
 * MAJOR version when you make incompatible API changes,
-* MINOR version when you add functionality in a backwards compatible manner, and
-* PATCH version when you make backwards compatible bug fixes.
+* MINOR version when you add functionality in a backwards-compatible manner, and
+* PATCH version when you make backwards-compatible bug fixes.
 
-### Major Release
+`release-plz` derives the next version automatically from the [Conventional Commits][conventional-commits-link] merged since the last release.
 
-To create a major release:
+### Release Flow
 
-```console
-cargo release major --execute
-```
+1. As commits land on `main`, `release-plz` opens (or updates) a **release PR** labelled `release`. This PR bumps the version in `Cargo.toml`, refreshes `Cargo.lock`, and updates `CHANGELOG.md` (rendered via [`cliff.toml`](cliff.toml)).
+2. Review the release PR. Adjust the version bump if needed by amending commit messages or the changelog, then merge it.
+3. Merging the release PR re-triggers the workflow. The `publish` job detects the new version, runs `cargo publish` to push the crate to [crates.io](https://crates.io/crates/fqtk), and creates the matching `vX.Y.Z` git tag and GitHub release.
 
-This will remove any pre-release extension, create a new tag and push it to github, and push the release to creates.io.
+The publish job is idempotent: if the version in `Cargo.toml` has already been published to crates.io, it skips publishing, and tag/release creation is skipped if they already exist.
 
-Upon success, move the version to the [next candidate release](#release-candidate).
+### Pre-requisites (maintainers)
 
-Finally, make sure to [create a new release][new-release-link] on GitHub.
+The workflow requires two repository secrets:
 
-### Minor and Patch Release
+* `RELEASE_PLZ_TOKEN` — a token (PAT or GitHub App token) with `contents: write` and `pull-requests: write` so `release-plz` can open release PRs and push tags.
+* `CARGO_REGISTRY_TOKEN` — a [crates.io API token](https://crates.io/settings/tokens) used by `cargo publish`.
 
-To create a _minor_ (_patch_) release, follow the [Major Release](#major-release) instructions substituting `major` with `minor` (`patch`):
-
-```console
-cargo release minor --execute
-```
-
-### Release Candidate
-
-To move to the next release candidate:
-
-```console
-cargo release rc --no-tag --no-publish --execute
-```
-
-This will create or bump the pre-release version and push the changes to the main branch on github.
-This will not tag and publish the release candidate.
-If you would like to tag the release candidate on github, remove `--no-tag` to create a new tag and push it to github.
-
-[cargo-release-link]:      https://github.com/crate-ci/cargo-release
-[cargo-release-docs-link]: https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
-[new-release-link]:        https://github.com/fulcrumgenomics/fqtk/releases/new
+[release-plz-link]:         https://release-plz.dev
+[conventional-commits-link]: https://www.conventionalcommits.org

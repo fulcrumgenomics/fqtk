@@ -217,7 +217,7 @@ GitHub Actions will verify that the README remains up-to-date, and commits with 
 
 ## Release Process
 
-Releases are managed by the maintainers using [`cargo-release`](https://github.com/crate-ci/cargo-release).
+Releases are automated by the maintainers using [`release-plz`](https://release-plz.dev), which opens a release PR and publishes to [crates.io](https://crates.io/crates/fqtk) when that PR is merged.
 
 This project follows [Semantic Versioning](https://semver.org/):
 
@@ -225,7 +225,9 @@ This project follows [Semantic Versioning](https://semver.org/):
 - **MINOR** version for backwards-compatible new functionality
 - **PATCH** version for backwards-compatible bug fixes
 
-See the [README](README.md#releasing-a-new-version) for detailed release instructions.
+`release-plz` derives the next version from the [Conventional Commits](https://www.conventionalcommits.org) merged since the last release, so following the commit conventions above directly drives versioning and the changelog.
+
+See the [README](README.md#releasing-a-new-version) for the detailed release flow.
 
 ## License
 
