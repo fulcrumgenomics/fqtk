@@ -932,7 +932,7 @@ pub(crate) struct Demux {
     #[clap(long, short = 'd', default_value = "2")]
     min_mismatch_delta: usize,
 
-    /// The number of threads to use. Cannot be less than 3.
+    /// The number of threads to use. Cannot be less than 5.
     #[clap(long, short = 't', default_value = "8")]
     threads: usize,
 
@@ -1778,9 +1778,12 @@ mod tests {
         demux_inputs.execute().unwrap();
     }
 
-    #[test]
-    #[should_panic(expected = "Threads provided 2 was too low!")]
-    fn test_too_few_threads_fails() {
+    /// Demultiplexing needs one main thread, one read-ahead thread, and three writer threads, so
+    /// four threads is the boundary case just below the minimum.
+    #[rstest]
+    #[case(2)]
+    #[case(4)]
+    fn test_too_few_threads_fails(#[case] threads: usize) {
         let tmp = TempDir::new().unwrap();
         let read_structures = vec![
             ReadStructure::from_str("+T").unwrap(),
@@ -1806,12 +1809,18 @@ mod tests {
             unmatched_prefix: "unmatched".to_owned(),
             max_mismatches: 1,
             min_mismatch_delta: 2,
-            threads: 2,
+            threads,
             compression_level: 5,
             skip_reasons: vec![],
             template_types: vec!['T'],
         };
-        demux_inputs.execute().unwrap();
+        let message = demux_inputs.execute().expect_err("demux unexpectedly succeeded").to_string();
+        assert!(
+            message.contains(&format!("Threads provided {} was too low!", threads)),
+            "unexpected error message for {} threads: {}",
+            threads,
+            message
+        );
     }
 
     #[test]
