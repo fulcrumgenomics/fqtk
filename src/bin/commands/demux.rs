@@ -1173,13 +1173,19 @@ impl Demux {
     /// The default `illumina` format carries UMIs in the read name and sample barcodes in the
     /// comment, so nothing is lost.  `unmodified` and `name-only` do not, and without this warning
     /// a run that silently discards every UMI base would look successful.
+    ///
+    /// Every effective read structure is checked, not just the global `--read-structures`, since
+    /// per-sample `read_structure_<n>` overrides may carry segment types the global structures do
+    /// not.
     fn warn_on_discarded_segments(
         &self,
+        sample_group: &SampleGroup,
         output_types: &HashSet<SegmentType>,
         template_types: &HashSet<SegmentType>,
     ) {
-        for segment_type in Self::discarded_segment_types(
+        for segment_type in Self::all_discarded_segment_types(
             &self.read_structures,
+            sample_group,
             self.header_format,
             self.effective_umi_in_name(),
             output_types,
@@ -1220,6 +1226,42 @@ impl Demux {
                 _ => {}
             }
         }
+    }
+
+    /// Returns the segment types whose bases would be silently discarded under `header_format`/
+    /// `umi_in_name` across every *effective* read structure: the global `read_structures` (used
+    /// for unmatched reads, and for samples without an override) plus each sample's per-sample
+    /// `read_structure_<n>` override.  A segment type is reported at most once, in the order
+    /// [`Self::discarded_segment_types`] returns it.
+    ///
+    /// Per-sample read structures take precedence over the global ones and may carry segment types
+    /// the global structures do not, so checking only the global structures would let a matched
+    /// sample discard bases without a warning.
+    fn all_discarded_segment_types(
+        read_structures: &[ReadStructure],
+        sample_group: &SampleGroup,
+        header_format: HeaderFormatKind,
+        umi_in_name: bool,
+        output_types: &HashSet<SegmentType>,
+        template_types: &HashSet<SegmentType>,
+    ) -> Vec<SegmentType> {
+        let per_sample =
+            sample_group.samples.iter().filter_map(|sample| sample.read_structures.as_deref());
+        let mut discarded = Vec::new();
+        for structures in std::iter::once(read_structures).chain(per_sample) {
+            for segment_type in Self::discarded_segment_types(
+                structures,
+                header_format,
+                umi_in_name,
+                output_types,
+                template_types,
+            ) {
+                if !discarded.contains(&segment_type) {
+                    discarded.push(segment_type);
+                }
+            }
+        }
+        discarded
     }
 
     /// Returns the segment types whose bases would be silently discarded under `header_format`/
@@ -1473,14 +1515,6 @@ impl Demux {
             &mut constraint_errors,
         );
 
-        // Warn when the chosen header format would drop barcode bases that are not routed
-        // anywhere else, so the loss is never silent.
-        if let (Some(output_types), Some(template_types)) =
-            (&output_segment_types_result, &template_segment_types_result)
-        {
-            self.warn_on_discarded_segments(output_types, template_types);
-        }
-
         // Validate template_types constraints
         if let (Some(output_types), Some(template_types)) =
             (&output_segment_types_result, &template_segment_types_result)
@@ -1614,17 +1648,27 @@ impl Command for Demux {
     fn execute(&self) -> Result<()> {
         let (fq_readers, output_segment_types, template_segment_types) =
             self.validate_and_prepare_inputs()?;
-        let template_output = TemplateOutput::new(
-            template_segment_types,
-            self.header_format,
-            self.effective_umi_in_name(),
-        );
 
         let sample_group = SampleGroup::from_file(&self.sample_metadata, &self.read_structures)?;
         info!(
             "{} samples loaded from file {:?}",
             sample_group.samples.len(),
             &self.sample_metadata
+        );
+
+        // Warn when the chosen header format would drop barcode bases that are not routed
+        // anywhere else, so the loss is never silent.  This runs after the sample metadata is
+        // parsed so that per-sample `read_structure_<n>` overrides are checked too.
+        self.warn_on_discarded_segments(
+            &sample_group,
+            &output_segment_types,
+            &template_segment_types,
+        );
+
+        let template_output = TemplateOutput::new(
+            template_segment_types,
+            self.header_format,
+            self.effective_umi_in_name(),
         );
         let fq_sources =
             fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE));
@@ -3024,6 +3068,93 @@ mod tests {
                 &none
             ),
             vec![]
+        );
+    }
+
+    /// Per-sample `read_structure_<n>` overrides take precedence over the global read
+    /// structures, so segments only a sample carries must still be reported as discarded.
+    #[test]
+    fn test_all_discarded_segment_types_covers_per_sample_read_structures() {
+        let to_set = |cs: &[char]| -> HashSet<SegmentType> {
+            cs.iter().map(|c| SegmentType::try_from(*c).unwrap()).collect()
+        };
+        let template_only = to_set(&['T']);
+
+        // The global structure has no barcode or UMI, so on its own it discards nothing...
+        let global = vec![ReadStructure::from_str("100T").unwrap()];
+        let sample_group = SampleGroup::from_samples(&[
+            Sample::new(0, "no-override".to_string(), "AAAAAAAA".to_string()),
+            Sample::with_read_structures(
+                1,
+                "override".to_string(),
+                "CCCCCCCC".to_string(),
+                Some(vec![ReadStructure::from_str("8B8M84T").unwrap()]),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            Demux::discarded_segment_types(
+                &global,
+                HeaderFormatKind::Unmodified,
+                false,
+                &template_only,
+                &template_only
+            ),
+            vec![]
+        );
+
+        // ...but the overriding sample's B and M segments are dropped under `unmodified`.
+        let mut discarded = Demux::all_discarded_segment_types(
+            &global,
+            &sample_group,
+            HeaderFormatKind::Unmodified,
+            false,
+            &template_only,
+            &template_only,
+        );
+        discarded.sort_by_key(|s| *s as u8);
+        assert!(discarded.contains(&SegmentType::MolecularBarcode));
+        assert!(discarded.contains(&SegmentType::SampleBarcode));
+
+        // `unmodified` + `umi_in_name` keeps the per-sample UMI in the read name, so only B is
+        // dropped.
+        assert_eq!(
+            Demux::all_discarded_segment_types(
+                &global,
+                &sample_group,
+                HeaderFormatKind::Unmodified,
+                true,
+                &template_only,
+                &template_only,
+            ),
+            vec![SegmentType::SampleBarcode]
+        );
+
+        // Routing B and M elsewhere rescues the per-sample segments too.
+        assert_eq!(
+            Demux::all_discarded_segment_types(
+                &global,
+                &sample_group,
+                HeaderFormatKind::Unmodified,
+                false,
+                &to_set(&['T', 'B', 'M']),
+                &template_only,
+            ),
+            vec![]
+        );
+
+        // Each discarded type is reported once, even when many samples carry it.
+        let global_with_barcode = vec![ReadStructure::from_str("8B92T").unwrap()];
+        assert_eq!(
+            Demux::all_discarded_segment_types(
+                &global_with_barcode,
+                &sample_group,
+                HeaderFormatKind::Unmodified,
+                true,
+                &template_only,
+                &template_only,
+            ),
+            vec![SegmentType::SampleBarcode]
         );
     }
 
