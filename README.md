@@ -244,6 +244,25 @@ Options:
 
           [default: T]
 
+      --header-format <HEADER_FORMAT>
+          The FASTQ header "shape" for each output record: whether the comment is rewritten (`illumina`), kept verbatim (`unmodified`), or dropped entirely (`name-only`).  See each value's own description below for exact per-format behavior and examples.
+
+          With `unmodified` and `name-only`, sample barcode bases (and, unless `--umi-in-name true` is given, UMI bases) are retained only if routed to their own FASTQs via `--output-types` or folded into the template bases via `--template-types`; otherwise they are not present in any output.  A warning is emitted when this would silently discard bases.
+
+          Possible values:
+          - illumina:   Casava ≥1.8 / bcl-convert-style header: the read-number field in the comment is rewritten to match the output file and the sample barcode(s) are appended to the comment.  UMI(s) are folded into the read name by default (override with `--umi-in-name`).  For example `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`
+          - unmodified: Emit each read's original header verbatim: the read-number field is not rewritten and no sample barcode is appended.  UMI(s) are NOT folded into the name by default (override with `--umi-in-name true`).  Nothing is parsed unless a UMI is folded in, so with the default `--umi-in-name` this (and `name-only`, below) is one of the formats that passes through headers which do not follow Illumina conventions unchanged (more than eight `:`-delimited name fields, or a comment that is not four `:`-delimited fields), such as those produced by MGI, Element, and ONT instruments
+          - name-only:  Emit only the read name: any pre-existing comment is always dropped, regardless of `--umi-in-name`.  UMI(s) are NOT folded into the name by default (override with `--umi-in-name true`), in which case the same non-Illumina-header tolerance described for `unmodified` applies here too (the name is only parsed when a UMI is actually folded into it).  Intended for pipelines (e.g. `bwa mem -C`) where a Casava-style comment would break downstream parsing.  With no comment and (by default) no UMI in the name, R1/R2 headers become byte-identical (no read number anywhere) — the same tradeoff `samtools fastq -n` makes for file-paired workflows
+
+          [default: illumina]
+
+      --umi-in-name <UMI_IN_NAME>
+          Whether to fold UMI(s) into the read name.
+
+          If not given, this is decided by `--header-format`: `true` for `illumina`, `false` for `unmodified` and `name-only`.  An explicit value here overrides the format's default -- e.g. `--header-format unmodified --umi-in-name true` keeps the original comment but still appends the UMI(s) to the name.  Has no effect when the UMI is instead folded into the template bases via `--template-types M ...`, since there is then nothing left to fold into the name.
+
+          [possible values: true, false]
+
   -h, --help
           Print help (see a summary with '-h')
 
