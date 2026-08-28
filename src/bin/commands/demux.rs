@@ -66,6 +66,11 @@ enum SkipReason {
 /// that its own routing allows to take effect (see `Demux::umi_in_name`'s doc for the one
 /// exception: `--template-types` can fold a UMI into the template bases instead, in which case
 /// there is nothing left for `--umi-in-name` to fold into the name).
+///
+/// A pre-existing tab-delimited SAM-tag suffix on the input header (e.g. from a prior `samtools
+/// fastq -T`) is a separate concept from the comment described here, and is preserved by every
+/// format regardless of `--umi-tag` -- see `--umi-tag`'s own doc for the exact replace/preserve
+/// rules.
 #[derive(clap::ValueEnum, Eq, Hash, PartialEq, Debug, Clone, Copy, Default)]
 enum HeaderFormatKind {
     /// Casava ≥1.8 / bcl-convert-style header: the read-number field in the comment is rewritten
@@ -76,29 +81,67 @@ enum HeaderFormatKind {
     Illumina,
     /// Emit each read's original header verbatim: the read-number field is not rewritten and no
     /// sample barcode is appended.  UMI(s) are NOT folded into the name by default (override with
-    /// `--umi-in-name true`).  Nothing is parsed unless a UMI is folded in, so with the default
-    /// `--umi-in-name` this (and `name-only`, below) is one of the formats that passes through
-    /// headers which do not follow Illumina conventions unchanged (more than eight `:`-delimited
-    /// name fields, or a comment that is not four `:`-delimited fields), such as those produced by
-    /// MGI, Element, and ONT instruments.
+    /// `--umi-in-name true`).  Nothing is parsed unless a UMI is folded into the name or written
+    /// to a tag via `--umi-tag`, so with neither of those given, this (and `name-only`, below) is
+    /// one of the formats that passes through headers which do not follow Illumina conventions
+    /// unchanged (more than eight `:`-delimited name fields, or a comment that is not four
+    /// `:`-delimited fields), such as those produced by MGI, Element, and ONT instruments.
     Unmodified,
-    /// Emit only the read name: any pre-existing comment is always dropped, regardless of
-    /// `--umi-in-name`.  UMI(s) are NOT folded into the name by default (override with
-    /// `--umi-in-name true`), in which case the same non-Illumina-header tolerance described for
-    /// `unmodified` applies here too (the name is only parsed when a UMI is actually folded into
-    /// it).  Intended for pipelines (e.g. `bwa mem -C`) where a Casava-style comment would break
-    /// downstream parsing.  With no comment and (by default) no UMI in the name, R1/R2 headers
-    /// become byte-identical (no read number anywhere) — the same tradeoff `samtools fastq -n`
-    /// makes for file-paired workflows.
+    /// Emit only the read name: any pre-existing space-delimited comment is always dropped,
+    /// regardless of `--umi-in-name` (a pre-existing tab-delimited SAM-tag suffix is a separate
+    /// concept and is not affected by this -- see the enum's own doc above).  UMI(s) are NOT
+    /// folded into the name by default (override with `--umi-in-name true`), in which case the
+    /// same non-Illumina-header tolerance described for `unmodified` applies here too (the name is
+    /// only parsed when a UMI is actually folded into it).  Intended for pipelines (e.g. `bwa mem
+    /// -C`) where a Casava-style comment would break downstream parsing; pair with `--umi-tag` to
+    /// retain the UMI without a comment or a name that no longer parses cleanly as `bwa mem -C`
+    /// expects.  With no comment and (by default) no UMI in the name, R1/R2 headers become
+    /// byte-identical (no read number anywhere) — the same tradeoff `samtools fastq -n` makes for
+    /// file-paired workflows.
     NameOnly,
 }
 
+/// A two-character SAM tag name (e.g. `RX`, `OX`), used to write UMI(s) into the FASTQ header as
+/// a tab-delimited SAM tag rather than (or in addition to) folding them into the read name.
+/// Validated to the SAM spec's `[A-Za-z][A-Za-z0-9]` tag-name form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SamTag([u8; 2]);
+
+impl SamTag {
+    /// The tag name as bytes, for writing into a header.  Named `to_bytes` (not `as_bytes`) since
+    /// it returns an owned `[u8; 2]`, not a borrow -- `as_*` is conventionally a cheap reborrow.
+    fn to_bytes(self) -> [u8; 2] {
+        self.0
+    }
+}
+
+impl Display for SamTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.0[0] as char, self.0[1] as char)
+    }
+}
+
+impl FromStr for SamTag {
+    type Err = anyhow::Error;
+    fn from_str(string: &str) -> Result<Self, Self::Err> {
+        let bytes = string.as_bytes();
+        ensure!(bytes.len() == 2, "SAM tag must be exactly two characters; got {string:?}");
+        ensure!(
+            bytes[0].is_ascii_alphabetic() && bytes[1].is_ascii_alphanumeric(),
+            "SAM tag must match [A-Za-z][A-Za-z0-9]; got {string:?}"
+        );
+        Ok(Self([bytes[0], bytes[1]]))
+    }
+}
+
 /// The full set of parameters governing how a single FASTQ header is written: whether UMIs are
-/// eligible to be folded into the name, the header format, and whether the UMI is folded in.
+/// eligible to be folded into the name, the header format, whether the UMI is folded in, and the
+/// SAM tag (if any) UMI(s) are additionally written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeaderFormat {
-    /// When false, UMI (M) segments are never folded into the read name (they are written into the
-    /// template bases instead, so the same bases are not emitted twice).
+    /// When false, UMI (M) segments are never folded into the read name or written to a SAM tag
+    /// (they are written into the template bases instead, so the same bases are not emitted
+    /// twice).
     include_umi: bool,
     /// The header "shape": comment rewrite/keep/drop behavior.
     kind: HeaderFormatKind,
@@ -106,6 +149,10 @@ struct HeaderFormat {
     /// `--umi-in-name` (if given) or `kind`'s default otherwise -- by the time a `HeaderFormat` is
     /// built there is no more "unset" state.
     umi_in_name: bool,
+    /// The SAM tag to additionally write UMI(s) into, if any.  Independent of `kind` and
+    /// `umi_in_name`: set unconditionally by `--umi-tag` and composes with every `kind` and with
+    /// folding the UMI into the name at the same time.
+    umi_tag: Option<SamTag>,
 }
 
 impl HeaderFormatKind {
@@ -200,6 +247,12 @@ impl ReadSet {
     /// Separator written between consecutive UMIs, e.g. duplex strands (Illumina DRAGEN
     /// convention).
     const UMI_SEP: u8 = b'+';
+    /// Separates a SAM-tag suffix (and each tag within it) from the rest of the header, e.g.
+    /// `name comment<TAB>RX:Z:AACC-GGTT`.
+    const TAB: u8 = b'\t';
+    /// Separator written between multiple UMIs stored in a single SAM tag (SAM-spec convention;
+    /// matches fgbio's `RX`/`GroupReadsByUmi` output).
+    const HYPHEN: u8 = b'-';
 
     /// Produces an iterator over references to the template segments stored in this ``ReadSet``.
     fn template_segments(&self) -> SegmentIter {
@@ -437,25 +490,32 @@ impl ReadSet {
         mut molecular_barcode_segments: SegmentIter,
         format: HeaderFormat,
     ) -> Result<()> {
-        let HeaderFormat { include_umi, kind, umi_in_name } = format;
+        let HeaderFormat { include_umi, kind, umi_in_name, umi_tag } = format;
         writer.write_all(&[Self::PREFIX])?;
 
         let fold_umi_into_name = include_umi && umi_in_name;
+        let write_umi_tag = include_umi && umi_tag.is_some();
+        // The tag-writing step needs the full UMI segment set independently of whatever the
+        // name-folding step below consumes from `molecular_barcode_segments`, since the two are
+        // orthogonal and either, both, or neither may run for a given `format`.
+        let molecular_barcode_segments_for_tag = molecular_barcode_segments.clone();
 
-        // `Unmodified` with no UMI folded into the name emits the header verbatim and stops:
-        // nothing is parsed at all here.  (`NameOnly` with no UMI folded in reaches the same
-        // non-Illumina-header tolerance further below, via the `else` branch of the name-writing
-        // step, since the name itself is never parsed unless a UMI is being folded into it.)
-        if kind == HeaderFormatKind::Unmodified && !fold_umi_into_name {
+        // `Unmodified` with no UMI folded into the name and no UMI tag to write emits the header
+        // verbatim and stops: nothing is parsed at all here.  (`NameOnly` with neither reaches the
+        // same non-Illumina-header tolerance further below, via the `else` branch of the
+        // name-writing step, since the name itself is only parsed when a UMI is being folded into
+        // it or the tag suffix needs separating out.)
+        if kind == HeaderFormatKind::Unmodified && !fold_umi_into_name && !write_umi_tag {
             writer.write_all(header)?;
             return Ok(());
         }
 
-        // Extract the name and optionally the comment
-        let (name, comment) = match header.find_byte(Self::SPACE) {
-            Some(x) => (&header[0..x], Some(&header[x + 1..])),
-            None => (header, None),
-        };
+        // Split the header into its three independent parts.  The tag suffix is located first and
+        // stripped off before looking for the comment's leading space, so a header that already
+        // carries both a comment and tags (`name comment<TAB>RX:Z:val`, e.g. from a prior
+        // `samtools fastq -T`) does not have the tag's own `:`-delimited content folded into the
+        // comment and miscounted as extra comment fields.
+        let (name, comment, tag_suffix) = Self::split_header(header);
 
         // Handle the 'name' component of the header.  If we're not folding in a UMI we can emit
         // the name part as is.  Otherwise we need to append the UMI(s) to the name.
@@ -491,7 +551,7 @@ impl ReadSet {
         // Exhaustive on `kind` (rather than early-returns eliminating down to an implicit last
         // case) so a future `HeaderFormatKind` variant fails to compile here instead of silently
         // inheriting `Illumina`'s comment-rewrite behavior.
-        match kind {
+        let write_comment_result: Result<()> = match kind {
             // `NameOnly` never emits a comment, regardless of what the input carried.
             HeaderFormatKind::NameOnly => Ok(()),
             // `Unmodified` (reaching here only because a UMI was folded into the name) emits the
@@ -565,7 +625,91 @@ impl ReadSet {
 
                 Ok(())
             }
+        };
+        write_comment_result?;
+
+        // The SAM-tag suffix is orthogonal to `kind` and is always appended last, after whatever
+        // header the chosen format produced above -- see `write_umi_tag_suffix`.
+        Self::write_umi_tag_suffix(
+            writer,
+            tag_suffix,
+            include_umi,
+            umi_tag,
+            molecular_barcode_segments_for_tag,
+        )
+    }
+
+    /// Splits a raw FASTQ header (without the leading `@`) into its three independent parts: the
+    /// read name, an optional space-delimited Illumina-style comment, and an optional
+    /// tab-delimited SAM-tag suffix (e.g. as produced by `samtools fastq -T`).  The tag suffix is
+    /// located first and stripped off before looking for the comment's leading space, since a
+    /// header can carry tags with no comment at all (`name<TAB>RX:Z:val`).
+    fn split_header(header: &[u8]) -> (&[u8], Option<&[u8]>, Option<&[u8]>) {
+        let (before_tags, tag_suffix) = match header.find_byte(Self::TAB) {
+            Some(x) => (&header[0..x], Some(&header[x + 1..])),
+            None => (header, None),
+        };
+        let (name, comment) = match before_tags.find_byte(Self::SPACE) {
+            Some(x) => (&before_tags[0..x], Some(&before_tags[x + 1..])),
+            None => (before_tags, None),
+        };
+        (name, comment, tag_suffix)
+    }
+
+    /// Writes the tab-delimited SAM-tag suffix: any pre-existing tags carried by the input header
+    /// (`existing_tag_suffix`), then -- when `include_umi` and `umi_tag` are both set and the read
+    /// structure actually carries UMI segment(s) -- the freshly computed
+    /// `<TAB><TAG>:Z:umi1[-umi2...]` tag for this run (duplex/multiple UMIs joined with `-` per the
+    /// SAM spec).  If an existing tag of the same name is present, it is dropped (replaced), not
+    /// duplicated alongside the fresh one -- this is the fix for the duplicate-tag bug where
+    /// pre-tagged input (e.g. from `samtools fastq -T`) would otherwise end up with two `RX:Z:`
+    /// fields.  An existing tag under a *different* name is always preserved.  Nothing is written
+    /// for a run with no fresh UMI to write: an existing tag of the target name is left alone
+    /// rather than silently dropped with nothing to replace it.
+    fn write_umi_tag_suffix<W: Write>(
+        writer: &mut W,
+        existing_tag_suffix: Option<&[u8]>,
+        include_umi: bool,
+        umi_tag: Option<SamTag>,
+        mut molecular_barcode_segments: SegmentIter,
+    ) -> Result<()> {
+        let first_umi_segment =
+            if include_umi && umi_tag.is_some() { molecular_barcode_segments.next() } else { None };
+
+        if let Some(existing) = existing_tag_suffix {
+            for token in existing.split(|b| *b == Self::TAB) {
+                // A degenerate header ending in a bare trailing tab (`name\t`) yields an empty
+                // final token; skip it rather than re-emitting a spurious empty tag field (which
+                // would produce a malformed double-tab in the output).
+                if token.is_empty() {
+                    continue;
+                }
+                // A well-formed SAM tag field is exactly `XX:Y:value`, so match the two-byte tag
+                // name *and* the delimiter that must follow it -- not just a byte prefix, which a
+                // malformed existing token could satisfy without actually being this tag.
+                let replaced = first_umi_segment.is_some()
+                    && umi_tag.is_some_and(|tag| {
+                        token.get(0..2) == Some(tag.to_bytes().as_slice())
+                            && token.get(2) == Some(&Self::COLON)
+                    });
+                if !replaced {
+                    writer.write_all(&[Self::TAB])?;
+                    writer.write_all(token)?;
+                }
+            }
         }
+
+        if let Some(first_seg) = first_umi_segment {
+            writer.write_all(&[Self::TAB])?;
+            writer.write_all(&umi_tag.expect("checked by first_umi_segment above").to_bytes())?;
+            writer.write_all(b":Z:")?;
+            writer.write_all(first_seg.seq.as_slice())?;
+            for seg in molecular_barcode_segments {
+                writer.write_all(&[Self::HYPHEN])?;
+                writer.write_all(seg.seq.as_slice())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -705,20 +849,23 @@ struct TemplateOutput {
     /// Whether to fold UMI(s) into the read name (already resolved from an explicit
     /// `--umi-in-name` or the format's default).
     umi_in_name: bool,
+    /// The SAM tag to additionally write UMI(s) into, if any (`--umi-tag`).
+    umi_tag: Option<SamTag>,
 }
 
 impl TemplateOutput {
     /// Builds the template output routing. `types` (the `--template-types` segment types) drives
     /// which segments are folded into the template bases and whether UMIs stay in the header;
-    /// `header_format` and `umi_in_name` control how the read header is built.
+    /// `header_format`, `umi_in_name`, and `umi_tag` control how the read header is built.
     fn new(
         types: HashSet<SegmentType>,
         header_format: HeaderFormatKind,
         umi_in_name: bool,
+        umi_tag: Option<SamTag>,
     ) -> Self {
         let include_other_segments = types.iter().any(|t| *t != SegmentType::Template);
         let umi_in_header = !types.contains(&SegmentType::MolecularBarcode);
-        Self { types, include_other_segments, umi_in_header, header_format, umi_in_name }
+        Self { types, include_other_segments, umi_in_header, header_format, umi_in_name, umi_tag }
     }
 
     /// The per-record header-formatting parameters implied by this routing.
@@ -727,6 +874,7 @@ impl TemplateOutput {
             include_umi: self.umi_in_header,
             kind: self.header_format,
             umi_in_name: self.umi_in_name,
+            umi_tag: self.umi_tag,
         }
     }
 }
@@ -1139,9 +1287,9 @@ pub(crate) struct Demux {
     /// value's own description below for exact per-format behavior and examples.
     ///
     /// With `unmodified` and `name-only`, sample barcode bases (and, unless `--umi-in-name true`
-    /// is given, UMI bases) are retained only if routed to their own FASTQs via `--output-types`
-    /// or folded into the template bases via `--template-types`; otherwise they are not present in
-    /// any output.  A warning is emitted when this would silently discard bases.
+    /// or `--umi-tag` is given, UMI bases) are retained only if routed to their own FASTQs via
+    /// `--output-types` or folded into the template bases via `--template-types`; otherwise they
+    /// are not present in any output.  A warning is emitted when this would silently discard bases.
     #[clap(long, value_enum, default_value_t = HeaderFormatKind::Illumina)]
     header_format: HeaderFormatKind,
 
@@ -1152,9 +1300,40 @@ pub(crate) struct Demux {
     /// e.g. `--header-format unmodified --umi-in-name true` keeps the original comment but still
     /// appends the UMI(s) to the name.  Has no effect when the UMI is instead folded into the
     /// template bases via `--template-types M ...`, since there is then nothing left to fold into
-    /// the name.
+    /// the name.  Independent of `--umi-tag`: both, either, or neither may be set at once.
+    ///
+    /// Only the UMI's bases are carried into the name; the base qualities have nowhere to go in a
+    /// read name and are lost.  Route the UMI to its own FASTQ via `--output-types M` if the
+    /// qualities need to be retained.
     #[clap(long)]
     umi_in_name: Option<bool>,
+
+    /// The SAM tag to additionally write UMI(s) into, as `<TAB><TAG>:Z:umi1[-umi2...]` appended
+    /// after whatever header `--header-format`/`--umi-in-name` produced (duplex/multiple UMIs
+    /// joined with `-`, matching fgbio's `RX`/`GroupReadsByUmi` convention).  Must be a
+    /// two-character SAM tag (`[A-Za-z][A-Za-z0-9]`), e.g. `RX` (the SAM-spec tag for corrected
+    /// UMI bases) or `OX` (original UMIs).
+    ///
+    /// Not given by default, in which case no tag is written.  Its presence is the only switch:
+    /// setting it always takes effect regardless of `--header-format`/`--umi-in-name`, composing
+    /// with every format -- including `name-only`, which combined with `--umi-tag` produces a bare
+    /// name plus tag header for pipelines (e.g. `bwa mem -C`) that need to parse the UMI from a SAM
+    /// tag rather than the read name, and mirrors `samtools fastq -T` / round-trips through
+    /// `samtools import`.  Has no effect when the UMI is instead folded into the template bases via
+    /// `--template-types M ...`, since there is then nothing left to write into any tag; likewise a
+    /// read structure with no `M` segment at all does not add or replace a tag, and emits no
+    /// warning, since there is no UMI to write regardless of this flag -- an existing tag of the
+    /// target name is preserved rather than removed, per the preservation rule below.  If the
+    /// input header already carries a tag of this name (e.g. from a prior `samtools fastq -T`) and
+    /// this run has a UMI to write, the existing value is replaced with the freshly computed one
+    /// rather than duplicated; any other pre-existing tag (or the same tag when this run has no
+    /// UMI to write) is preserved verbatim.
+    ///
+    /// As with `--umi-in-name`, only the UMI's bases are written into the tag; the base qualities
+    /// are lost.  Route the UMI to its own FASTQ via `--output-types M` if the qualities need to
+    /// be retained.
+    #[clap(long)]
+    umi_tag: Option<SamTag>,
 }
 
 impl Demux {
@@ -1188,6 +1367,7 @@ impl Demux {
             sample_group,
             self.header_format,
             self.effective_umi_in_name(),
+            self.umi_tag,
             output_types,
             template_types,
         ) {
@@ -1197,7 +1377,9 @@ impl Demux {
                 // `--header-format` in that case would misdescribe the cause.  `unmodified`/
                 // `name-only` already default to `false`, so an explicit override there isn't the
                 // cause -- fall through to the format-attributed message below, which correctly
-                // tells the user to pass `--umi-in-name true`.
+                // tells the user to pass `--umi-in-name true` or `--umi-tag`.  (`--umi-tag` being
+                // set is not a possible cause here either: when it is, the UMI is retained via the
+                // tag and this segment type is never reported as discarded in the first place.)
                 SegmentType::MolecularBarcode
                     if self.umi_in_name == Some(false)
                         && self.header_format.default_umi_in_name() =>
@@ -1206,14 +1388,14 @@ impl Demux {
                         "--umi-in-name false does not write UMIs to the read name, and M \
                          segments are not in --output-types or --template-types: the UMI bases \
                          will not appear in any output.  Add M to --output-types (or \
-                         --template-types), or drop --umi-in-name false."
+                         --template-types), pass --umi-tag <TAG>, or drop --umi-in-name false."
                     );
                 }
                 SegmentType::MolecularBarcode => warn!(
                     "--header-format {} does not write UMIs to the read name, and M segments are \
                      not in --output-types or --template-types: the UMI bases will not appear in \
                      any output.  Add M to --output-types (or --template-types), or pass \
-                     --umi-in-name true.",
+                     --umi-in-name true or --umi-tag <TAG>.",
                     self.header_format
                 ),
                 SegmentType::SampleBarcode => warn!(
@@ -1242,6 +1424,7 @@ impl Demux {
         sample_group: &SampleGroup,
         header_format: HeaderFormatKind,
         umi_in_name: bool,
+        umi_tag: Option<SamTag>,
         output_types: &HashSet<SegmentType>,
         template_types: &HashSet<SegmentType>,
     ) -> Vec<SegmentType> {
@@ -1253,6 +1436,7 @@ impl Demux {
                 structures,
                 header_format,
                 umi_in_name,
+                umi_tag,
                 output_types,
                 template_types,
             ) {
@@ -1270,13 +1454,15 @@ impl Demux {
     /// (`output_types`) or the template bases (`template_types`).
     ///
     /// The UMI and sample-barcode axes are independent: a UMI is discarded only when it's neither
-    /// folded into the name (`umi_in_name`) nor retained elsewhere; the sample barcode is
-    /// discarded only when `header_format` doesn't rewrite the comment (only `illumina` does) and
-    /// it isn't retained elsewhere.  `illumina` always writes both, so it never discards anything.
+    /// folded into the name (`umi_in_name`) nor written to a SAM tag (`umi_tag`) nor retained
+    /// elsewhere; the sample barcode is discarded only when `header_format` doesn't rewrite the
+    /// comment (only `illumina` does) and it isn't retained elsewhere.  `illumina` always writes
+    /// both, so it never discards anything.
     fn discarded_segment_types(
         read_structures: &[ReadStructure],
         header_format: HeaderFormatKind,
         umi_in_name: bool,
+        umi_tag: Option<SamTag>,
         output_types: &HashSet<SegmentType>,
         template_types: &HashSet<SegmentType>,
     ) -> Vec<SegmentType> {
@@ -1289,7 +1475,7 @@ impl Demux {
         };
 
         let mut discarded = Vec::new();
-        if !umi_in_name
+        if !(umi_in_name || umi_tag.is_some())
             && present(SegmentType::MolecularBarcode)
             && !is_retained(SegmentType::MolecularBarcode)
         {
@@ -1669,6 +1855,7 @@ impl Command for Demux {
             template_segment_types,
             self.header_format,
             self.effective_umi_in_name(),
+            self.umi_tag,
         );
         let fq_sources =
             fq_readers.into_iter().map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE));
@@ -1873,6 +2060,11 @@ mod tests {
     use tempfile::TempDir;
 
     const SAMPLE1_BARCODE: &str = "GATTGGG";
+    /// The SAM-spec tag for corrected UMI bases, used throughout the `--umi-tag` tests below.
+    const RX: SamTag = SamTag([b'R', b'X']);
+    /// A second, distinct tag name, used to test that `--umi-tag` honors a custom tag name and
+    /// that an existing tag under a *different* name is preserved rather than replaced.
+    const OX: SamTag = SamTag([b'O', b'X']);
 
     /// Given a record name prefix and a slice of bases for a set of records, returns the contents
     /// of a FASTQ file as a vec of Strings, one string per line of the FASTQ.
@@ -2020,6 +2212,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2066,6 +2259,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2108,6 +2302,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         let demux_result = demux_inputs.execute();
         permissions.set_readonly(false);
@@ -2149,6 +2344,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2187,6 +2383,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2220,6 +2417,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2264,6 +2462,7 @@ mod tests {
             template_types: vec!['B', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2316,6 +2515,7 @@ mod tests {
             template_types: vec!['B', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2376,6 +2576,7 @@ mod tests {
             template_types: vec!['M', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2424,6 +2625,7 @@ mod tests {
             template_types: vec!['B', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2455,6 +2657,7 @@ mod tests {
             template_types: vec!['B', 'M'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2489,6 +2692,7 @@ mod tests {
             template_types: vec!['C', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2520,6 +2724,7 @@ mod tests {
             template_types: vec!['X', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2559,6 +2764,7 @@ mod tests {
             template_types: vec!['B', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2598,6 +2804,7 @@ mod tests {
             template_types: vec!['M', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2632,6 +2839,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -2667,6 +2875,7 @@ mod tests {
             template_types: vec!['B', 'S', 'M', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2720,6 +2929,7 @@ mod tests {
             template_types: vec!['C', 'T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2775,6 +2985,7 @@ mod tests {
             template_types: vec!['C', 'T'],
             header_format: HeaderFormatKind::Unmodified,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -2795,12 +3006,13 @@ mod tests {
 
     /// Builds a paired-end, single-sample `Demux` over two reads whose headers differ only in the
     /// read-number field, with an 8bp UMI on each end (duplex) and an inline sample barcode on R1.
-    /// Returns the configured `Demux` and its output directory; the caller sets `header_format`
-    /// and `umi_in_name`.
+    /// Returns the configured `Demux` and its output directory; the caller sets `header_format`,
+    /// `umi_in_name`, and `umi_tag`.
     fn paired_demux_with_header_format(
         tmp: &TempDir,
         header_format: HeaderFormatKind,
         umi_in_name: Option<bool>,
+        umi_tag: Option<SamTag>,
     ) -> (Demux, PathBuf) {
         let read_structures = vec![
             ReadStructure::from_str("8M8B20T").unwrap(),
@@ -2840,21 +3052,23 @@ mod tests {
             template_types: vec!['T'],
             header_format,
             umi_in_name,
+            umi_tag,
         };
         (demux, output_dir)
     }
 
-    /// Covers every `(--header-format, --umi-in-name)` combination whose expected output is a
-    /// single pair of R1/R2 header assertions (the `name-only` cases don't fit this shape --
-    /// see `test_header_format_name_only_drops_comment_even_with_umi_in_name` below -- since one
-    /// of them needs two sub-scenarios in the same test to show the comment stays dropped even
-    /// once a UMI starts appearing in the name).
+    /// Covers every `(--header-format, --umi-in-name, --umi-tag)` combination whose expected
+    /// output is a single pair of R1/R2 header assertions (the `name-only` cases without a tag
+    /// don't fit this shape -- see `test_header_format_name_only_drops_comment_even_with_umi_in_name`
+    /// below -- since one of them needs two sub-scenarios in the same test to show the comment
+    /// stays dropped even once a UMI starts appearing in the name).
     #[rstest]
     // unmodified, no override: regression test that each output carries the header of ITS OWN
     // source, so R2 keeps its "2:N" read-number field rather than inheriting R1's "1:N".
     // Verbatim: no UMI in the name, no barcode in the comment, read-number field unchanged.
     #[case(
         HeaderFormatKind::Unmodified,
+        None,
         None,
         b"inst:1:FC:1:1101:5:7 1:N:0:0",
         b"inst:1:FC:1:1101:5:7 2:N:0:0"
@@ -2864,6 +3078,7 @@ mod tests {
     #[case(
         HeaderFormatKind::Unmodified,
         Some(true),
+        None,
         b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 1:N:0:0",
         b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 2:N:0:0"
     )]
@@ -2876,6 +3091,7 @@ mod tests {
     #[case(
         HeaderFormatKind::default(),
         None,
+        None,
         b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 1:N:0:ACGTACGT",
         b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 2:N:0:ACGTACGT"
     )]
@@ -2885,17 +3101,62 @@ mod tests {
     #[case(
         HeaderFormatKind::Illumina,
         Some(false),
+        None,
         b"inst:1:FC:1:1101:5:7 1:N:0:ACGTACGT",
         b"inst:1:FC:1:1101:5:7 2:N:0:ACGTACGT"
+    )]
+    // illumina + --umi-tag: the tag composes with the rewritten comment, appended after it -- per
+    // tfenne's own design note that a format-plus-tag combination should be supported and
+    // documented, not forbidden.  Both mates carry the same duplex UMI under the tag.
+    #[case(
+        HeaderFormatKind::Illumina,
+        None,
+        Some(RX),
+        b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 1:N:0:ACGTACGT\tRX:Z:AAAAAAAA-CCCCCCCC",
+        b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 2:N:0:ACGTACGT\tRX:Z:AAAAAAAA-CCCCCCCC"
+    )]
+    // unmodified + --umi-tag: exercises the one path that reaches this combination through the
+    // `Unmodified && !fold_umi_into_name && !write_umi_tag` verbatim-header shortcut (demux.rs) --
+    // an active tag must suppress that shortcut so the tag still gets written even though nothing
+    // else about the header changes.
+    #[case(
+        HeaderFormatKind::Unmodified,
+        None,
+        Some(RX),
+        b"inst:1:FC:1:1101:5:7 1:N:0:0\tRX:Z:AAAAAAAA-CCCCCCCC",
+        b"inst:1:FC:1:1101:5:7 2:N:0:0\tRX:Z:AAAAAAAA-CCCCCCCC"
+    )]
+    // unmodified + --umi-in-name true + --umi-tag: all three independent behaviors at once --
+    // the original comment preserved verbatim, the UMI folded into the name, and the UMI also
+    // written to the tag.  The sibling case above pins `umi_in_name: None` (false for
+    // `unmodified`); this one is the full three-way combination the #91 PR advertises as
+    // composable, not just each pair of axes independently.
+    #[case(
+        HeaderFormatKind::Unmodified,
+        Some(true),
+        Some(RX),
+        b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 1:N:0:0\tRX:Z:AAAAAAAA-CCCCCCCC",
+        b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC 2:N:0:0\tRX:Z:AAAAAAAA-CCCCCCCC"
+    )]
+    // name-only + --umi-tag: bare name plus tag, no comment -- the flagship "what `bwa mem -C`
+    // needs" composition tfenne's review calls out explicitly.
+    #[case(
+        HeaderFormatKind::NameOnly,
+        None,
+        Some(RX),
+        b"inst:1:FC:1:1101:5:7\tRX:Z:AAAAAAAA-CCCCCCCC",
+        b"inst:1:FC:1:1101:5:7\tRX:Z:AAAAAAAA-CCCCCCCC"
     )]
     fn test_header_format_paired_end_headers(
         #[case] header_format: HeaderFormatKind,
         #[case] umi_in_name: Option<bool>,
+        #[case] umi_tag: Option<SamTag>,
         #[case] expected_r1: &[u8],
         #[case] expected_r2: &[u8],
     ) {
         let tmp = TempDir::new().unwrap();
-        let (demux, output_dir) = paired_demux_with_header_format(&tmp, header_format, umi_in_name);
+        let (demux, output_dir) =
+            paired_demux_with_header_format(&tmp, header_format, umi_in_name, umi_tag);
         demux.execute().unwrap();
 
         let r1 = read_fastq(&output_dir.join("Sample0000.R1.fq.gz"));
@@ -2912,7 +3173,7 @@ mod tests {
         // R1/R2 headers become byte-identical.
         let tmp = TempDir::new().unwrap();
         let (demux, output_dir) =
-            paired_demux_with_header_format(&tmp, HeaderFormatKind::NameOnly, None);
+            paired_demux_with_header_format(&tmp, HeaderFormatKind::NameOnly, None, None);
         demux.execute().unwrap();
 
         let r1 = read_fastq(&output_dir.join("Sample0000.R1.fq.gz"));
@@ -2923,7 +3184,7 @@ mod tests {
         // With `--umi-in-name true`, the UMI is folded into the (now-identical) name, but the
         // comment is still always dropped.
         let (demux2, output_dir2) =
-            paired_demux_with_header_format(&tmp, HeaderFormatKind::NameOnly, Some(true));
+            paired_demux_with_header_format(&tmp, HeaderFormatKind::NameOnly, Some(true), None);
         demux2.execute().unwrap();
         let r1_with_umi = read_fastq(&output_dir2.join("Sample0000.R1.fq.gz"));
         assert_eq!(r1_with_umi[0].head, b"inst:1:FC:1:1101:5:7:AAAAAAAA+CCCCCCCC");
@@ -2975,6 +3236,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Unmodified,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux.execute().unwrap();
 
@@ -2999,61 +3261,67 @@ mod tests {
         // Read structure with a UMI (M), a sample barcode (B), and a template (T).
         let rs = vec![ReadStructure::from_str("8M8B84T").unwrap()];
         let none: HashSet<SegmentType> = HashSet::new();
-        let discarded = |header_format, umi_in_name, output: &[char], template: &[char]| {
-            let to_set =
-                |cs: &[char]| cs.iter().map(|c| SegmentType::try_from(*c).unwrap()).collect();
-            let mut d = Demux::discarded_segment_types(
-                &rs,
-                header_format,
-                umi_in_name,
-                &to_set(output),
-                &to_set(template),
-            );
-            d.sort_by_key(|s| *s as u8);
-            d
-        };
+        let discarded =
+            |header_format, umi_in_name, umi_tag, output: &[char], template: &[char]| {
+                let to_set =
+                    |cs: &[char]| cs.iter().map(|c| SegmentType::try_from(*c).unwrap()).collect();
+                let mut d = Demux::discarded_segment_types(
+                    &rs,
+                    header_format,
+                    umi_in_name,
+                    umi_tag,
+                    &to_set(output),
+                    &to_set(template),
+                );
+                d.sort_by_key(|s| *s as u8);
+                d
+            };
 
         // illumina discards nothing: UMI goes in the name, barcode in the comment.
-        assert_eq!(discarded(HeaderFormatKind::Illumina, true, &['T'], &['T']), vec![]);
+        assert_eq!(discarded(HeaderFormatKind::Illumina, true, None, &['T'], &['T']), vec![]);
 
         // illumina with `--umi-in-name false` still writes the barcode (the comment is always
         // rewritten), but now drops the UMI -- unreachable under the old fused enum, where
         // `rewrite` always implied UMI-in-name.
         assert_eq!(
-            discarded(HeaderFormatKind::Illumina, false, &['T'], &['T']),
+            discarded(HeaderFormatKind::Illumina, false, None, &['T'], &['T']),
             vec![SegmentType::MolecularBarcode]
         );
+
+        // ...unless `--umi-tag` is also set: the UMI is retained via the tag, so only the case
+        // above (neither `--umi-in-name` nor `--umi-tag`) reports it as discarded.
+        assert_eq!(discarded(HeaderFormatKind::Illumina, false, Some(RX), &['T'], &['T']), vec![]);
 
         // unmodified with no UMI in the name and only T output drops both the UMI and the barcode.
         // Sorted ascending by discriminant byte: SampleBarcode (b'B') before MolecularBarcode (b'M').
         assert_eq!(
-            discarded(HeaderFormatKind::Unmodified, false, &['T'], &['T']),
+            discarded(HeaderFormatKind::Unmodified, false, None, &['T'], &['T']),
             vec![SegmentType::SampleBarcode, SegmentType::MolecularBarcode]
         );
 
         // unmodified + umi-in-name keeps the UMI in the name, so only the sample barcode is
         // dropped.
         assert_eq!(
-            discarded(HeaderFormatKind::Unmodified, true, &['T'], &['T']),
+            discarded(HeaderFormatKind::Unmodified, true, None, &['T'], &['T']),
             vec![SegmentType::SampleBarcode]
         );
 
         // name-only takes the same `!rewrites_comment()` branch as unmodified: no UMI in the
         // name and only T output drops both the UMI and the barcode.
         assert_eq!(
-            discarded(HeaderFormatKind::NameOnly, false, &['T'], &['T']),
+            discarded(HeaderFormatKind::NameOnly, false, None, &['T'], &['T']),
             vec![SegmentType::SampleBarcode, SegmentType::MolecularBarcode]
         );
 
         // Routing M and B to their own FASTQs rescues them under unmodified.
         assert_eq!(
-            discarded(HeaderFormatKind::Unmodified, false, &['T', 'M', 'B'], &['T']),
+            discarded(HeaderFormatKind::Unmodified, false, None, &['T', 'M', 'B'], &['T']),
             vec![]
         );
 
         // Folding M and B into the template bases also rescues them.
         assert_eq!(
-            discarded(HeaderFormatKind::Unmodified, false, &['T'], &['T', 'M', 'B']),
+            discarded(HeaderFormatKind::Unmodified, false, None, &['T'], &['T', 'M', 'B']),
             vec![]
         );
 
@@ -3064,6 +3332,7 @@ mod tests {
                 &template_only,
                 HeaderFormatKind::Unmodified,
                 false,
+                None,
                 &none,
                 &none
             ),
@@ -3097,6 +3366,7 @@ mod tests {
                 &global,
                 HeaderFormatKind::Unmodified,
                 false,
+                None,
                 &template_only,
                 &template_only
             ),
@@ -3109,6 +3379,7 @@ mod tests {
             &sample_group,
             HeaderFormatKind::Unmodified,
             false,
+            None,
             &template_only,
             &template_only,
         );
@@ -3124,6 +3395,21 @@ mod tests {
                 &sample_group,
                 HeaderFormatKind::Unmodified,
                 true,
+                None,
+                &template_only,
+                &template_only,
+            ),
+            vec![SegmentType::SampleBarcode]
+        );
+
+        // `--umi-tag` retains the per-sample UMI too, without needing `umi_in_name`.
+        assert_eq!(
+            Demux::all_discarded_segment_types(
+                &global,
+                &sample_group,
+                HeaderFormatKind::Unmodified,
+                false,
+                Some(RX),
                 &template_only,
                 &template_only,
             ),
@@ -3137,6 +3423,7 @@ mod tests {
                 &sample_group,
                 HeaderFormatKind::Unmodified,
                 false,
+                None,
                 &to_set(&['T', 'B', 'M']),
                 &template_only,
             ),
@@ -3151,6 +3438,7 @@ mod tests {
                 &sample_group,
                 HeaderFormatKind::Unmodified,
                 true,
+                None,
                 &template_only,
                 &template_only,
             ),
@@ -3193,6 +3481,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3272,6 +3561,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3331,6 +3621,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3407,6 +3698,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3482,6 +3774,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3550,6 +3843,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux.execute().unwrap();
 
@@ -3617,6 +3911,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux.execute().unwrap();
 
@@ -3684,6 +3979,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3761,6 +4057,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -3798,6 +4095,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -3835,6 +4133,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -3877,6 +4176,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
     }
@@ -3916,6 +4216,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -3968,7 +4269,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -3988,7 +4294,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4014,6 +4325,7 @@ mod tests {
                 include_umi: false,
                 kind: HeaderFormatKind::Illumina,
                 umi_in_name: true,
+                umi_tag: None,
             },
         )
         .unwrap();
@@ -4035,7 +4347,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4055,7 +4372,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4075,7 +4397,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
     }
@@ -4094,7 +4421,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4117,7 +4449,12 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::Illumina, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4144,6 +4481,7 @@ mod tests {
                 include_umi: true,
                 kind: HeaderFormatKind::Unmodified,
                 umi_in_name: false,
+                umi_tag: None,
             },
         )
         .unwrap();
@@ -4171,6 +4509,7 @@ mod tests {
                 include_umi: true,
                 kind: HeaderFormatKind::Unmodified,
                 umi_in_name: false,
+                umi_tag: None,
             },
         )
         .unwrap();
@@ -4202,6 +4541,7 @@ mod tests {
                 include_umi: true,
                 kind: HeaderFormatKind::Unmodified,
                 umi_in_name: true,
+                umi_tag: None,
             },
         )
         .unwrap();
@@ -4227,6 +4567,7 @@ mod tests {
                 include_umi: true,
                 kind: HeaderFormatKind::NameOnly,
                 umi_in_name: false,
+                umi_tag: None,
             },
         )
         .unwrap();
@@ -4249,7 +4590,327 @@ mod tests {
             header,
             barcode_segs.iter().filter(|_| true),
             umi_segs.iter().filter(|_| true),
-            HeaderFormat { include_umi: true, kind: HeaderFormatKind::NameOnly, umi_in_name: true },
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: true,
+                umi_tag: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_sam_tag_from_str() {
+        assert_eq!(SamTag::from_str("RX").unwrap(), RX);
+        assert_eq!(SamTag::from_str("OX").unwrap(), OX);
+        assert_eq!(SamTag::from_str("Z9").unwrap(), SamTag([b'Z', b'9']));
+        assert_eq!(RX.to_string(), "RX");
+        // Too short / too long / bad characters are rejected.
+        assert!(SamTag::from_str("R").is_err());
+        assert!(SamTag::from_str("RXX").is_err());
+        assert!(SamTag::from_str("9X").is_err()); // first char must be a letter
+        assert!(SamTag::from_str("R-").is_err());
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_writes_after_illumina_comment() {
+        // `--umi-tag` composes with `illumina`: the tag is appended after the rewritten comment,
+        // not in place of it.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108 1:N:0:0";
+        let barcode_segs =
+            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
+        let umi_segs = [
+            seg(b"AACC", SegmentType::MolecularBarcode),
+            seg(b"GGTT", SegmentType::MolecularBarcode),
+        ];
+        let expected =
+            "@inst:123:ABCDE:1:204:1022:2108 1:N:0:ACGT+GGTT\tRX:Z:AACC-GGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_and_umi_in_name_both_carry_the_full_umi() {
+        // The name-folding and tag-writing steps are independent: when both are active, each gets
+        // the complete duplex UMI set, not a split of it.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [
+            seg(b"AACC", SegmentType::MolecularBarcode),
+            seg(b"GGTT", SegmentType::MolecularBarcode),
+        ];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108:AACC+GGTT\tRX:Z:AACC-GGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: true,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_replaces_existing_tag_of_same_name() {
+        // The duplicate-tag bug fix: pre-tagged input (e.g. from a prior `samtools fastq -T RX`)
+        // must not end up with two `RX:Z:` fields when `--umi-tag RX` also writes a fresh value.
+        // The stale tag is dropped and only the freshly computed one is written, in the same
+        // (last) position -- replace, not duplicate or skip.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\tRX:Z:STALEVAL";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tRX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_preserves_existing_tag_of_a_different_name() {
+        // An existing tag under a name other than the active `--umi-tag` is preserved verbatim,
+        // and the fresh tag is appended after it.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\tYY:Z:unrelated";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tYY:Z:unrelated\tOX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(OX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_leaves_existing_tag_untouched_when_no_fresh_umi() {
+        // With no UMI segments to write this run, an existing tag of the *same* name as
+        // `--umi-tag` is left alone rather than silently dropped with nothing to replace it.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\tRX:Z:KEEPME";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs: [FastqSegment; 0] = [];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tRX:Z:KEEPME".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_has_no_effect_when_umi_is_in_template_bases() {
+        // `include_umi: false` means the UMI was routed into the template bases instead; no tag
+        // is written even though `umi_tag` is set, mirroring the name-folding behavior.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: false,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_illumina_replaces_stale_tag_through_comment_rewrite() {
+        // `illumina` is the default format, so re-demuxing FASTQs produced by a prior `samtools
+        // fastq -T` (which appends a tab-delimited tag after the Illumina comment) is a mainline
+        // scenario. `split_header` must strip the tag suffix *before* the comment's colon count is
+        // checked, or the tag's own colons inflate the count and the (correct) 4-segment comment
+        // wrongly fails validation -- this pins that split, plus the tag getting replaced.
+        let mut out = Vec::new();
+        let header = b"inst:1:FC:1:1101:5:7 1:N:0:0\tRX:Z:STALE";
+        let barcode_segs = [seg(b"ACGTACGT", SegmentType::SampleBarcode)];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT\tRX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_name_only_preserves_existing_tag_without_umi_tag_flag() {
+        // A pre-existing tab-delimited SAM-tag suffix is a distinct concept from the (always
+        // dropped) Illumina-style comment under `name-only`, and is preserved regardless of
+        // whether `--umi-tag` is passed at all -- this is the counterpart to the replace/preserve
+        // tests above, which all set `umi_tag: Some(...)`.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108 1:N:0:0\tYY:Z:unrelated";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs: [FastqSegment; 0] = [];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tYY:Z:unrelated".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_preserves_prefix_colliding_token() {
+        // A stricter check than a bare `starts_with`: an existing token that merely shares the
+        // active tag's two-byte prefix but isn't actually that tag (no `:` in the third position)
+        // must be preserved, not dropped as a false "replace" match.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\tRXZ:i:5";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tRXZ:i:5\tRX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_preserves_other_tags_in_multi_tag_suffix() {
+        // With more than one pre-existing tag, only the one matching the active `--umi-tag` name
+        // is replaced; the others survive in their original order.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\tAA:Z:x\tRX:Z:stale\tBB:Z:y";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tAA:Z:x\tBB:Z:y\tRX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_write_header_umi_tag_skips_empty_trailing_tag_token() {
+        // A degenerate header ending in a bare trailing tab (no tag after it) must not produce a
+        // malformed double-tab when a fresh tag is appended.
+        let mut out = Vec::new();
+        let header = b"inst:123:ABCDE:1:204:1022:2108\t";
+        let barcode_segs: [FastqSegment; 0] = [];
+        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
+        let expected = "@inst:123:ABCDE:1:204:1022:2108\tRX:Z:AACCGGTT".to_string();
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header,
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::NameOnly,
+                umi_in_name: false,
+                umi_tag: Some(RX),
+            },
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -4522,6 +5183,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -4606,6 +5268,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -4654,6 +5317,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
@@ -4690,6 +5354,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         let err = demux_inputs.execute().unwrap_err();
         let msg = format!("{err:#}");
@@ -4725,6 +5390,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         let output_dir = demux_inputs.output.clone();
         demux_inputs.execute().unwrap();
@@ -4768,6 +5434,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         }
     }
 
@@ -4871,6 +5538,7 @@ mod tests {
             template_types: vec!['T'],
             header_format: HeaderFormatKind::Illumina,
             umi_in_name: None,
+            umi_tag: None,
         };
         demux_inputs.execute().unwrap();
 
