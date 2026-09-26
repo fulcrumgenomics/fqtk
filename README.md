@@ -270,7 +270,7 @@ Options:
 
           Possible values:
           - illumina:   The standard Illumina header: the read number in the comment is set to match the output file and the sample barcode(s) are appended to the comment.  UMI(s) are added to the read name by default.  E.g. `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`
-          - unmodified: The input header, unchanged except for any UMI(s) added by `--umi-in-name true` or `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, ONT) are accepted
+          - unmodified: The input header, unchanged except for any UMI(s) added by `--umi-in-name true` or `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, Ultima, ONT) are accepted
           - name-only:  The read name only; any comment is removed, but existing SAM tags (e.g. from `samtools fastq -T`) are kept.  No read number is written, so R1 and R2 headers will usually be identical.  Use with `--umi-tag` for tools such as `bwa mem -C`
 
           [default: illumina]
@@ -278,7 +278,7 @@ Options:
       --umi-in-name <UMI_IN_NAME>
           Whether to add UMI(s) to the read name.  Defaults to `true` for `--header-format illumina` and `false` otherwise.
 
-          UMIs are added as a final `:`-delimited field of the read name, with multiple UMIs joined by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  UMI base qualities are not retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in `--template-types`.
+          UMIs are added as a final `:`-delimited field of the read name, with multiple UMIs joined by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  If the name has exactly eight `:`-delimited fields (typically an Illumina name that already has a UMI), the UMI(s) are appended to the eighth field after a `+` instead.  UMI base qualities are not retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in `--template-types`.
 
           [possible values: true, false]
 
