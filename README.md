@@ -38,6 +38,23 @@ All tools are highly efficient and multi-threaded for high performance.
 
 `fqtk demux` demultiplexes one or more FASTQ files (e.g. a set of R1, R2 and I1 FASTQ files) with any number of sample barcodes at fixed locations within the reads.
 
+### Output read headers
+
+By default `fqtk demux` writes headers in Illumina's format, as bcl-convert does: the sample barcode goes in the comment and any UMI is appended to the read name. `--header-format`, `--umi-in-name` and `--umi-tag` change this. For example, for the input read `@inst:1:FC:1:1101:0:7 1:N:0:0` with UMI `AGATTTTC` and sample barcode `AAAAAAAA`:
+
+| To get | Use | R1 header |
+|---|---|---|
+| Illumina headers, e.g. for DRAGEN (default) | _(no options)_ | `@inst:1:FC:1:1101:0:7:AGATTTTC 1:N:0:AAAAAAAA` |
+| Headers left untouched | `--header-format unmodified` | `@inst:1:FC:1:1101:0:7 1:N:0:0` |
+| Headers left untouched, plus the UMI | `--header-format unmodified --umi-in-name true` | `@inst:1:FC:1:1101:0:7:AGATTTTC 1:N:0:0` |
+| The UMI in a SAM tag, for `bwa mem -C` or `samtools import -T` | `--header-format name-only --umi-tag RX` | `@inst:1:FC:1:1101:0:7<TAB>RX:Z:AGATTTTC` |
+
+Things to be aware of:
+
+- Only `illumina` writes the sample barcode to the header. With the other formats, add `B` to `--output-types` if you need the barcode. `fqtk demux` warns when sample barcode or UMI bases will not appear in any output.
+- `--umi-tag` works with every format, but `bwa mem -C` needs `name-only`. With `illumina`, the `1:N:0:...` comment comes before the tag, and `bwa mem -C` would copy it into the SAM record as an invalid tag.
+- UMI base qualities are only kept if the UMI is written to its own FASTQ with `--output-types M`.
+
 Usage for `fqtk demux` follows:
 
 <!-- start usage:demux -->
@@ -227,7 +244,7 @@ Options:
           [default: 5]
 
   -S, --skip-reasons <SKIP_REASONS>
-          Skip demultiplexing reads for any of the following reasons, otherwise panic.
+          Skip reads with any of these problems instead of failing: `too-few-bases`.
 
           1. `too-few-bases`: there are too few bases or qualities to extract given the read structures.  For example, if a read is 8bp long but the read structure is `10B`, or if a read is empty and the read structure is `+T`.
 
@@ -245,32 +262,32 @@ Options:
           [default: T]
 
       --header-format <HEADER_FORMAT>
-          The FASTQ header "shape" for each output record: whether the comment is rewritten (`illumina`), kept verbatim (`unmodified`), or dropped entirely (`name-only`).  See each value's own description below for exact per-format behavior and examples.
+          The format of the header of each output FASTQ record.
 
-          With `unmodified` and `name-only`, sample barcode bases (and, unless `--umi-in-name true` or `--umi-tag` is given, UMI bases) are retained only if routed to their own FASTQs via `--output-types` or folded into the template bases via `--template-types`; otherwise they are not present in any output.  A warning is emitted when this would silently discard bases.
+          Only `illumina` writes the sample barcode(s) to the header.  Where UMI(s) are written is controlled by `--umi-in-name` and `--umi-tag`.  A warning is emitted if sample barcode or UMI bases will not appear in any output.
+
+          The `illumina` format is described in Illumina's bcl2fastq2 Software Guide (document 15051736, "FASTQ Files"): https://support.illumina.com/content/dam/illumina-support/documents/documentation/software_documentation/bcl2fastq/bcl2fastq2-v2-20-software-guide-15051736-03.pdf
 
           Possible values:
-          - illumina:   Casava ≥1.8 / bcl-convert-style header: the read-number field in the comment is rewritten to match the output file and the sample barcode(s) are appended to the comment.  UMI(s) are folded into the read name by default (override with `--umi-in-name`).  For example `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`
-          - unmodified: Emit each read's original header verbatim: the read-number field is not rewritten and no sample barcode is appended.  UMI(s) are NOT folded into the name by default (override with `--umi-in-name true`).  Nothing is parsed unless a UMI is folded into the name or written to a tag via `--umi-tag`, so with neither of those given, this (and `name-only`, below) is one of the formats that passes through headers which do not follow Illumina conventions unchanged (more than eight `:`-delimited name fields, or a comment that is not four `:`-delimited fields), such as those produced by MGI, Element, and ONT instruments
-          - name-only:  Emit only the read name: any pre-existing space-delimited comment is always dropped, regardless of `--umi-in-name` (a pre-existing tab-delimited SAM-tag suffix is a separate concept and is not affected by this -- see the enum's own doc above).  UMI(s) are NOT folded into the name by default (override with `--umi-in-name true`), in which case the same non-Illumina-header tolerance described for `unmodified` applies here too (the name is only parsed when a UMI is actually folded into it).  Intended for pipelines (e.g. `bwa mem -C`) where a Casava-style comment would break downstream parsing; pair with `--umi-tag` to retain the UMI without a comment or a name that no longer parses cleanly as `bwa mem -C` expects.  With no comment and (by default) no UMI in the name, R1/R2 headers become byte-identical (no read number anywhere) — the same tradeoff `samtools fastq -n` makes for file-paired workflows
+          - illumina:   The standard Illumina header: the read number in the comment is set to match the output file and the sample barcode(s) are appended to the comment.  UMI(s) are added to the read name by default.  E.g. `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`
+          - unmodified: The input header, unchanged except for any UMI(s) added by `--umi-in-name true` or `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, ONT) are accepted
+          - name-only:  The read name only; any comment is removed, but existing SAM tags (e.g. from `samtools fastq -T`) are kept.  No read number is written, so R1 and R2 headers will usually be identical.  Use with `--umi-tag` for tools such as `bwa mem -C`
 
           [default: illumina]
 
       --umi-in-name <UMI_IN_NAME>
-          Whether to fold UMI(s) into the read name.
+          Whether to add UMI(s) to the read name.  Defaults to `true` for `--header-format illumina` and `false` otherwise.
 
-          If not given, this is decided by `--header-format`: `true` for `illumina`, `false` for `unmodified` and `name-only`.  An explicit value here overrides the format's default -- e.g. `--header-format unmodified --umi-in-name true` keeps the original comment but still appends the UMI(s) to the name.  Has no effect when the UMI is instead folded into the template bases via `--template-types M ...`, since there is then nothing left to fold into the name.  Independent of `--umi-tag`: both, either, or neither may be set at once.
-
-          Only the UMI's bases are carried into the name; the base qualities have nowhere to go in a read name and are lost.  Route the UMI to its own FASTQ via `--output-types M` if the qualities need to be retained.
+          UMIs are added as a final `:`-delimited field of the read name, with multiple UMIs joined by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  UMI base qualities are not retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in `--template-types`.
 
           [possible values: true, false]
 
       --umi-tag <UMI_TAG>
-          The SAM tag to additionally write UMI(s) into, as `<TAB><TAG>:Z:umi1[-umi2...]` appended after whatever header `--header-format`/`--umi-in-name` produced (duplex/multiple UMIs joined with `-`, matching fgbio's `RX`/`GroupReadsByUmi` convention).  Must be a two-character SAM tag (`[A-Za-z][A-Za-z0-9]`), e.g. `RX` (the SAM-spec tag for corrected UMI bases) or `OX` (original UMIs).
+          Also write UMI(s) to the header in this SAM tag (e.g. `RX`).
 
-          Not given by default, in which case no tag is written.  Its presence is the only switch: setting it always takes effect regardless of `--header-format`/`--umi-in-name`, composing with every format -- including `name-only`, which combined with `--umi-tag` produces a bare name plus tag header for pipelines (e.g. `bwa mem -C`) that need to parse the UMI from a SAM tag rather than the read name, and mirrors `samtools fastq -T` / round-trips through `samtools import`.  Has no effect when the UMI is instead folded into the template bases via `--template-types M ...`, since there is then nothing left to write into any tag; likewise a read structure with no `M` segment at all does not add or replace a tag, and emits no warning, since there is no UMI to write regardless of this flag -- an existing tag of the target name is preserved rather than removed, per the preservation rule below.  If the input header already carries a tag of this name (e.g. from a prior `samtools fastq -T`) and this run has a UMI to write, the existing value is replaced with the freshly computed one rather than duplicated; any other pre-existing tag (or the same tag when this run has no UMI to write) is preserved verbatim.
+          The tag is appended to the header after a tab, with multiple UMIs joined by `-` (e.g. `@NAME<TAB>RX:Z:UMI1-UMI2`), as produced by `samtools fastq -T`.  An existing tag of the same name is replaced; other existing tags are kept.  UMI base qualities are not retained.  Cannot be used when `M` is in `--template-types`.
 
-          As with `--umi-in-name`, only the UMI's bases are written into the tag; the base qualities are lost.  Route the UMI to its own FASTQ via `--output-types M` if the qualities need to be retained.
+          `bwa mem -C` copies everything after the read name into the SAM record, so use `--header-format name-only` with it; the comment written by `illumina` is not a valid SAM tag.
 
   -h, --help
           Print help (see a summary with '-h')

@@ -60,44 +60,23 @@ enum SkipReason {
     TooFewBases,
 }
 
-/// The FASTQ header "shape" for each output record: whether the comment is rewritten, kept
-/// verbatim, or dropped entirely.  Independent of this, `--umi-in-name` controls whether the
-/// UMI(s) are folded into the read name; every format honors an explicit `--umi-in-name` override
-/// that its own routing allows to take effect (see `Demux::umi_in_name`'s doc for the one
-/// exception: `--template-types` can fold a UMI into the template bases instead, in which case
-/// there is nothing left for `--umi-in-name` to fold into the name).
-///
-/// A pre-existing tab-delimited SAM-tag suffix on the input header (e.g. from a prior `samtools
-/// fastq -T`) is a separate concept from the comment described here, and is preserved by every
-/// format regardless of `--umi-tag` -- see `--umi-tag`'s own doc for the exact replace/preserve
-/// rules.
+/// The format of the header written for each output FASTQ record (`--header-format`).  Where
+/// UMI(s) go is controlled separately by `--umi-in-name` and `--umi-tag`.  The variant docs are
+/// the per-value CLI help, so keep each to a short single paragraph.
 #[derive(clap::ValueEnum, Eq, Hash, PartialEq, Debug, Clone, Copy, Default)]
 enum HeaderFormatKind {
-    /// Casava ≥1.8 / bcl-convert-style header: the read-number field in the comment is rewritten
-    /// to match the output file and the sample barcode(s) are appended to the comment.  UMI(s) are
-    /// folded into the read name by default (override with `--umi-in-name`).  For example
-    /// `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`.
+    /// The standard Illumina header: the read number in the comment is set to match the output
+    /// file and the sample barcode(s) are appended to the comment.  UMI(s) are added to the read
+    /// name by default.  E.g. `@inst:1:FC:1:1101:5:7 1:N:0:0` becomes
+    /// `@inst:1:FC:1:1101:5:7:AACCGGTT 1:N:0:ACGTACGT`.
     #[default]
     Illumina,
-    /// Emit each read's original header verbatim: the read-number field is not rewritten and no
-    /// sample barcode is appended.  UMI(s) are NOT folded into the name by default (override with
-    /// `--umi-in-name true`).  Nothing is parsed unless a UMI is folded into the name or written
-    /// to a tag via `--umi-tag`, so with neither of those given, this (and `name-only`, below) is
-    /// one of the formats that passes through headers which do not follow Illumina conventions
-    /// unchanged (more than eight `:`-delimited name fields, or a comment that is not four
-    /// `:`-delimited fields), such as those produced by MGI, Element, and ONT instruments.
+    /// The input header, unchanged except for any UMI(s) added by `--umi-in-name true` or
+    /// `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, ONT) are accepted.
     Unmodified,
-    /// Emit only the read name: any pre-existing space-delimited comment is always dropped,
-    /// regardless of `--umi-in-name` (a pre-existing tab-delimited SAM-tag suffix is a separate
-    /// concept and is not affected by this -- see the enum's own doc above).  UMI(s) are NOT
-    /// folded into the name by default (override with `--umi-in-name true`), in which case the
-    /// same non-Illumina-header tolerance described for `unmodified` applies here too (the name is
-    /// only parsed when a UMI is actually folded into it).  Intended for pipelines (e.g. `bwa mem
-    /// -C`) where a Casava-style comment would break downstream parsing; pair with `--umi-tag` to
-    /// retain the UMI without a comment or a name that no longer parses cleanly as `bwa mem -C`
-    /// expects.  With no comment and (by default) no UMI in the name, R1/R2 headers become
-    /// byte-identical (no read number anywhere) — the same tradeoff `samtools fastq -n` makes for
-    /// file-paired workflows.
+    /// The read name only; any comment is removed, but existing SAM tags (e.g. from `samtools
+    /// fastq -T`) are kept.  No read number is written, so R1 and R2 headers will usually be
+    /// identical.  Use with `--umi-tag` for tools such as `bwa mem -C`.
     NameOnly,
 }
 
@@ -1252,7 +1231,7 @@ pub(crate) struct Demux {
     #[clap(long, short = 'c', default_value = "5")]
     compression_level: usize,
 
-    /// Skip demultiplexing reads for any of the following reasons, otherwise panic.
+    /// Skip reads with any of these problems instead of failing: `too-few-bases`.
     ///
     /// 1. `too-few-bases`: there are too few bases or qualities to extract given the read
     ///    structures.  For example, if a read is 8bp long but the read structure is `10B`, or
@@ -1282,65 +1261,45 @@ pub(crate) struct Demux {
     #[clap(long, default_value = "T", num_args = 1..)]
     template_types: Vec<char>,
 
-    /// The FASTQ header "shape" for each output record: whether the comment is rewritten
-    /// (`illumina`), kept verbatim (`unmodified`), or dropped entirely (`name-only`).  See each
-    /// value's own description below for exact per-format behavior and examples.
+    /// The format of the header of each output FASTQ record.
     ///
-    /// With `unmodified` and `name-only`, sample barcode bases (and, unless `--umi-in-name true`
-    /// or `--umi-tag` is given, UMI bases) are retained only if routed to their own FASTQs via
-    /// `--output-types` or folded into the template bases via `--template-types`; otherwise they
-    /// are not present in any output.  A warning is emitted when this would silently discard bases.
+    /// Only `illumina` writes the sample barcode(s) to the header.  Where UMI(s) are written is
+    /// controlled by `--umi-in-name` and `--umi-tag`.  A warning is emitted if sample barcode or
+    /// UMI bases will not appear in any output.
+    ///
+    /// The `illumina` format is described in Illumina's bcl2fastq2 Software Guide (document
+    /// 15051736, "FASTQ Files"): https://support.illumina.com/content/dam/illumina-support/documents/documentation/software_documentation/bcl2fastq/bcl2fastq2-v2-20-software-guide-15051736-03.pdf
     #[clap(long, value_enum, default_value_t = HeaderFormatKind::Illumina)]
     header_format: HeaderFormatKind,
 
-    /// Whether to fold UMI(s) into the read name.
+    /// Whether to add UMI(s) to the read name.  Defaults to `true` for `--header-format illumina`
+    /// and `false` otherwise.
     ///
-    /// If not given, this is decided by `--header-format`: `true` for `illumina`, `false` for
-    /// `unmodified` and `name-only`.  An explicit value here overrides the format's default --
-    /// e.g. `--header-format unmodified --umi-in-name true` keeps the original comment but still
-    /// appends the UMI(s) to the name.  Has no effect when the UMI is instead folded into the
-    /// template bases via `--template-types M ...`, since there is then nothing left to fold into
-    /// the name.  Independent of `--umi-tag`: both, either, or neither may be set at once.
-    ///
-    /// Only the UMI's bases are carried into the name; the base qualities have nowhere to go in a
-    /// read name and are lost.  Route the UMI to its own FASTQ via `--output-types M` if the
-    /// qualities need to be retained.
+    /// UMIs are added as a final `:`-delimited field of the read name, with multiple UMIs joined
+    /// by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  UMI base qualities are
+    /// not retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in
+    /// `--template-types`.
     #[clap(long)]
     umi_in_name: Option<bool>,
 
-    /// The SAM tag to additionally write UMI(s) into, as `<TAB><TAG>:Z:umi1[-umi2...]` appended
-    /// after whatever header `--header-format`/`--umi-in-name` produced (duplex/multiple UMIs
-    /// joined with `-`, matching fgbio's `RX`/`GroupReadsByUmi` convention).  Must be a
-    /// two-character SAM tag (`[A-Za-z][A-Za-z0-9]`), e.g. `RX` (the SAM-spec tag for corrected
-    /// UMI bases) or `OX` (original UMIs).
+    /// Also write UMI(s) to the header in this SAM tag (e.g. `RX`).
     ///
-    /// Not given by default, in which case no tag is written.  Its presence is the only switch:
-    /// setting it always takes effect regardless of `--header-format`/`--umi-in-name`, composing
-    /// with every format -- including `name-only`, which combined with `--umi-tag` produces a bare
-    /// name plus tag header for pipelines (e.g. `bwa mem -C`) that need to parse the UMI from a SAM
-    /// tag rather than the read name, and mirrors `samtools fastq -T` / round-trips through
-    /// `samtools import`.  Has no effect when the UMI is instead folded into the template bases via
-    /// `--template-types M ...`, since there is then nothing left to write into any tag; likewise a
-    /// read structure with no `M` segment at all does not add or replace a tag, and emits no
-    /// warning, since there is no UMI to write regardless of this flag -- an existing tag of the
-    /// target name is preserved rather than removed, per the preservation rule below.  If the
-    /// input header already carries a tag of this name (e.g. from a prior `samtools fastq -T`) and
-    /// this run has a UMI to write, the existing value is replaced with the freshly computed one
-    /// rather than duplicated; any other pre-existing tag (or the same tag when this run has no
-    /// UMI to write) is preserved verbatim.
+    /// The tag is appended to the header after a tab, with multiple UMIs joined by `-` (e.g.
+    /// `@NAME<TAB>RX:Z:UMI1-UMI2`), as produced by `samtools fastq -T`.  An existing tag of the
+    /// same name is replaced; other existing tags are kept.  UMI base qualities are not
+    /// retained.  Cannot be used when `M` is in `--template-types`.
     ///
-    /// As with `--umi-in-name`, only the UMI's bases are written into the tag; the base qualities
-    /// are lost.  Route the UMI to its own FASTQ via `--output-types M` if the qualities need to
-    /// be retained.
+    /// `bwa mem -C` copies everything after the read name into the SAM record, so use
+    /// `--header-format name-only` with it; the comment written by `illumina` is not a valid SAM
+    /// tag.
     #[clap(long)]
     umi_tag: Option<SamTag>,
 }
 
 impl Demux {
-    /// The effective "fold UMI into read name" setting: an explicit `--umi-in-name` wins over the
-    /// `--header-format` default, unless `--template-types` has already routed the UMI into the
-    /// template bases, in which case there is nothing left to fold into the name regardless of
-    /// this setting.
+    /// The effective "add UMI to read name" setting: an explicit `--umi-in-name` wins over the
+    /// `--header-format` default.  A UMI routed into the template bases by `--template-types` is
+    /// never added to the name, whatever this returns (see `HeaderFormat::include_umi`).
     fn effective_umi_in_name(&self) -> bool {
         self.umi_in_name.unwrap_or(self.header_format.default_umi_in_name())
     }
@@ -1446,6 +1405,38 @@ impl Demux {
             }
         }
         discarded
+    }
+
+    /// Returns the options that ask for UMIs to be written to the header (`--umi-in-name true`,
+    /// `--umi-tag`), formatted as given on the command line, if no effective read structure
+    /// (global or per-sample) has a UMI (`M`) segment; otherwise returns an empty list.
+    ///
+    /// This is reported as a warning rather than an error so that a pipeline can pass the same UMI
+    /// options whether or not a given run's read structures contain UMIs.
+    fn unused_umi_options(
+        read_structures: &[ReadStructure],
+        sample_group: &SampleGroup,
+        umi_in_name: Option<bool>,
+        umi_tag: Option<SamTag>,
+    ) -> Vec<String> {
+        let per_sample =
+            sample_group.samples.iter().filter_map(|sample| sample.read_structures.as_deref());
+        let has_umi = std::iter::once(read_structures)
+            .chain(per_sample)
+            .flatten()
+            .any(|rs| rs.segments_by_type(SegmentType::MolecularBarcode).count() > 0);
+        if has_umi {
+            return vec![];
+        }
+
+        let mut unused = Vec::new();
+        if umi_in_name == Some(true) {
+            unused.push("--umi-in-name true".to_owned());
+        }
+        if let Some(tag) = umi_tag {
+            unused.push(format!("--umi-tag {tag}"));
+        }
+        unused
     }
 
     /// Returns the segment types whose bases would be silently discarded under `header_format`/
@@ -1665,6 +1656,7 @@ impl Demux {
     ///     - That `--template-types` includes T (the template segment)
     ///     - That `--output-types` includes T when `--template-types` has non-T segments
     ///     - That no read structure has multiple T segments when `--template-types` has non-T
+    ///     - That `--umi-in-name true` and `--umi-tag` are not given with M in `--template-types`
     fn validate_and_prepare_inputs(
         &self,
     ) -> Result<(VecOfReaders, HashSet<SegmentType>, HashSet<SegmentType>)> {
@@ -1764,6 +1756,21 @@ impl Demux {
                 }
             }
 
+            // A UMI folded into the template bases is never also written to the header, so an
+            // explicit request to write it there could never take effect.
+            if template_types.contains(&SegmentType::MolecularBarcode) {
+                if self.umi_in_name == Some(true) {
+                    constraint_errors.push(
+                        "--umi-in-name true cannot be used when M is in --template-types, since the UMI is written into the template bases instead of the read name".to_owned(),
+                    );
+                }
+                if let Some(tag) = self.umi_tag {
+                    constraint_errors.push(format!(
+                        "--umi-tag {tag} cannot be used when M is in --template-types, since the UMI is written into the template bases instead of the read header"
+                    ));
+                }
+            }
+
             // Every segment type present in the read structures must have a destination so its
             // bases are not silently lost. Template (T) is forced into output, sample barcode (B)
             // and molecular barcode (M) fall back to the read header, and Skip (S) is discarded by
@@ -1850,6 +1857,19 @@ impl Command for Demux {
             &output_segment_types,
             &template_segment_types,
         );
+        let unused_umi_options = Self::unused_umi_options(
+            &self.read_structures,
+            &sample_group,
+            self.umi_in_name,
+            self.umi_tag,
+        );
+        if !unused_umi_options.is_empty() {
+            warn!(
+                "{} given, but no read structure contains a UMI (M) segment, so no UMIs will be \
+                 written.",
+                unused_umi_options.join(" and ")
+            );
+        }
 
         let template_output = TemplateOutput::new(
             template_segment_types,
@@ -3452,6 +3472,147 @@ mod tests {
                 &template_only,
             ),
             vec![SegmentType::SampleBarcode]
+        );
+    }
+
+    /// A single-sample `Demux` over one `8B8M84T` read, with the UMI folded into the template
+    /// bases (`--template-types M T`) and the given UMI header options.
+    fn demux_with_umi_in_template_bases(
+        tmp: &TempDir,
+        umi_in_name: Option<bool>,
+        umi_tag: Option<SamTag>,
+    ) -> Demux {
+        let barcode = "AAAAAAAA";
+        let read = format!("{barcode}GGGGGGGG{}", "T".repeat(84));
+        Demux {
+            inputs: vec![fastq_file(tmp, "ex", "ex", &[&read])],
+            read_structures: vec![ReadStructure::from_str("8B8M84T").unwrap()],
+            sample_metadata: metadata_file(tmp, &[barcode]),
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['M', 'T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name,
+            umi_tag,
+        }
+    }
+
+    #[test]
+    fn test_umi_in_name_true_is_rejected_when_umi_is_in_template_types() {
+        let tmp = TempDir::new().unwrap();
+        let error = demux_with_umi_in_template_bases(&tmp, Some(true), None).execute().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--umi-in-name true cannot be used when M is in --template-types"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_umi_tag_is_rejected_when_umi_is_in_template_types() {
+        let tmp = TempDir::new().unwrap();
+        let error = demux_with_umi_in_template_bases(&tmp, None, Some(RX)).execute().unwrap_err();
+        assert!(
+            error.to_string().contains("--umi-tag RX cannot be used when M is in --template-types"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_umi_in_name_false_is_accepted_when_umi_is_in_template_types() {
+        let tmp = TempDir::new().unwrap();
+        demux_with_umi_in_template_bases(&tmp, Some(false), None).execute().unwrap();
+    }
+
+    #[test]
+    fn test_umi_tag_without_umi_segments_still_demultiplexes() {
+        let tmp = TempDir::new().unwrap();
+        let barcode = "AAAAAAAA";
+        let read = format!("{barcode}{}", "T".repeat(92));
+        let output_dir = tmp.path().join("output");
+        let demux = Demux {
+            inputs: vec![fastq_file(&tmp, "ex", "ex", &[&read])],
+            read_structures: vec![ReadStructure::from_str("8B92T").unwrap()],
+            sample_metadata: metadata_file(&tmp, &[barcode]),
+            output_types: vec!['T'],
+            output: output_dir.clone(),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: Some(true),
+            umi_tag: Some(RX),
+        };
+        demux.execute().unwrap();
+
+        let records = read_fastq(&output_dir.join("Sample0000.R1.fq.gz"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(str::from_utf8(&records[0].head).unwrap(), "ex_0 1:N:0:AAAAAAAA");
+    }
+
+    #[test]
+    fn test_unused_umi_options_lists_umi_options_when_no_read_structure_has_a_umi() {
+        let read_structures = vec![ReadStructure::from_str("8B92T").unwrap()];
+        let sample_group =
+            SampleGroup::from_samples(&[Sample::new(0, "s1".to_owned(), "AAAAAAAA".to_owned())])
+                .unwrap();
+        assert_eq!(
+            Demux::unused_umi_options(&read_structures, &sample_group, Some(true), Some(RX)),
+            vec!["--umi-in-name true".to_owned(), "--umi-tag RX".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_unused_umi_options_ignores_umi_in_name_false() {
+        let read_structures = vec![ReadStructure::from_str("8B92T").unwrap()];
+        let sample_group =
+            SampleGroup::from_samples(&[Sample::new(0, "s1".to_owned(), "AAAAAAAA".to_owned())])
+                .unwrap();
+        assert!(
+            Demux::unused_umi_options(&read_structures, &sample_group, Some(false), None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_unused_umi_options_is_empty_when_global_read_structure_has_a_umi() {
+        let read_structures = vec![ReadStructure::from_str("8B8M84T").unwrap()];
+        let sample_group =
+            SampleGroup::from_samples(&[Sample::new(0, "s1".to_owned(), "AAAAAAAA".to_owned())])
+                .unwrap();
+        assert!(
+            Demux::unused_umi_options(&read_structures, &sample_group, Some(true), Some(RX))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_unused_umi_options_is_empty_when_a_per_sample_read_structure_has_a_umi() {
+        let read_structures = vec![ReadStructure::from_str("8B92T").unwrap()];
+        let sample_group = SampleGroup::from_samples(&[
+            Sample::new(0, "no-umi".to_owned(), "AAAAAAAA".to_owned()),
+            Sample::with_read_structures(
+                1,
+                "umi".to_owned(),
+                "CCCCCCCC".to_owned(),
+                Some(vec![ReadStructure::from_str("8B8M84T").unwrap()]),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            Demux::unused_umi_options(&read_structures, &sample_group, Some(true), Some(RX))
+                .is_empty()
         );
     }
 
