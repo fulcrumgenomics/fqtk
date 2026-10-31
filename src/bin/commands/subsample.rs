@@ -196,13 +196,13 @@ impl Command for Subsample {
         info!("Using random seed: {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // Open one reader per input.  Decompression runs on a background read-ahead thread per
-        // input and hands decompressed byte chunks to these readers, which parse records here on
-        // the main thread.  Keeping inflation off the main thread leaves it free to parse records
-        // and run the per-record RNG draw and read-name sync checks.
+        // Create one reader per input.  Each input is opened and decompressed on its own
+        // background read-ahead thread, and its reader parses the decompressed bytes here on the
+        // main thread.  Keeping inflation off the main thread leaves it free to parse records and
+        // run the per-record RNG draw and read-name sync checks.
         let mut sources = Vec::with_capacity(self.inputs.len());
         for path in &self.inputs {
-            sources.push(ReadAheadBuilder { path: path.clone(), ..Default::default() }.build()?);
+            sources.push(ReadAheadBuilder { path: path.clone(), ..Default::default() }.build());
         }
 
         // Create output writers

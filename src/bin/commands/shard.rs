@@ -146,10 +146,10 @@ impl Command for Shard {
     fn execute(&self) -> Result<()> {
         info!("Reading {} input FASTQs and generating {} shards.", self.inputs.len(), self.shards);
 
-        // Open one reader per input.  Decompression runs on a background read-ahead thread per
-        // input and hands decompressed byte chunks to these readers, which parse records here on
-        // the main thread.  Keeping inflation off the main thread lets it spend its time parsing
-        // and routing records to keep the compression pool fed.
+        // Create one reader per input.  Each input is opened and decompressed on its own
+        // background read-ahead thread, and its reader parses the decompressed bytes here on the
+        // main thread.  Keeping inflation off the main thread lets it spend its time parsing and
+        // routing records to keep the compression pool fed.
         let mut readers = Vec::with_capacity(self.inputs.len());
         for path in &self.inputs {
             readers.push(
@@ -158,7 +158,7 @@ impl Command for Shard {
                     chunk_size: self.chunk_size,
                     chunk_count: self.chunk_count,
                 }
-                .build()?,
+                .build(),
             );
         }
         let n_inputs = readers.len();
