@@ -47,7 +47,7 @@ fn fmt_count(n: u64) -> String {
 ///
 /// ```bash
 /// fqtk subsample \
-///     --input r1.fq.gz r2.fq.gz \
+///     --inputs r1.fq.gz r2.fq.gz \
 ///     --output subsampled \
 ///     --fraction 0.1
 /// ```
