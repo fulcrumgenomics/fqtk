@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::fastq_readahead::{ReadAheadBuilder, open_readers};
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
@@ -149,18 +149,13 @@ impl Command for Shard {
         // Create one reader per input.  Each input is opened and decompressed on its own
         // background read-ahead thread, and its reader parses the decompressed bytes here on the
         // main thread.  Keeping inflation off the main thread lets it spend its time parsing and
-        // routing records to keep the compression pool fed.
-        let mut readers = Vec::with_capacity(self.inputs.len());
-        for path in &self.inputs {
-            readers.push(
-                ReadAheadBuilder {
-                    path: path.clone(),
-                    chunk_size: self.chunk_size,
-                    chunk_count: self.chunk_count,
-                }
-                .build(),
-            );
-        }
+        // routing records to keep the compression pool fed.  Opening waits until every input is
+        // readable, so an unreadable input fails before any shard file is created.
+        let mut readers = open_readers(self.inputs.iter().map(|path| ReadAheadBuilder {
+            path: path.clone(),
+            chunk_size: self.chunk_size,
+            chunk_count: self.chunk_count,
+        }))?;
         let n_inputs = readers.len();
 
         let (mut pool, mut shard_writers) = self.build_writer_pool()?;
@@ -544,6 +539,23 @@ mod tests {
         let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
         let result = build_sharder(&[bad.as_path()], &prefix, 2).execute();
         assert!(result.is_err(), "expected a decompression error but the run succeeded");
+    }
+
+    #[test]
+    fn test_missing_input_fails_before_any_shard_file_is_created() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let missing = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "q", "/1", 1, 10);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let err = build_sharder(&[&r1, &missing], &prefix, 2).execute().unwrap_err();
+        assert!(err.to_string().contains("r2.fq"), "error does not name the input: {err}");
+        let files: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(files, ["r1.fq"]);
     }
 
     #[test]

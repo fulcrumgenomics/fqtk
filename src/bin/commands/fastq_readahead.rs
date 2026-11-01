@@ -31,13 +31,17 @@ type ByteChunk = io::Result<Vec<u8>>;
 /// Read-ahead stream of decompressed input byte chunks produced on a background thread.
 type ByteChunkStream = ChunkedReadAheadIterator<ByteChunk>;
 
-/// Builds a single background-decompressing FASTQ reader for one input file.
+/// Configures a single background-decompressing FASTQ reader for one input file.
 ///
 /// Construct with the input `path` and, optionally, override `chunk_size`/`chunk_count`; the
-/// `Default` impl supplies sensible values for the latter two, so the common case is:
+/// `Default` impl supplies sensible values for the latter two.  Pass the builders for all of a
+/// command's inputs to [`open_readers`] together, so the common case is:
 ///
 /// ```ignore
-/// let reader = ReadAheadBuilder { path, ..Default::default() }.build();
+/// let readers = open_readers(paths.iter().map(|path| ReadAheadBuilder {
+///     path: path.clone(),
+///     ..Default::default()
+/// }))?;
 /// ```
 pub(crate) struct ReadAheadBuilder {
     /// Path to the input FASTQ (may be uncompressed, gzipped, or block-gzipped).
@@ -49,17 +53,13 @@ pub(crate) struct ReadAheadBuilder {
 }
 
 impl ReadAheadBuilder {
-    /// Returns a FASTQ reader that parses records on the consuming thread while a background
-    /// read-ahead thread opens the input and decompresses it into fixed-size byte chunks.
-    ///
-    /// Never blocks: the input is opened on the read-ahead thread, so a failure to open or decode
-    /// it surfaces as an error, naming the path, on the reader's first read.
-    pub(crate) fn build(self) -> FastqReader<ChunkReader> {
+    /// Starts a background read-ahead thread that opens the input and decompresses it into
+    /// fixed-size byte chunks, and returns the reader that serves those chunks.  Never blocks.
+    fn start(self) -> ChunkReader {
         let chunker =
             ByteChunker { path: self.path, reader: None, chunk_size: self.chunk_size, done: false };
         let chunks = chunker.read_ahead(1, self.chunk_count);
-        let chunk_reader = ChunkReader { chunks, current: Vec::new(), pos: 0 };
-        FastqReader::with_capacity(chunk_reader, BUFFER_SIZE)
+        ChunkReader { chunks, current: Vec::new(), pos: 0 }
     }
 }
 
@@ -150,6 +150,19 @@ pub(crate) struct ChunkReader {
     pos: usize,
 }
 
+impl ChunkReader {
+    /// Blocks until the read-ahead thread has opened the input and decompressed its first chunk,
+    /// which is kept to be served first.  Returns the error, naming the path, if the input couldn't
+    /// be opened or its first chunk decoded; an empty input is not an error.  Call it once, before
+    /// any read.
+    fn wait_for_first_chunk(&mut self) -> io::Result<()> {
+        if let Some(chunk) = self.chunks.next() {
+            self.current = chunk?;
+        }
+        Ok(())
+    }
+}
+
 impl Read for ChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Per the `Read` contract a zero-length buffer must return `Ok(0)` without consuming
@@ -176,6 +189,28 @@ impl Read for ChunkReader {
     }
 }
 
+/// Opens each input on its own background read-ahead thread and returns, in the same order, a
+/// FASTQ reader for each that parses records on the calling thread.
+///
+/// Blocks until every input has been opened and its first chunk decompressed, so that an input
+/// that can't be opened or decoded fails here, naming its path, before the caller creates any
+/// output.  Every read-ahead thread is started before waiting on any of them: opening a FIFO
+/// blocks until its writer opens it too, so waiting on each input before starting the next would
+/// deadlock a producer that opens its FIFOs in a different order, or opens them all before writing.
+pub(crate) fn open_readers(
+    inputs: impl IntoIterator<Item = ReadAheadBuilder>,
+) -> io::Result<Vec<FastqReader<ChunkReader>>> {
+    let mut chunk_readers: Vec<ChunkReader> =
+        inputs.into_iter().map(ReadAheadBuilder::start).collect();
+    for chunk_reader in &mut chunk_readers {
+        chunk_reader.wait_for_first_chunk()?;
+    }
+    Ok(chunk_readers
+        .into_iter()
+        .map(|chunk_reader| FastqReader::with_capacity(chunk_reader, BUFFER_SIZE))
+        .collect())
+}
+
 /// Opens `path` for reading, decompressing it if its extension marks it as gzipped.
 fn open_input(path: &Path) -> io::Result<Box<dyn BufRead + Send>> {
     // Unwrap the underlying `io::Error`: `FgError`'s message hides the cause (e.g. "No such
@@ -200,25 +235,69 @@ mod tests {
         text
     }
 
+    /// Returns the names of every record in `reader`.
+    fn read_names(mut reader: FastqReader<ChunkReader>) -> Vec<String> {
+        reader.records().map(|rec| String::from_utf8(rec.unwrap().head).unwrap()).collect()
+    }
+
+    /// Opens a single input with the default chunking.
+    fn open_one(path: &Path) -> io::Result<FastqReader<ChunkReader>> {
+        let mut readers =
+            open_readers([ReadAheadBuilder { path: path.to_path_buf(), ..Default::default() }])?;
+        Ok(readers.remove(0))
+    }
+
     #[test]
-    fn missing_input_errors_on_first_read_naming_the_path() {
+    fn open_readers_fails_on_a_missing_input_naming_the_path() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.fq.gz");
-        let mut reader = ReadAheadBuilder { path: path.clone(), ..Default::default() }.build();
 
-        let err = reader.next().unwrap().unwrap_err().to_string();
+        let err = open_one(&path).err().unwrap().to_string();
         assert!(err.contains(&path.display().to_string()), "error does not name the path: {err}");
     }
 
     #[test]
-    fn invalid_gzip_input_errors_on_first_read_naming_the_path() {
+    fn open_readers_fails_on_an_invalid_gzip_input_naming_the_path() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("plain.fq.gz");
         std::fs::write(&path, fastq_text("q", 3)).unwrap();
-        let mut reader = ReadAheadBuilder { path: path.clone(), ..Default::default() }.build();
 
-        let err = reader.next().unwrap().unwrap_err().to_string();
+        let err = open_one(&path).err().unwrap().to_string();
         assert!(err.contains(&path.display().to_string()), "error does not name the path: {err}");
+    }
+
+    #[test]
+    fn open_readers_fails_when_any_input_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let present = dir.path().join("r1.fq");
+        let missing = dir.path().join("r2.fq");
+        std::fs::write(&present, fastq_text("q", 3)).unwrap();
+        let builders = [&present, &missing]
+            .map(|path| ReadAheadBuilder { path: path.clone(), ..Default::default() });
+
+        let err = open_readers(builders).err().unwrap().to_string();
+        assert!(err.contains(&missing.display().to_string()), "error does not name r2: {err}");
+    }
+
+    #[test]
+    fn an_empty_input_opens_and_has_no_records() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.fq");
+        std::fs::write(&path, "").unwrap();
+
+        assert!(read_names(open_one(&path).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn every_record_is_read_when_the_input_spans_many_chunks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("r1.fq");
+        std::fs::write(&path, fastq_text("q", 20)).unwrap();
+        let builder = ReadAheadBuilder { path, chunk_size: 7, chunk_count: 2 };
+
+        let names = read_names(open_readers([builder]).unwrap().remove(0));
+        let expected: Vec<String> = (1..=20).map(|i| format!("q{i}")).collect();
+        assert_eq!(names, expected);
     }
 
     /// Inputs that are FIFOs (named pipes), whose opens block until the other end is opened.
@@ -260,9 +339,13 @@ mod tests {
             }
         }
 
-        /// Reads every record from `reader`, returning the record names.
-        fn read_names(mut reader: FastqReader<ChunkReader>) -> Vec<String> {
-            reader.records().map(|rec| String::from_utf8(rec.unwrap().head).unwrap()).collect()
+        /// Opens `r1` and `r2` together and returns the record names read from each.
+        fn read_pair(r1: PathBuf, r2: PathBuf) -> (Vec<String>, Vec<String>) {
+            let builders = [r1, r2].map(|path| ReadAheadBuilder { path, ..Default::default() });
+            let mut readers = open_readers(builders).unwrap().into_iter();
+            let r1_names = read_names(readers.next().unwrap());
+            let r2_names = read_names(readers.next().unwrap());
+            (r1_names, r2_names)
         }
 
         #[test]
@@ -285,11 +368,7 @@ mod tests {
                 }
             });
 
-            let (r1_names, r2_names) = run_with_deadline(move || {
-                let r1_reader = ReadAheadBuilder { path: r1, ..Default::default() }.build();
-                let r2_reader = ReadAheadBuilder { path: r2, ..Default::default() }.build();
-                (read_names(r1_reader), read_names(r2_reader))
-            });
+            let (r1_names, r2_names) = run_with_deadline(move || read_pair(r1, r2));
             producer.join().unwrap();
             assert_eq!(r1_names, ["r1_1", "r1_2", "r1_3"]);
             assert_eq!(r2_names, ["r2_1", "r2_2", "r2_3"]);
@@ -303,7 +382,7 @@ mod tests {
             make_fifo(&r1);
             make_fifo(&r2);
 
-            // Opens R2 first, the reverse of the order in which the readers are built.
+            // Opens R2 first, the reverse of the order in which the inputs are given.
             let (r1_out, r2_out) = (r1.clone(), r2.clone());
             let producer = thread::spawn(move || {
                 let mut r2_fifo = File::create(r2_out).unwrap();
@@ -312,11 +391,7 @@ mod tests {
                 r2_fifo.write_all(fastq_text("r2_", 3).as_bytes()).unwrap();
             });
 
-            let (r1_names, r2_names) = run_with_deadline(move || {
-                let r1_reader = ReadAheadBuilder { path: r1, ..Default::default() }.build();
-                let r2_reader = ReadAheadBuilder { path: r2, ..Default::default() }.build();
-                (read_names(r1_reader), read_names(r2_reader))
-            });
+            let (r1_names, r2_names) = run_with_deadline(move || read_pair(r1, r2));
             producer.join().unwrap();
             assert_eq!(r1_names, ["r1_1", "r1_2", "r1_3"]);
             assert_eq!(r2_names, ["r2_1", "r2_2", "r2_3"]);
