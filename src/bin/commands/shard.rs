@@ -1,6 +1,7 @@
 use crate::commands::command::Command;
-use crate::commands::fastq_readahead::{ReadAheadBuilder, open_readers};
-use anyhow::{Result, anyhow};
+use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::read_set_reader::ReadSetReader;
+use anyhow::Result;
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
 use itertools::Itertools;
@@ -47,6 +48,9 @@ impl ShardWriters<PooledWriter> {
 ///
 /// Inputs may be uncompressed, gzipped, or block-gzipped.  Output files are _always_ block gzipped.
 ///
+/// The records read together from the inputs must share a read name, ignoring any `/1` or `/2`
+/// suffix and comment, unless `--disable-read-name-checking` is given.
+///
 #[derive(Parser, Debug)]
 #[command(version)]
 #[clap(verbatim_doc_comment)]
@@ -81,6 +85,10 @@ pub(crate) struct Shard {
     #[clap(long, short = 'c', default_value = "1",
            value_parser = RangedU64ValueParser::<u8>::new().range(1..=12))]
     compression_level: u8,
+
+    /// Disable checking that read names are in sync across input files.
+    #[clap(long)]
+    disable_read_name_checking: bool,
 
     /// (hidden) Size, in bytes, of each decompressed input chunk passed from a per-input
     /// decompression thread to the main parsing thread.
@@ -151,12 +159,16 @@ impl Command for Shard {
         // main thread.  Keeping inflation off the main thread lets it spend its time parsing and
         // routing records to keep the compression pool fed.  Opening waits until every input is
         // readable, so an unreadable input fails before any shard file is created.
-        let mut readers = open_readers(self.inputs.iter().map(|path| ReadAheadBuilder {
-            path: path.clone(),
-            chunk_size: self.chunk_size,
-            chunk_count: self.chunk_count,
-        }))?;
-        let n_inputs = readers.len();
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|path| ReadAheadBuilder {
+                path: path.clone(),
+                chunk_size: self.chunk_size,
+                chunk_count: self.chunk_count,
+            })
+            .collect();
+        let mut read_sets = ReadSetReader::open(inputs, !self.disable_read_name_checking)?;
 
         let (mut pool, mut shard_writers) = self.build_writer_pool()?;
 
@@ -180,35 +192,19 @@ impl Command for Shard {
         let mut target_shard_idx: usize = 0;
         let process_result: Result<()> = 'process: {
             loop {
-                // Pull one record from each input *before* writing any of them.  Validating the
-                // whole set up front means an out-of-sync set (one input short of the others) is
-                // rejected without leaving a half-written, misaligned set in the output files.
-                let records: Vec<_> = readers.iter_mut().map(|reader| reader.next()).collect();
-
-                for result in records.iter().flatten() {
-                    if let Err(e) = result {
-                        break 'process Err(anyhow!("Error reading FASTQ input: {e}"));
-                    }
-                }
-
-                let present = records.iter().filter(|slot| slot.is_some()).count();
-                if present == 0 {
-                    break; // all inputs exhausted together: a clean end of input
-                }
-                if present != n_inputs {
-                    break 'process Err(anyhow!(
-                        "FASTQ sources out of sync; expected {} records but got {}.",
-                        n_inputs,
-                        present
-                    ));
-                }
+                // The whole read set is read and checked before any of it is written, so a read
+                // error, an early end or a name mismatch can't leave a half-written, misaligned
+                // set in the outputs.
+                let records = match read_sets.next() {
+                    Ok(Some(records)) => records,
+                    Ok(None) => break, // all inputs ended together: a clean end of input
+                    Err(e) => break 'process Err(e),
+                };
 
                 let target = &mut shard_writers[target_shard_idx];
-                for (slot, writer) in records.iter().zip(target.writers.iter_mut()) {
-                    if let Some(Ok(record)) = slot {
-                        if let Err(e) = record.write_unchanged(&mut *writer) {
-                            break 'process Err(e.into());
-                        }
+                for (record, writer) in records.iter().zip(target.writers.iter_mut()) {
+                    if let Err(e) = record.write_unchanged(&mut *writer) {
+                        break 'process Err(e.into());
                     }
                 }
 
@@ -246,7 +242,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Writes zero or more records to the given `Write`.  Bases and quals are randomly
-    /// generated.  Read names are of the format `{prefix}{suffix}{idx}` where `idx` starts
+    /// generated.  Read names are of the format `{prefix}{idx}{suffix}` where `idx` starts
     /// from the value of the `idx` parameter, and increases by one for each record.
     fn write_fastq_records<W: Write>(
         out: &mut W,
@@ -304,6 +300,7 @@ mod tests {
             shards,
             threads: 4,
             compression_level: 1,
+            disable_read_name_checking: false,
             // Deliberately small so most records straddle chunk boundaries, exercising the
             // ChunkReader reassembly path across the test suite.
             chunk_size: 100,
@@ -528,6 +525,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mismatched_read_names_fail() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "a", "/1", 1, 5);
+        build_fastq(r2.as_path(), "b", "/2", 1, 5);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let err = build_sharder(&[&r1, &r2], &prefix, 2).execute().unwrap_err();
+        assert!(err.to_string().contains("Read name mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_mismatched_read_names_are_sharded_with_checking_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        let r2 = PathBuf::from(tmp.path()).join("r2.fq");
+        build_fastq(r1.as_path(), "a", "/1", 1, 5);
+        build_fastq(r2.as_path(), "b", "/2", 1, 5);
+
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let sharder =
+            Shard { disable_read_name_checking: true, ..build_sharder(&[&r1, &r2], &prefix, 2) };
+        sharder.execute().unwrap();
+        let outputs = collect_shard_outputs(&prefix, 2, 2, read_fastq);
+        assert_eq!(outputs.iter().flatten().flatten().count(), 10);
+    }
+
     /// A corrupt or truncated gzip input must surface as an error rather than hanging or silently
     /// producing empty output -- this exercises the ByteChunker -> ChunkReader error propagation.
     #[test]
@@ -619,6 +645,7 @@ mod tests {
             shards: 2,
             threads: 2,
             compression_level: 1,
+            disable_read_name_checking: false,
             chunk_size: 64 * 1024,
             chunk_count: 4,
         };
@@ -649,6 +676,7 @@ mod tests {
             shards: 3,
             threads: 4,
             compression_level: 1,
+            disable_read_name_checking: false,
             chunk_size: 3,
             chunk_count: 2,
         };
@@ -677,6 +705,7 @@ mod tests {
             shards: 2,
             threads: 2,
             compression_level: 1,
+            disable_read_name_checking: false,
             chunk_size: 8 * 1024 * 1024,
             chunk_count: 4,
         };

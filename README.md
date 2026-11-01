@@ -327,6 +327,9 @@ relative paths interpreted relative to the working directory where the command i
 
 Inputs may be uncompressed, gzipped, or block-gzipped.  Output files are _always_ block gzipped.
 
+The records read together from the inputs must share a read name, ignoring any `/1` or `/2`
+suffix and comment, unless `--disable-read-name-checking` is given.
+
 Usage: fqtk shard [OPTIONS] --inputs <INPUTS>... --output-prefix <OUTPUT_PREFIX> --shards <SHARDS>
 
 Options:
@@ -358,6 +361,9 @@ Options:
           The level of compression to use to compress outputs.  Defaults to 1 because sharded FASTQs are typically short-lived intermediates, where write throughput matters more than squeezing out the last few percent of file size
 
           [default: 1]
+
+      --disable-read-name-checking
+          Disable checking that read names are in sync across input files
 
   -h, --help
           Print help (see a summary with '-h')

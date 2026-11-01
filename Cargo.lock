@@ -444,6 +444,7 @@ dependencies = [
  "flate2",
  "itertools",
  "log",
+ "memchr",
  "mimalloc",
  "pooled-writer",
  "proglog",
