@@ -856,9 +856,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pooled-writer"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8fc96ca1297aa8292ecb9a33f3bd0174be25ee418617a6c09054b2da65d3ea4"
+checksum = "4af4d5db34d4bd183d86097ec6b39a124014705fa51eef21b354d3e7087bbbfb"
 dependencies = [
  "bgzf",
  "bytes",
