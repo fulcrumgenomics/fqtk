@@ -8,7 +8,7 @@ set -euo pipefail
 # GitHub Actions verifies the README is up to date, so run this whenever a tool's arguments or
 # docstring change and commit the result.
 
-tools=(demux shard subsample)
+tools=(demux shard shuffle subsample)
 
 for tool in "${tools[@]}"; do
     usage="usage-${tool}.txt"

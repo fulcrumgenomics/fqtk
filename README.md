@@ -30,6 +30,7 @@ A toolkit for working with FASTQ files, written in Rust.
 
 - **`demux`** — demultiplex one or more FASTQ files into per-sample FASTQs using sample barcodes at fixed positions within the reads.
 - **`shard`** — split one or more matched FASTQs (e.g. R1/R2) into N shards, assigning reads round-robin so each input read ends up in exactly one output FASTQ.
+- **`shuffle`** — shuffle one or more synchronized FASTQs into a reproducible random order, using bounded memory for inputs of any size.
 - **`subsample`** — randomly subsample reads from one or more synchronized FASTQs.
 
 All tools are highly efficient and multi-threaded for high performance.
@@ -374,6 +375,103 @@ Options:
           Print version
 ````
 <!-- end usage:shard -->
+
+## `fqtk shuffle`
+
+`fqtk shuffle` reads one or more synchronized FASTQs (e.g. R1 and R2) and writes the same reads in a random order, using the same order in every output so paired reads stay in sync.  The order comes from a seeded hash of each read's name, so it is reproducible whatever the thread count or memory limit.  Inputs larger than `--max-memory` are split into temporary zstd-compressed files that are each sorted in memory, so inputs of any size can be shuffled with bounded memory.
+
+Usage for `fqtk shuffle` follows:
+
+<!-- start usage:shuffle -->
+````console
+
+Shuffles reads in one or more synchronized FASTQ files into a random order.
+
+Reads one or more FASTQ files (e.g. paired-end R1 and R2) and writes the same
+records in a random order. All input files must contain the same number of
+reads in the same order; every output file gets the same order, so paired
+reads stay in sync. Records are written as they appear in the input, except
+that a last record missing its newline gains one.
+
+Writes one output file per input, in the same order, to the paths given by
+`--outputs`. Output files are always BGZF compressed. If shuffling fails once
+its outputs are open, those that are regular files are deleted so they can't
+be mistaken for complete ones.
+
+The order is set by a seeded hash of each read's name (ignoring any `/1` or
+`/2` suffix and comment), so the same reads and seed always produce the same
+output, whatever the thread count or memory limit. Reads that share a name
+stay next to each other in input order, and a warning says how many repeat
+the name before them. When no `--seed` is given, the seed is derived from the name, bases and
+qualities of the first read set, so the same reads get the same order whether
+they come from a plain file, a gzipped file or a pipe, and whatever their
+comments or line endings.
+
+Inputs that fit within `--max-memory` are shuffled in memory. Larger inputs
+are split by hash into temporary zstd-compressed files in `--tmp-dir`, which
+are then sorted and written out one at a time. This needs temporary disk
+space for a compressed copy of the input, plus a little more while any
+bucket too large for memory is split again. When reading from pipes, give
+`--expected-reads` so the temporary files can be sized to the input. If
+shuffle is killed, delete the `fqtk-shuffle.*` directories it leaves in the
+temporary directory.
+
+# Example
+
+```bash
+fqtk shuffle \
+    --inputs r1.fq.gz r2.fq.gz \
+    --outputs shuffled.r1.fq.gz shuffled.r2.fq.gz
+```
+
+Usage: fqtk shuffle [OPTIONS] --inputs <INPUTS>... --outputs <OUTPUTS>...
+
+Options:
+  -i, --inputs <INPUTS>...
+          One or more input FASTQ files, gzipped if their names end in .gz or .bgz. All files must have the same number of reads in the same order
+
+  -o, --outputs <OUTPUTS>...
+          Output FASTQ files, one per input in the same order. Always BGZF compressed
+
+  -s, --seed <SEED>
+          Seed for the shuffle. When omitted, the seed is derived from the first read set
+
+  -t, --threads <THREADS>
+          Number of threads to use. Minimum 2. In addition, one thread per input for read and decompression, and up to about a quarter more run briefly while temporary files are loaded
+
+          [default: 8]
+
+  -c, --compression-level <COMPRESSION_LEVEL>
+          BGZF compression level for output files, from 0 (BGZF blocks without compression, e.g. for a pipe to another tool) to 12
+
+          [default: 5]
+
+  -m, --max-memory <MAX_MEMORY>
+          Total memory, not per thread, for holding reads while sorting them, e.g. 512M or 4G. K, M, G and T are binary (1024-based) units
+
+          [default: 4G]
+
+  -T, --tmp-dir <DIR>
+          Directory for temporary files, which need room for a compressed copy of the input. Repeat to spread them across several directories. Defaults to the system temporary directory
+
+      --temp-compression <TEMP_COMPRESSION>
+          Zstd compression level for temporary files, from 1 (fastest) to 19
+
+          [default: 1]
+
+      --disable-read-name-checking
+          Disable checking that read names are in sync across input files
+
+      --expected-reads <EXPECTED_READS>
+          Approximate number of reads in each input file (i.e. read pairs for paired-end input), used to size temporary files for large inputs. Useful when reading from pipes, whose size is unknown, and takes precedence over the estimate from input file sizes. Overestimating costs little; underestimating can add an extra pass over the data
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+````
+<!-- end usage:shuffle -->
 
 ## `fqtk subsample`
 

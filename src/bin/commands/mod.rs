@@ -4,4 +4,5 @@ pub mod fastq_readahead;
 pub mod outputs;
 pub mod read_set_reader;
 pub mod shard;
+pub mod shuffle;
 pub mod subsample;
