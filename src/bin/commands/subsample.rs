@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::fastq_readahead::{ReadAheadBuilder, open_readers};
 use anyhow::Result;
 use clap::Parser;
 use log::info;
@@ -196,14 +196,16 @@ impl Command for Subsample {
         info!("Using random seed: {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // Open one reader per input.  Decompression runs on a background read-ahead thread per
-        // input and hands decompressed byte chunks to these readers, which parse records here on
-        // the main thread.  Keeping inflation off the main thread leaves it free to parse records
-        // and run the per-record RNG draw and read-name sync checks.
-        let mut sources = Vec::with_capacity(self.inputs.len());
-        for path in &self.inputs {
-            sources.push(ReadAheadBuilder { path: path.clone(), ..Default::default() }.build()?);
-        }
+        // Create one reader per input.  Each input is opened and decompressed on its own
+        // background read-ahead thread, and its reader parses the decompressed bytes here on the
+        // main thread.  Keeping inflation off the main thread leaves it free to parse records and
+        // run the per-record RNG draw and read-name sync checks.  Opening waits until every input
+        // is readable, so an unreadable input fails before any output file is created.
+        let mut sources = open_readers(
+            self.inputs
+                .iter()
+                .map(|path| ReadAheadBuilder { path: path.clone(), ..Default::default() }),
+        )?;
 
         // Create output writers
         let (mut pool, mut writers) = self.create_writers()?;
@@ -438,6 +440,25 @@ mod tests {
         };
         let err = cmd.validate().unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn test_invalid_gzip_input_fails_before_any_output_is_created() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("r1.fq.gz");
+        std::fs::write(&input, "@r\nACGT\n+\nIIII\n").unwrap();
+        let cmd = Subsample {
+            inputs: vec![input],
+            output: tmp.path().join("out"),
+            fraction: 0.5,
+            threads: 2,
+            compression_level: 1,
+            seed: None,
+            disable_read_name_checking: false,
+        };
+        let err = cmd.execute().unwrap_err();
+        assert!(err.to_string().contains("r1.fq.gz"), "error does not name the input: {err}");
+        assert!(!tmp.path().join("out.R1.fq.gz").exists(), "output created before the failure");
     }
 
     #[test]
