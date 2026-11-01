@@ -1,5 +1,6 @@
 use crate::commands::command::Command;
-use crate::commands::fastq_readahead::{ReadAheadBuilder, open_readers};
+use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::read_set_reader::ReadSetReader;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
@@ -7,7 +8,6 @@ use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use seq_io::fastq::Record;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -95,21 +95,6 @@ impl Hash for Subsample {
         self.compression_level.hash(state);
         self.seed.hash(state);
         self.disable_read_name_checking.hash(state);
-    }
-}
-
-/// Returns the read name portion of a FASTQ header, stripping any trailing
-/// `/1` or `/2` paired-end suffix and any comment after whitespace.
-fn base_read_name(head: &[u8]) -> &[u8] {
-    let name_end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
-    let name = &head[..name_end];
-    if name.len() >= 2
-        && name[name.len() - 2] == b'/'
-        && matches!(name[name.len() - 1], b'1' | b'2')
-    {
-        &name[..name.len() - 2]
-    } else {
-        name
     }
 }
 
@@ -201,11 +186,12 @@ impl Command for Subsample {
         // main thread.  Keeping inflation off the main thread leaves it free to parse records and
         // run the per-record RNG draw and read-name sync checks.  Opening waits until every input
         // is readable, so an unreadable input fails before any output file is created.
-        let mut sources = open_readers(
-            self.inputs
-                .iter()
-                .map(|path| ReadAheadBuilder { path: path.clone(), ..Default::default() }),
-        )?;
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|path| ReadAheadBuilder { path: path.clone(), ..Default::default() })
+            .collect();
+        let mut read_sets = ReadSetReader::open(inputs, !self.disable_read_name_checking)?;
 
         // Create output writers
         let (mut pool, mut writers) = self.create_writers()?;
@@ -218,9 +204,6 @@ impl Command for Subsample {
         );
 
         let log_unit: u64 = 5_000_000;
-        let num_inputs = sources.len();
-        let check_names = !self.disable_read_name_checking && num_inputs > 1;
-        let mut expected_name: Vec<u8> = Vec::new();
         let mut total_read: u64 = 0;
         let mut total_kept: u64 = 0;
 
@@ -232,58 +215,19 @@ impl Command for Subsample {
             loop {
                 let keep = rng.random::<f64>() < self.fraction;
 
-                // Pull one record from each input *before* writing any of them, mirroring shard.
-                // Validating the whole set up front means a failure partway through a set (read
-                // error or premature EOF) is surfaced without leaving a half-written, misaligned
-                // set in the output files.
-                let records: Vec<_> = sources.iter_mut().map(|source| source.next()).collect();
+                // The whole read set is read and checked before any of it is written, so a read
+                // error, an early end or a name mismatch can't leave a half-written, misaligned
+                // set in the outputs.
+                let records = match read_sets.next() {
+                    Ok(Some(records)) => records,
+                    Ok(None) => break, // all inputs ended together: a clean end of input
+                    Err(e) => break 'process Err(e),
+                };
 
-                for result in records.iter().flatten() {
-                    if let Err(e) = result {
-                        break 'process Err(anyhow::anyhow!("Error reading FASTQ input: {e}"));
-                    }
-                }
-
-                let records_found = records.iter().filter(|slot| slot.is_some()).count();
-                if records_found == 0 {
-                    break; // all inputs exhausted together: a clean end of input
-                }
-                if records_found != num_inputs {
-                    break 'process Err(anyhow::anyhow!(
-                        "FASTQ files are out of sync: {} of {} files had a record at read {}",
-                        records_found,
-                        num_inputs,
-                        total_read + 1,
-                    ));
-                }
-
-                // Read-name checking and writing happen only for kept sets.  The name check still
-                // runs before any write so a mismatch can't leave a half-written, misaligned set.
                 if keep {
-                    if check_names {
-                        for (i, slot) in records.iter().enumerate() {
-                            if let Some(Ok(rec)) = slot {
-                                let name = base_read_name(rec.head());
-                                if i == 0 {
-                                    expected_name.clear();
-                                    expected_name.extend_from_slice(name);
-                                } else if name != expected_name.as_slice() {
-                                    break 'process Err(anyhow::anyhow!(
-                                        "Read name mismatch at read {}: file 0={:?}, file {i}={:?}",
-                                        total_read + 1,
-                                        String::from_utf8_lossy(&expected_name),
-                                        String::from_utf8_lossy(name),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    for (slot, writer) in records.iter().zip(writers.iter_mut()) {
-                        if let Some(Ok(rec)) = slot {
-                            if let Err(e) = rec.write_unchanged(&mut *writer) {
-                                break 'process Err(e.into());
-                            }
+                    for (record, writer) in records.iter().zip(writers.iter_mut()) {
+                        if let Err(e) = record.write_unchanged(&mut *writer) {
+                            break 'process Err(e.into());
                         }
                     }
                 }
@@ -329,6 +273,7 @@ impl Command for Subsample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::read_set_reader::base_read_name;
     use fgoxide::io::Io;
     use seq_io::fastq::OwnedRecord;
     use seq_io::fastq::Reader as FastqReader;
@@ -385,43 +330,6 @@ mod tests {
 
     fn make_bases(n: usize) -> Vec<&'static str> {
         vec!["ACGTACGTACGT"; n]
-    }
-
-    // ---- base_read_name tests ----
-
-    #[test]
-    fn test_base_read_name_plain() {
-        assert_eq!(base_read_name(b"readname"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_with_slash_1() {
-        assert_eq!(base_read_name(b"readname/1"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_with_slash_2() {
-        assert_eq!(base_read_name(b"readname/2"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_with_comment() {
-        assert_eq!(base_read_name(b"readname some comment"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_with_suffix_and_comment() {
-        assert_eq!(base_read_name(b"readname/1 some comment"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_with_tab_comment() {
-        assert_eq!(base_read_name(b"readname\tcomment"), b"readname");
-    }
-
-    #[test]
-    fn test_base_read_name_slash_3_not_stripped() {
-        assert_eq!(base_read_name(b"readname/3"), b"readname/3");
     }
 
     // ---- validation tests ----
@@ -849,6 +757,25 @@ mod tests {
             inputs: vec![input_r1, input_r2],
             output: output.clone(),
             fraction: 1.0,
+            threads: 2,
+            compression_level: 1,
+            seed: Some(42),
+            disable_read_name_checking: false,
+        };
+        let err = cmd.execute().unwrap_err();
+        assert!(err.to_string().contains("Read name mismatch"), "{err}");
+    }
+
+    #[test]
+    fn test_read_name_check_fails_on_reads_that_are_not_kept() {
+        let tmp = TempDir::new().unwrap();
+        let input_r1 = write_fastq(&tmp, "r1", &fq_lines_from_bases("readA", &["ACGT"; 5]));
+        let input_r2 = write_fastq(&tmp, "r2", &fq_lines_from_bases("readB", &["ACGT"; 5]));
+
+        let cmd = Subsample {
+            inputs: vec![input_r1, input_r2],
+            output: tmp.path().join("out"),
+            fraction: 0.0,
             threads: 2,
             compression_level: 1,
             seed: Some(42),
