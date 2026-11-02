@@ -1,17 +1,18 @@
-use crate::commands::command::Command;
+use crate::commands::command::{Command, validation_result};
 use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::outputs::{
+    check_output_paths, create_bgzf_writers, remove_incomplete_outputs,
+};
 use crate::commands::read_set_reader::ReadSetReader;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
-use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
+use pooled_writer::PooledWriter;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::hash_map::DefaultHasher;
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::BufWriter;
 use std::path::PathBuf;
 
 /// Formats a u64 with comma separators (e.g. 1,234,567).
@@ -35,7 +36,8 @@ fn fmt_count(n: u64) -> String {
 /// discarded across all files simultaneously.
 ///
 /// Output files are named `{output}.R1.fq.gz`, `{output}.R2.fq.gz`, etc.
-/// and are always BGZF compressed.
+/// and are always BGZF compressed. If subsampling fails, they are deleted so they
+/// can't be mistaken for complete ones.
 ///
 /// Each read is independently retained with probability equal to `--fraction`,
 /// giving an approximate subsample without needing to know the total read count
@@ -136,40 +138,15 @@ impl Subsample {
             errors.push(format!("Compression level must be 1-12, got {}.", self.compression_level));
         }
 
-        if let Some(parent) = self.output.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                errors.push(format!("Output parent directory {parent:?} does not exist."));
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            let details = errors.iter().fold(String::new(), |mut s, e| {
-                s.push_str(&format!("    - {e}\n"));
-                s
-            });
-            Err(anyhow::anyhow!("The following errors with the input(s) were detected:\n{details}"))
-        }
+        check_output_paths(&self.inputs, &self.output_paths(), &mut errors);
+        validation_result(&errors)
     }
 
-    /// Creates BGZF-compressed pooled output writers, one per input file.
-    fn create_writers(&self) -> Result<(Pool, Vec<PooledWriter>)> {
-        let writer_threads = self.threads - 1;
-        let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
-            .threads(writer_threads)
-            .queue_size(writer_threads * 50)
-            .compression_level(u8::try_from(self.compression_level)?)?;
-
-        let mut writers = Vec::with_capacity(self.inputs.len());
-        for idx in 0..self.inputs.len() {
-            let path = PathBuf::from(format!("{}.R{}.fq.gz", self.output.display(), idx + 1));
-            let file_writer = BufWriter::new(File::create(&path)?);
-            writers.push(pool_builder.exchange(file_writer));
-        }
-
-        let pool = pool_builder.build()?;
-        Ok((pool, writers))
+    /// Returns the output paths, `{output}.R1.fq.gz` etc., one per input in the same order.
+    fn output_paths(&self) -> Vec<PathBuf> {
+        (1..=self.inputs.len())
+            .map(|n| PathBuf::from(format!("{}.R{n}.fq.gz", self.output.display())))
+            .collect()
     }
 }
 
@@ -193,8 +170,10 @@ impl Command for Subsample {
             .collect();
         let mut read_sets = ReadSetReader::open(inputs, !self.disable_read_name_checking)?;
 
-        // Create output writers
-        let (mut pool, mut writers) = self.create_writers()?;
+        // All but this thread compress the output.
+        let outputs = self.output_paths();
+        let (mut pool, mut writers) =
+            create_bgzf_writers(&outputs, self.threads - 1, u8::try_from(self.compression_level)?)?;
 
         info!(
             "Subsampling {} input file(s) at fraction {:.4} to {:?}",
@@ -256,7 +235,11 @@ impl Command for Subsample {
         let close_result =
             writers.into_iter().try_for_each(PooledWriter::close).map_err(anyhow::Error::from);
         let stop_result = pool.stop_pool().map_err(anyhow::Error::from);
-        process_result.and(close_result).and(stop_result)?;
+        let result = process_result.and(close_result).and(stop_result);
+        if result.is_err() {
+            remove_incomplete_outputs(&outputs);
+        }
+        result?;
 
         let pct = if total_read > 0 { total_kept as f64 / total_read as f64 * 100.0 } else { 0.0 };
         info!(
@@ -809,24 +792,15 @@ mod tests {
         cmd.execute().unwrap();
     }
 
-    /// When paired inputs have different lengths the run must error *and* must not leave a
-    /// half-written, misaligned set: the kept R1/R2 outputs must hold equal record counts (the
-    /// orphan record from the longer input must not have been written before the error).
     #[test]
-    fn test_out_of_sync_inputs_leave_no_orphan_record() {
+    fn test_out_of_sync_inputs_fail_and_remove_the_outputs() {
         let tmp = TempDir::new().unwrap();
-        // Same read names so the name check passes; R1 has one extra record so the third set is
-        // out of sync.  At fraction 1.0 every in-sync set is kept, so without validate-before-write
-        // the orphan R1 record would be emitted before the mismatch is detected.
-        let lines_r1 = fq_lines_from_bases("r", &make_bases(3));
-        let lines_r2 = fq_lines_from_bases("r", &make_bases(2));
-        let input_r1 = write_fastq(&tmp, "r1", &lines_r1);
-        let input_r2 = write_fastq(&tmp, "r2", &lines_r2);
-        let output = tmp.path().join("out");
+        let input_r1 = write_fastq(&tmp, "r1", &fq_lines_from_bases("r", &make_bases(3)));
+        let input_r2 = write_fastq(&tmp, "r2", &fq_lines_from_bases("r", &make_bases(2)));
 
         let cmd = Subsample {
             inputs: vec![input_r1, input_r2],
-            output: output.clone(),
+            output: tmp.path().join("out"),
             fraction: 1.0,
             threads: 2,
             compression_level: 1,
@@ -835,16 +809,28 @@ mod tests {
         };
         let err = cmd.execute().unwrap_err();
         assert!(err.to_string().contains("out of sync"), "unexpected error: {err}");
+        for output in cmd.output_paths() {
+            assert!(!output.exists(), "{output:?} was left behind");
+        }
+    }
 
-        let r1 = read_fastq(&PathBuf::from(format!("{}.R1.fq.gz", output.display())));
-        let r2 = read_fastq(&PathBuf::from(format!("{}.R2.fq.gz", output.display())));
-        assert_eq!(
-            r1.len(),
-            r2.len(),
-            "R1/R2 outputs left misaligned on the out-of-sync error path"
-        );
-        // The two in-sync pairs must be kept (fraction 1.0) and only the orphan third read
-        // rejected -- guards against the assertion passing vacuously if both outputs were empty.
-        assert_eq!(r1.len(), 2, "expected the two in-sync pairs to be preserved");
+    #[test]
+    fn test_an_output_that_is_an_input_is_rejected_before_it_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("sub.R1.fq.gz");
+        std::fs::write(&input, "@r\nACGT\n+\nIIII\n").unwrap();
+
+        let cmd = Subsample {
+            inputs: vec![input.clone()],
+            output: tmp.path().join("sub"),
+            fraction: 0.5,
+            threads: 2,
+            compression_level: 1,
+            seed: Some(42),
+            disable_read_name_checking: false,
+        };
+        let err = cmd.execute().unwrap_err();
+        assert!(err.to_string().contains("is also an input"), "unexpected error: {err}");
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), "@r\nACGT\n+\nIIII\n");
     }
 }

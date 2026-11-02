@@ -1,31 +1,16 @@
-use crate::commands::command::Command;
+use crate::commands::command::{Command, validation_result};
 use crate::commands::fastq_readahead::ReadAheadBuilder;
+use crate::commands::outputs::{
+    check_output_paths, create_bgzf_writers, remove_incomplete_outputs,
+};
 use crate::commands::read_set_reader::ReadSetReader;
 use anyhow::Result;
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
-use itertools::Itertools;
 use log::info;
-use pooled_writer::{Pool, PoolBuilder, PooledWriter, bgzf::BgzfCompressor};
+use pooled_writer::PooledWriter;
 use proglog::{CountFormatterKind, ProgLogBuilder};
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-
-/// Holds the set of output writers for a single shard, one per input FASTQ.
-struct ShardWriters<W: Write> {
-    /// The output writers for this shard, one per input FASTQ.
-    writers: Vec<W>,
-}
-
-impl ShardWriters<PooledWriter> {
-    /// Attempts to gracefully shut down the writers in this struct, consuming the struct in the
-    /// process. Will error if closing of the `PooledWriter`s fails for any reason.
-    fn close(self) -> Result<()> {
-        self.writers.into_iter().try_for_each(PooledWriter::close)?;
-        Ok(())
-    }
-}
+use std::path::PathBuf;
 
 /// Shards a set of FASTQs into N output shards.
 ///
@@ -50,6 +35,8 @@ impl ShardWriters<PooledWriter> {
 ///
 /// The records read together from the inputs must share a read name, ignoring any `/1` or `/2`
 /// suffix and comment, unless `--disable-read-name-checking` is given.
+///
+/// If sharding fails, output files are deleted so they can't be mistaken for complete ones.
 ///
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -103,55 +90,31 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
-    /// Builds the fastq writers for each output file and shard, and then instantiates
-    /// a writer pool using block-gzip compression.  Returns the writer Pool itself along
-    /// with a Vec of `ShardWriters` each of which can accept and write `Vec`s of fastq records
-    /// with one record from each of the input files.
-    fn build_writer_pool(&self) -> Result<(Pool, Vec<ShardWriters<PooledWriter>>)> {
-        // First build up the per-shard writers
-        let mut shard_writers = Vec::with_capacity(self.shards);
-        for shard in 1..=self.shards {
-            let mut ws = Vec::with_capacity(self.inputs.len());
+    /// Checks the output paths before any input is read or output created.
+    fn validate(&self) -> Result<()> {
+        let mut errors = Vec::new();
+        check_output_paths(&self.inputs, &self.output_paths(), &mut errors);
+        validation_result(&errors)
+    }
 
-            for source_idx in 1..=self.inputs.len() {
-                let path_str = format!(
-                    "{prefix}.{shard_prefix}{shard_num}.{read_prefix}{read_num}.fq.gz",
-                    prefix = self.output_prefix,
-                    shard_prefix = self.shard_prefix,
-                    shard_num = shard,
-                    read_prefix = self.read_number_prefix,
-                    read_num = source_idx
-                );
-                let path = Path::new(&path_str);
-                let writer = BufWriter::new(File::create(path)?);
-                ws.push(writer);
+    /// Returns the output paths: one per input for the first shard, then for the second, etc.
+    fn output_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(self.shards * self.inputs.len());
+        for shard_num in 1..=self.shards {
+            for read_num in 1..=self.inputs.len() {
+                paths.push(PathBuf::from(format!(
+                    "{}.{}{shard_num}.{}{read_num}.fq.gz",
+                    self.output_prefix, self.shard_prefix, self.read_number_prefix
+                )));
             }
-
-            shard_writers.push(ShardWriters { writers: ws });
         }
-
-        // Then construct the writer pool, reserving one thread for the main loop.
-        let pool_threads = self.threads - 1;
-        let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
-            .threads(pool_threads)
-            .queue_size(pool_threads * 50)
-            .compression_level(self.compression_level)?;
-
-        // Then exchange the file writers for pooled (compressing) writers.
-        let mut pooled_shard_writers = Vec::with_capacity(shard_writers.len());
-        for shard_writer in shard_writers.into_iter() {
-            let pooled_writers =
-                shard_writer.writers.into_iter().map(|w| pool_builder.exchange(w)).collect_vec();
-            pooled_shard_writers.push(ShardWriters { writers: pooled_writers });
-        }
-
-        let pool = pool_builder.build()?;
-        Ok((pool, pooled_shard_writers))
+        paths
     }
 }
 
 impl Command for Shard {
     fn execute(&self) -> Result<()> {
+        self.validate()?;
         info!("Reading {} input FASTQs and generating {} shards.", self.inputs.len(), self.shards);
 
         // Create one reader per input.  Each input is opened and decompressed on its own
@@ -170,7 +133,11 @@ impl Command for Shard {
             .collect();
         let mut read_sets = ReadSetReader::open(inputs, !self.disable_read_name_checking)?;
 
-        let (mut pool, mut shard_writers) = self.build_writer_pool()?;
+        // All but this thread compress the output.
+        let outputs = self.output_paths();
+        let (mut pool, mut writers) =
+            create_bgzf_writers(&outputs, self.threads - 1, self.compression_level)?;
+        let n_inputs = self.inputs.len();
 
         let logger = ProgLogBuilder::new()
             .name("fqtk")
@@ -201,8 +168,8 @@ impl Command for Shard {
                     Err(e) => break 'process Err(e),
                 };
 
-                let target = &mut shard_writers[target_shard_idx];
-                for (record, writer) in records.iter().zip(target.writers.iter_mut()) {
+                let target = &mut writers[target_shard_idx * n_inputs..][..n_inputs];
+                for (record, writer) in records.iter().zip(target) {
                     if let Err(e) = record.write_unchanged(&mut *writer) {
                         break 'process Err(e.into());
                     }
@@ -218,9 +185,14 @@ impl Command for Shard {
         // propagated, regardless of whether record processing succeeded.  A processing error
         // takes precedence over a cleanup error.
         info!("Finished reading input FASTQs.");
-        let close_result = shard_writers.into_iter().try_for_each(ShardWriters::close);
+        let close_result =
+            writers.into_iter().try_for_each(PooledWriter::close).map_err(anyhow::Error::from);
         let stop_result = pool.stop_pool().map_err(anyhow::Error::from);
-        process_result.and(close_result).and(stop_result)?;
+        let result = process_result.and(close_result).and(stop_result);
+        if result.is_err() {
+            remove_incomplete_outputs(&outputs);
+        }
+        result?;
         info!("Output FASTQ writing complete.");
 
         Ok(())
@@ -501,11 +473,8 @@ mod tests {
         assert!(err.to_string().contains("out of sync"), "unexpected error message: {}", err);
     }
 
-    /// When paired inputs have different lengths the run must error *and* must not leave a
-    /// half-written, misaligned set: the per-shard R1/R2 files should hold equal record counts
-    /// (the orphan record from the longer input must not have been written).
     #[test]
-    fn test_out_of_sync_inputs_leave_no_orphan_record() {
+    fn test_out_of_sync_inputs_fail_and_remove_the_outputs() {
         let tmp = TempDir::new().unwrap();
         let r1 = PathBuf::from(tmp.path()).join("r1.fq");
         let r2 = PathBuf::from(tmp.path()).join("r2.fq");
@@ -513,16 +482,36 @@ mod tests {
         build_fastq(r2.as_path(), "q", "/2", 1, 2);
 
         let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
-        let err = build_sharder(&[&r1, &r2], &prefix, 1).execute().unwrap_err();
+        let sharder = build_sharder(&[&r1, &r2], &prefix, 2);
+        let err = sharder.execute().unwrap_err();
         assert!(err.to_string().contains("out of sync"), "unexpected error message: {}", err);
+        for output in sharder.output_paths() {
+            assert!(!output.exists(), "{output:?} was left behind");
+        }
+    }
 
-        let r1_out = read_fastq(Path::new(&format!("{}.shard1.read1.fq.gz", prefix)));
-        let r2_out = read_fastq(Path::new(&format!("{}.shard1.read2.fq.gz", prefix)));
-        assert_eq!(
-            r1_out.len(),
-            r2_out.len(),
-            "R1/R2 outputs left misaligned on the out-of-sync error path"
-        );
+    #[test]
+    fn test_an_output_that_is_an_input_is_rejected_before_it_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = format!("{}/test_out", tmp.path().to_str().unwrap());
+        let input = PathBuf::from(format!("{prefix}.shard1.read1.fq.gz"));
+        build_fastq(input.as_path(), "q", "", 1, 4);
+        let before = std::fs::read(&input).unwrap();
+
+        let err = build_sharder(&[&input], &prefix, 2).execute().unwrap_err();
+        assert!(err.to_string().contains("is also an input"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+    }
+
+    #[test]
+    fn test_a_missing_output_directory_fails_before_any_input_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = PathBuf::from(tmp.path()).join("r1.fq");
+        build_fastq(r1.as_path(), "q", "", 1, 4);
+
+        let prefix = format!("{}/missing/test_out", tmp.path().to_str().unwrap());
+        let err = build_sharder(&[&r1], &prefix, 2).execute().unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "unexpected error: {err}");
     }
 
     #[test]
