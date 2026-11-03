@@ -3,6 +3,7 @@ extern crate core;
 pub mod commands;
 
 use crate::commands::shard::Shard;
+use crate::commands::shuffle::Shuffle;
 use anyhow::Result;
 use clap::Parser;
 use commands::command::Command;
@@ -26,6 +27,7 @@ struct Args {
 enum Subcommand {
     Demux(Demux),
     Shard(Shard),
+    Shuffle(Shuffle),
     Subsample(Subsample),
 }
 
