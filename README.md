@@ -330,6 +330,8 @@ Inputs may be uncompressed, gzipped, or block-gzipped.  Output files are _always
 The records read together from the inputs must share a read name, ignoring any `/1` or `/2`
 suffix and comment, unless `--disable-read-name-checking` is given.
 
+If sharding fails, output files are deleted so they can't be mistaken for complete ones.
+
 Usage: fqtk shard [OPTIONS] --inputs <INPUTS>... --output-prefix <OUTPUT_PREFIX> --shards <SHARDS>
 
 Options:
@@ -390,7 +392,8 @@ same number of reads in the same order; each read is either kept or
 discarded across all files simultaneously.
 
 Output files are named `{output}.R1.fq.gz`, `{output}.R2.fq.gz`, etc.
-and are always BGZF compressed.
+and are always BGZF compressed. If subsampling fails, they are deleted so they
+can't be mistaken for complete ones.
 
 Each read is independently retained with probability equal to `--fraction`,
 giving an approximate subsample without needing to know the total read count
