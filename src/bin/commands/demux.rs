@@ -72,7 +72,7 @@ enum HeaderFormatKind {
     #[default]
     Illumina,
     /// The input header, unchanged except for any UMI(s) added by `--umi-in-name true` or
-    /// `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, ONT) are accepted.
+    /// `--umi-tag`.  Non-Illumina headers (e.g. MGI, Element, Ultima, ONT) are accepted.
     Unmodified,
     /// The read name only; any comment is removed, but existing SAM tags (e.g. from `samtools
     /// fastq -T`) are kept.  No read number is written, so R1 and R2 headers will usually be
@@ -423,12 +423,14 @@ impl ReadSet {
     /// there is an existing UMI or sample barcode in the header, the segments are appended after
     /// adding a `+`, else the segments are inserted.
     ///
-    /// Supports headers that are just the `name` segment, or `name comment`.  The name must have
-    /// at most 8 colon-separated parts.  If there are seven or fewer parts in the name, the
-    /// UMI is appended as the last part.  If there are eight, the eighth is assumed to be an
-    /// existing UMI, and any UMI is appended.
+    /// Supports headers that are just the `name` segment, or `name comment`.  When UMI(s) are
+    /// added to the name, the `illumina` format requires the name to have at most 8
+    /// colon-separated parts; other formats accept any name.  If there are eight parts in the
+    /// name, the eighth is assumed to be an existing UMI, and any UMI is appended to it after a
+    /// `+`.  Otherwise the UMI is appended as a new last part.
     ///
-    /// If the comment is present is must have exactly four colon-separated parts.
+    /// For the `illumina` format, a comment with three or more colons must have exactly four
+    /// colon-separated parts; other formats never parse the comment.
     ///
     /// Format of the header is:
     ///   @name comment
@@ -502,9 +504,13 @@ impl ReadSet {
             if fold_umi_into_name { molecular_barcode_segments.next() } else { None };
         if let Some(first_seg) = first_umi_segment {
             let sep_count = name.iter().filter(|c| **c == Self::COLON).count();
+            // Only `illumina` requires an Illumina-shaped read name.  `unmodified` and `name-only`
+            // accept any header (e.g. Ultima's names have 16 fields), so a longer name simply has
+            // the UMI appended as a new final field.
             ensure!(
-                sep_count <= 7,
-                "Can't handle read name with more than 8 segments: {}",
+                sep_count <= 7 || kind != HeaderFormatKind::Illumina,
+                "Can't handle read name with more than 8 segments: {}.  For non-Illumina read \
+                 names, use `--header-format unmodified` (or `name-only`) with `--umi-in-name true`.",
                 String::from_utf8(header.to_vec())?
             );
 
@@ -1276,8 +1282,10 @@ pub(crate) struct Demux {
     /// and `false` otherwise.
     ///
     /// UMIs are added as a final `:`-delimited field of the read name, with multiple UMIs joined
-    /// by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  UMI base qualities are
-    /// not retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in
+    /// by `+` (e.g. `@NAME:UMI1+UMI2`), following Illumina's convention.  If the name has exactly
+    /// eight `:`-delimited fields (typically an Illumina name that already has a UMI), the UMI(s)
+    /// are appended to the eighth field after a `+` instead.  UMI base qualities are not
+    /// retained; add `M` to `--output-types` to keep them.  Cannot be `true` when `M` is in
     /// `--template-types`.
     #[clap(long)]
     umi_in_name: Option<bool>,
@@ -4554,30 +4562,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "8 segments")]
-    fn test_write_header_name_too_many_parts() {
-        let mut out = Vec::new();
-        let header = b"q1:1:2:3:4:5:6:7:8:9:10";
-        let barcode_segs =
-            [seg(b"ACGT", SegmentType::SampleBarcode), seg(b"GGTT", SegmentType::SampleBarcode)];
-        let umi_segs = [seg(b"AACCGGTT", SegmentType::MolecularBarcode)];
-        ReadSet::write_header_internal(
-            &mut out,
-            1,
-            header,
-            barcode_segs.iter().filter(|_| true),
-            umi_segs.iter().filter(|_| true),
-            HeaderFormat {
-                include_umi: true,
-                kind: HeaderFormatKind::Illumina,
-                umi_in_name: true,
-                umi_tag: None,
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn test_write_header_comment_too_few_parts() {
         let mut out = Vec::new();
         let header = b"q1 0:0";
@@ -4769,6 +4753,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    /// An Ultima UG 100 read name, which has 16 `:`-delimited fields.
+    const ULTIMA_NAME: &str = "V115:429032-107901333-Z0001-CAGCTCGAATGCGAT:NA:NA:2:2:1:45:13:1:\
+                               331:N:0.718:CAGCTCGAATGCGAT:NA:1569";
+
+    /// Formats other than `illumina` accept any read name when folding UMI(s) into it: a name
+    /// with more than eight fields gets the UMI(s) as a new final field, while a name with exactly
+    /// eight fields is still treated as carrying a UMI that the new UMI(s) are appended to.
+    #[rstest]
+    #[case::unmodified_ultima(
+        HeaderFormatKind::Unmodified,
+        format!("{ULTIMA_NAME} 2:N"),
+        format!("@{ULTIMA_NAME}:AACC+GGTT 2:N")
+    )]
+    #[case::name_only_ultima(
+        HeaderFormatKind::NameOnly,
+        format!("{ULTIMA_NAME} 2:N"),
+        format!("@{ULTIMA_NAME}:AACC+GGTT")
+    )]
+    #[case::unmodified_many_fields_no_comment(
+        HeaderFormatKind::Unmodified,
+        "q1:1:2:3:4:5:6:7:8:9:10".to_string(),
+        "@q1:1:2:3:4:5:6:7:8:9:10:AACC+GGTT".to_string()
+    )]
+    #[case::unmodified_nine_fields(
+        HeaderFormatKind::Unmodified,
+        "a:b:c:d:e:f:g:h:i 1:N:0:0".to_string(),
+        "@a:b:c:d:e:f:g:h:i:AACC+GGTT 1:N:0:0".to_string()
+    )]
+    #[case::unmodified_existing_umi(
+        HeaderFormatKind::Unmodified,
+        "inst:123:ABCDE:1:204:1022:2108:TTTT 1:N:0:0".to_string(),
+        "@inst:123:ABCDE:1:204:1022:2108:TTTT+AACC+GGTT 1:N:0:0".to_string()
+    )]
+    fn test_write_header_non_illumina_format_folds_umi_into_any_name(
+        #[case] kind: HeaderFormatKind,
+        #[case] header: String,
+        #[case] expected: String,
+    ) {
+        let mut out = Vec::new();
+        let barcode_segs = [seg(b"ACGT", SegmentType::SampleBarcode)];
+        let umi_segs = [
+            seg(b"AACC", SegmentType::MolecularBarcode),
+            seg(b"GGTT", SegmentType::MolecularBarcode),
+        ];
+        ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header.as_bytes(),
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat { include_umi: true, kind, umi_in_name: true, umi_tag: None },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    /// `illumina` rejects a name with more than eight fields when folding in a UMI, starting at
+    /// nine fields (the boundary), and the error points at the formats that accept such names.
+    #[rstest]
+    #[case::nine_fields("a:b:c:d:e:f:g:h:i 1:N:0:0".to_string())]
+    #[case::ultima(format!("{ULTIMA_NAME} 2:N"))]
+    fn test_write_header_illumina_name_too_many_parts_suggests_alternatives(
+        #[case] header: String,
+    ) {
+        let mut out = Vec::new();
+        let umi_segs = [seg(b"AACC", SegmentType::MolecularBarcode)];
+        let barcode_segs: [FastqSegment; 0] = [];
+        let message = ReadSet::write_header_internal(
+            &mut out,
+            1,
+            header.as_bytes(),
+            barcode_segs.iter().filter(|_| true),
+            umi_segs.iter().filter(|_| true),
+            HeaderFormat {
+                include_umi: true,
+                kind: HeaderFormatKind::Illumina,
+                umi_in_name: true,
+                umi_tag: None,
+            },
+        )
+        .expect_err("a name with more than eight fields should be rejected by illumina")
+        .to_string();
+        assert!(message.contains("more than 8 segments"), "unexpected message: {message}");
+        assert!(message.contains("--header-format unmodified"), "unexpected message: {message}");
+        assert!(message.contains("--umi-in-name true"), "unexpected message: {message}");
     }
 
     #[test]
