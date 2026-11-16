@@ -182,6 +182,13 @@ struct RawInput {
     quals: Vec<u8>,
 }
 
+impl AsRef<[u8]> for RawInput {
+    /// Returns the raw bases.
+    fn as_ref(&self) -> &[u8] {
+        &self.bases
+    }
+}
+
 /// Error returned by [`ReadSet::resegment`].  The two variants let callers distinguish reads
 /// that were too short to extract every segment (always recoverable by counting them as
 /// `TooFewBases` skips) from genuinely unexpected failures (which should abort the run).
@@ -259,30 +266,6 @@ impl ReadSet {
     /// Generates the sample barcode sequence for this read set and returns it as a Vec of bytes.
     fn sample_barcode_sequence(&self) -> Vec<u8> {
         self.sample_barcode_segments().flat_map(|s| &s.seq).copied().collect()
-    }
-
-    /// Returns a fixed-length, per-input prefix slice of the raw bases concatenated across all
-    /// input FASTQs, used to perform per-sample N-padded matching when per-sample read
-    /// structures are in use.  Callers are responsible for ensuring every input has at least
-    /// `prefix_lens[i]` bases — `ReadSetIterator` already gates each input on this length, so
-    /// any read reaching this method is guaranteed long enough.
-    ///
-    /// # Panics
-    ///   - In debug builds, panics if any input has fewer bases than its prefix length.
-    fn matching_window_bases(&self, prefix_lens: &[usize]) -> Vec<u8> {
-        let total: usize = prefix_lens.iter().sum();
-        let mut out = Vec::with_capacity(total);
-        for (raw, &plen) in self.raw_per_input.iter().zip(prefix_lens) {
-            debug_assert!(
-                raw.bases.len() >= plen,
-                "raw bases length {} < matching prefix length {}; ReadSetIterator should have \
-                 gated this read",
-                raw.bases.len(),
-                plen,
-            );
-            out.extend_from_slice(&raw.bases[..plen]);
-        }
-        out
     }
 
     /// Consumes this read set and returns a new one with `segments` extracted from
@@ -1134,8 +1117,13 @@ impl DemuxMetric {
 ///
 /// During matching, each sample's expected pattern is constructed from its effective read
 /// structure by filling `B`-segment positions from the `barcode` column and treating
-/// `M`/`S`/`C` segment positions as `N` wildcards.  All patterns are padded with trailing `N`s
-/// to a per-input matching window equal to the longest pre-template prefix across samples.
+/// `M`/`S`/`C`/`T` segment positions as `N` wildcards.  All patterns are padded with trailing
+/// `N`s to a per-input matching window that covers, across samples, the longest pre-template
+/// prefix and every `B` segment.  `B` segments may follow a fixed-length template (e.g.
+/// `300T8B12M8B`).  Only the positions of some sample's `B` bases are compared, and a read
+/// shorter than the window is compared as if padded with `N`s.  A read too short for its
+/// sample's read structure, or for `--read-structures` if unmatched, is handled per
+/// `--skip-reasons too-few-bases`.
 ///
 /// Example metadata TSV (CODEC stagger):
 ///
@@ -1907,21 +1895,16 @@ impl Command for Demux {
         let mut unmatched_metric = DemuxMetric::new(self.unmatched_prefix.as_str(), ".");
 
         let per_sample_rs = sample_group.has_per_sample_read_structures();
-        let prefix_lens = if per_sample_rs {
-            sample_group.matching_prefix_lens(&self.read_structures)?
+        let matching_window = if per_sample_rs {
+            Some(sample_group.matching_window(&self.read_structures)?)
         } else {
-            Vec::new()
-        };
-        let matching_patterns = if per_sample_rs {
-            sample_group.build_matching_patterns(&self.read_structures, &prefix_lens)?
-        } else {
-            Vec::new()
+            None
         };
 
-        let mut barcode_matcher = if per_sample_rs {
+        let mut barcode_matcher = if let Some(window) = &matching_window {
             BarcodeMatcher::with_patterns(
                 &sample_group.samples,
-                matching_patterns,
+                window.patterns().to_vec(),
                 u8::try_from(self.max_mismatches)?,
                 u8::try_from(self.min_mismatch_delta)?,
                 true,
@@ -1935,16 +1918,15 @@ impl Command for Demux {
             )
         };
 
-        // In per-sample mode the iterator gates on the per-input matching-window length
-        // (prefix_lens[i]); the global read structure's full min_len would over-reject reads
-        // that satisfy a sample's shorter structure.  Re-segmentation downstream re-checks
-        // length against the matched sample's structure.
+        // In per-sample mode the iterator doesn't gate on length, since the global read
+        // structure's length would reject reads that fit a sample's shorter one.  Length is
+        // checked when a read is re-segmented with its sample's (or the global) read structure.
         let mut fq_iterators = fq_sources
             .zip(self.read_structures.clone())
             .enumerate()
             .map(|(source_index, (source, read_structure))| {
                 let min_len = if per_sample_rs {
-                    prefix_lens[source_index]
+                    0
                 } else {
                     read_structure.iter().map(|s| s.length().unwrap_or(1)).sum()
                 };
@@ -1991,8 +1973,8 @@ impl Command for Demux {
                 next_read_sets
             );
             let read_set = ReadSet::combine_readsets(next_read_sets);
-            let observed: Vec<u8> = if per_sample_rs {
-                read_set.matching_window_bases(&prefix_lens)
+            let observed: Vec<u8> = if let Some(window) = &matching_window {
+                window.observed_bases(&read_set.raw_per_input)
             } else {
                 read_set.sample_barcode_sequence()
             };
@@ -2021,11 +2003,10 @@ impl Command for Demux {
                     sample_metrics[matched_idx].templates += 1;
                 }
             } else if per_sample_rs {
-                // Iterator gating in per-sample mode is loosened to the matching prefix length,
-                // so a read can clear the prefix gate while being too short for the global read
-                // structure used on the unmatched path.  Honor `--skip-reasons too-few-bases`
-                // exactly as the matched and legacy paths do: skip when requested, otherwise
-                // abort with a remedy hint.
+                // The iterator doesn't gate on length in per-sample mode, so an unmatched read can
+                // be too short for the global read structure.  Honor `--skip-reasons
+                // too-few-bases` as the matched and legacy paths do: skip when requested,
+                // otherwise abort with a remedy hint.
                 match read_set.resegment(&self.read_structures) {
                     Ok(resegmented) => {
                         sample_writers[unmatched_index].write(&resegmented, &template_output)?;
@@ -5573,6 +5554,106 @@ mod tests {
         // Globals (7B+T) have no M segment, so unmatched only writes R1; the file may not even
         // exist if no unmatched reads occurred.  In this test, the read matches S1, so there
         // are no unmatched records.
+    }
+
+    /// Per-sample read structures may place sample-barcode segments after a fixed-length
+    /// template, split by a UMI (the MGI layout from #106, scaled down).  Reads are assigned by
+    /// the B segments joined in read order, and the template and UMI are extracted.
+    #[test]
+    fn test_demux_per_sample_barcodes_after_template() {
+        let tmp = TempDir::new().unwrap();
+        // R2 = 6T 4B 3M 4B: S1 barcode AAAA+CCCC, S2 barcode GGGG+TTTT, then two unmatched
+        // reads: one matching neither sample, and one whose first B is S1's and second is S2's,
+        // which must not match on the first B alone.
+        let r1_file = fastq_file(&tmp, "r1", "ex", &["ACACAC", "GTGTGT", "CACACA", "TGTGTG"]);
+        let r2_file = fastq_file(
+            &tmp,
+            "r2",
+            "ex",
+            &["TTTTTTAAAAGTACCCC", "CCCCCCGGGGCATTTTT", "AAAAAAACGTNNNACGT", "GGGGGGAAAAGTATTTT"],
+        );
+        let sample_metadata = metadata_file_with_rs(
+            &tmp,
+            &[("S1", "AAAACCCC", &["6T", "6T4B3M4B"]), ("S2", "GGGGTTTT", &["6T", "6T4B3M4B"])],
+        );
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file, r2_file],
+            read_structures: vec![
+                ReadStructure::from_str("6T").unwrap(),
+                ReadStructure::from_str("6T4B3M4B").unwrap(),
+            ],
+            sample_metadata,
+            output_types: vec!['T', 'M'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        };
+        let output_dir = demux_inputs.output.clone();
+        demux_inputs.execute().unwrap();
+
+        for (sample, r1, r2, umi) in
+            [("S1", b"ACACAC", b"TTTTTT", b"GTA"), ("S2", b"GTGTGT", b"CCCCCC", b"CAT")]
+        {
+            let reads_r1 = read_fastq(&output_dir.join(format!("{sample}.R1.fq.gz")));
+            let reads_r2 = read_fastq(&output_dir.join(format!("{sample}.R2.fq.gz")));
+            let reads_u1 = read_fastq(&output_dir.join(format!("{sample}.U1.fq.gz")));
+            assert_eq!(reads_r1.len(), 1, "{sample}");
+            assert_eq!(reads_r1[0].seq, r1.to_vec(), "{sample}");
+            assert_eq!(reads_r2[0].seq, r2.to_vec(), "{sample}");
+            assert_eq!(reads_u1[0].seq, umi.to_vec(), "{sample}");
+        }
+        let unmatched_r2 = read_fastq(&output_dir.join("unmatched.R2.fq.gz"));
+        let unmatched_seqs: Vec<&[u8]> = unmatched_r2.iter().map(|r| r.seq.as_slice()).collect();
+        assert_eq!(unmatched_seqs, vec![b"AAAAAA".as_slice(), b"GGGGGG".as_slice()]);
+    }
+
+    /// When one sample's barcode follows a fixed-length template, the matching window is longer
+    /// than another sample needs.  A read that is shorter than the window but long enough for its
+    /// own sample is still demultiplexed instead of being rejected as too short.
+    #[test]
+    fn test_demux_per_sample_short_read_matches_sample_with_shorter_window() {
+        let tmp = TempDir::new().unwrap();
+        // S1 = 4B+T (needs 5 bases); S2 = 10T4B (needs 14 bases).
+        let r1_file = fastq_file(&tmp, "r1", "ex", &["ACGTAA", "CCCCCCCCCCTTGG"]);
+        let sample_metadata =
+            metadata_file_with_rs(&tmp, &[("S1", "ACGT", &["4B+T"]), ("S2", "TTGG", &["10T4B"])]);
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file],
+            read_structures: vec![ReadStructure::from_str("+T").unwrap()],
+            sample_metadata,
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        };
+        let output_dir = demux_inputs.output.clone();
+        demux_inputs.execute().unwrap();
+
+        let s1 = read_fastq(&output_dir.join("S1.R1.fq.gz"));
+        let s2 = read_fastq(&output_dir.join("S2.R1.fq.gz"));
+        assert_eq!(s1.iter().map(|r| r.seq.as_slice()).collect_vec(), vec![b"AA".as_slice()]);
+        assert_eq!(
+            s2.iter().map(|r| r.seq.as_slice()).collect_vec(),
+            vec![b"CCCCCCCCCC".as_slice()]
+        );
     }
 
     /// Builds a per-sample demux scenario in which a read clears the (loosened) per-sample

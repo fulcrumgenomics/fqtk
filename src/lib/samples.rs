@@ -5,6 +5,7 @@ use fgoxide::io::Io;
 use itertools::Itertools;
 use read_structure::{ReadStructure, SegmentType};
 use std::fmt::{self, Display};
+use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -296,13 +297,13 @@ impl SampleGroup {
 
     /// Returns the per-input matching prefix lengths needed to demultiplex this sample group.
     /// For each input FASTQ index, this is the maximum across samples of the number of bases
-    /// before the first Template segment in that sample's read structure.  Falls back to the
-    /// corresponding entry in `default_structures` for samples without per-sample read
-    /// structures.
+    /// before the first Template segment or the end of the last sample-barcode (`B`) segment,
+    /// whichever is larger, in that sample's read structure.  Falls back to the corresponding
+    /// entry in `default_structures` for samples without per-sample read structures.
     ///
     /// # Errors
-    ///   - Returns an error if any non-Template segment in the matching window has a
-    ///     non-fixed length.
+    ///   - Returns an error if any non-Template segment before the first Template segment, or
+    ///     any sample-barcode segment, has a non-fixed length.
     ///   - Returns an error if a sample's per-sample read-structure count differs from
     ///     `default_structures.len()`.
     pub fn matching_prefix_lens(&self, default_structures: &[ReadStructure]) -> Result<Vec<usize>> {
@@ -319,23 +320,19 @@ impl SampleGroup {
             );
             for (i, rs) in rs_for_sample.iter().enumerate() {
                 let plen = pre_template_fixed_len(rs).with_context(|| {
-                    let source = if sample.read_structures.is_some() {
-                        format!("sample {}'s `read_structure_{}`", sample.sample_id, i + 1)
-                    } else {
-                        format!(
-                            "the `--read-structures` fallback for sample {} (input {})",
-                            sample.sample_id,
-                            i + 1,
-                        )
-                    };
                     format!(
                         "per-sample demultiplexing requires a fixed-length matching window, so \
-                         every segment before the template in {source} must have a fixed length"
+                         every segment before the template in {} must have a fixed length",
+                        read_structure_source(sample, i)
                     )
                 })?;
-                if plen > maxes[i] {
-                    maxes[i] = plen;
-                }
+                let barcode_end = sample_barcode_spans(rs)
+                    .with_context(|| {
+                        format!("invalid read structure in {}", read_structure_source(sample, i))
+                    })?
+                    .last()
+                    .map_or(0, |span| span.end);
+                maxes[i] = maxes[i].max(plen).max(barcode_end);
             }
         }
         Ok(maxes)
@@ -343,15 +340,15 @@ impl SampleGroup {
 
     /// Builds the matching pattern bytes for each sample.  The pattern is a fixed-length
     /// byte sequence (concatenated across all input FASTQs) of total length
-    /// `prefix_lens.iter().sum()`.  For each input, the sample's read structure is walked
-    /// position-by-position; B (sample-barcode) segment positions are filled from
-    /// `sample.barcode` (taken in order across inputs), and M/S/C/T segment positions and any
-    /// trailing positions up to the prefix length are filled with `N` (treated as a wildcard
-    /// by the matcher).
+    /// `prefix_lens.iter().sum()`.  For each input, B (sample-barcode) segment positions are
+    /// filled from `sample.barcode` (taken in read order across inputs), and all other
+    /// positions up to the prefix length (M/S/C/T segments and trailing bases) are filled with
+    /// `N` (treated as a wildcard by the matcher).  `B` segments may appear anywhere in the
+    /// read, including after a fixed-length template, since only the last segment of a read
+    /// structure may be variable length and every `B` therefore has a fixed offset.
     ///
     /// # Errors
-    ///   - Returns an error if any sample's read structure has a non-fixed-length non-template
-    ///     segment in the matching window.
+    ///   - Returns an error if any sample-barcode (`B`) segment has a non-fixed length.
     ///   - Returns an error if a sample-barcode (`B`) segment crosses the matching window
     ///     boundary, since silently truncating a barcode would corrupt matching.
     pub fn build_matching_patterns(
@@ -374,26 +371,6 @@ impl SampleGroup {
                 rs_for_sample.len(),
                 prefix_lens.len(),
             );
-
-            // All sample-barcode (B) segments must precede the template (T): a B positioned after
-            // the template falls outside the matching window and can never be used to assign the
-            // read, so reject it explicitly rather than failing later with a confusing count.
-            for (input_idx, rs) in rs_for_sample.iter().enumerate() {
-                let total_b = rs.segments_by_type(SegmentType::SampleBarcode).count();
-                let b_before_template = rs
-                    .iter()
-                    .take_while(|seg| seg.kind != SegmentType::Template)
-                    .filter(|seg| seg.kind == SegmentType::SampleBarcode)
-                    .count();
-                ensure!(
-                    total_b == b_before_template,
-                    "sample {}: all sample-barcode (B) segments must precede the template (T) in \
-                     read structure {} (input {})",
-                    sample.sample_id,
-                    rs,
-                    input_idx + 1,
-                );
-            }
 
             // The effective read structures' total sample-barcode (B) length must equal the
             // barcode column length.  This also validates global-only samples in mixed mode, whose
@@ -421,54 +398,33 @@ impl SampleGroup {
             let mut pattern = Vec::with_capacity(total_len);
             let mut barcode_cursor = 0usize;
             let barcode_bytes = sample.barcode.as_bytes();
-            for (rs, &prefix_len) in rs_for_sample.iter().zip(prefix_lens) {
-                let mut filled = 0usize;
-                for seg in rs.iter() {
-                    if seg.kind == SegmentType::Template {
-                        break;
-                    }
-                    let len = seg.length.ok_or_else(|| {
-                        anyhow!(
-                            "sample {}: non-template segment {seg} in read structure must have a \
-                             fixed length",
-                            sample.sample_id,
-                        )
-                    })?;
-                    let remaining = prefix_len - filled;
-                    let take = len.min(remaining);
-                    if seg.kind == SegmentType::SampleBarcode {
-                        ensure!(
-                            take == len,
-                            "sample {}: sample-barcode segment {seg} crosses the matching \
-                             window boundary (segment length {}, but only {} bases remain in \
-                             the {}-base window)",
-                            sample.sample_id,
-                            len,
-                            remaining,
-                            prefix_len,
-                        );
-                        ensure!(
-                            barcode_cursor + len <= barcode_bytes.len(),
-                            "sample {}: barcode ({} bases) is shorter than the total \
-                             sample-barcode length required by its read structure",
-                            sample.sample_id,
-                            barcode_bytes.len(),
-                        );
-                        pattern.extend_from_slice(
-                            &barcode_bytes[barcode_cursor..barcode_cursor + len],
-                        );
-                        barcode_cursor += len;
-                    } else {
-                        pattern.extend(std::iter::repeat_n(b'N', take));
-                    }
-                    filled += take;
-                    if take < len {
-                        break;
-                    }
+            for (i, (rs, &prefix_len)) in rs_for_sample.iter().zip(prefix_lens).enumerate() {
+                let mut input_pattern = vec![b'N'; prefix_len];
+                let spans = sample_barcode_spans(rs).with_context(|| {
+                    format!("invalid read structure in {}", read_structure_source(sample, i))
+                })?;
+                for span in spans {
+                    let end = span.end;
+                    ensure!(
+                        end <= prefix_len,
+                        "sample {}: a sample-barcode segment in read structure {rs} crosses the \
+                         matching window boundary (segment ends at base {end}, but the window is \
+                         {prefix_len} bases)",
+                        sample.sample_id,
+                    );
+                    let len = span.len();
+                    ensure!(
+                        barcode_cursor + len <= barcode_bytes.len(),
+                        "sample {}: barcode ({} bases) is shorter than the total \
+                         sample-barcode length required by its read structure",
+                        sample.sample_id,
+                        barcode_bytes.len(),
+                    );
+                    input_pattern[span]
+                        .copy_from_slice(&barcode_bytes[barcode_cursor..barcode_cursor + len]);
+                    barcode_cursor += len;
                 }
-                if filled < prefix_len {
-                    pattern.extend(std::iter::repeat_n(b'N', prefix_len - filled));
-                }
+                pattern.extend_from_slice(&input_pattern);
             }
             ensure!(
                 barcode_cursor == sample.barcode.len(),
@@ -480,6 +436,64 @@ impl SampleGroup {
             patterns.push(pattern);
         }
         Ok(patterns)
+    }
+
+    /// Builds the [`MatchingWindow`] used to assign reads to samples in per-sample read
+    /// structure mode, keeping only the positions where some sample's pattern is not a no-call.
+    /// The other positions can never change a match, and dropping them keeps template bases out
+    /// of the barcode matcher's cache keys.  Errors as [`Self::build_matching_patterns`] does.
+    pub fn matching_window(&self, default_structures: &[ReadStructure]) -> Result<MatchingWindow> {
+        let prefix_lens = self.matching_prefix_lens(default_structures)?;
+        let full_patterns = self.build_matching_patterns(default_structures, &prefix_lens)?;
+        let coordinates: Vec<(usize, usize)> = prefix_lens
+            .iter()
+            .enumerate()
+            .flat_map(|(input, &len)| (0..len).map(move |offset| (input, offset)))
+            .collect();
+        let mut kept: Vec<usize> = (0..coordinates.len())
+            .filter(|&j| full_patterns.iter().any(|p| !crate::byte_is_nocall(p[j])))
+            .collect();
+        if kept.is_empty() {
+            // No position is constrained; keep them all so the patterns are never empty.
+            kept = (0..coordinates.len()).collect();
+        }
+        Ok(MatchingWindow {
+            positions: kept.iter().map(|&j| coordinates[j]).collect(),
+            patterns: full_patterns
+                .iter()
+                .map(|pattern| kept.iter().map(|&j| pattern[j]).collect())
+                .collect(),
+        })
+    }
+}
+
+/// The read positions and per-sample expected bases used to assign reads to samples in
+/// per-sample read structure mode.  Built by [`SampleGroup::matching_window`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchingWindow {
+    /// The `(input index, offset in the read)` of each compared base, in read order.
+    positions: Vec<(usize, usize)>,
+    /// For each sample (in sample order), its expected base at each of `positions`.  A no-call
+    /// (`N`) is a wildcard.
+    patterns: Vec<Vec<u8>>,
+}
+
+impl MatchingWindow {
+    /// Returns each sample's expected bases at the window positions, in sample order.
+    #[must_use]
+    pub fn patterns(&self) -> &[Vec<u8>] {
+        &self.patterns
+    }
+
+    /// Returns the bases of `reads` (one per input FASTQ, in input order) at the window
+    /// positions.  A position past the end of its read is returned as `N`, so a short read still
+    /// matches the samples whose barcode bases it covers.
+    #[must_use]
+    pub fn observed_bases<R: AsRef<[u8]>>(&self, reads: &[R]) -> Vec<u8> {
+        self.positions
+            .iter()
+            .map(|&(input, offset)| reads[input].as_ref().get(offset).copied().unwrap_or(b'N'))
+            .collect()
     }
 }
 
@@ -537,6 +551,43 @@ fn parse_per_sample_read_structures(
 /// files saved with a BOM or CRLF line endings parse correctly.
 fn strip_bom_and_cr(s: &str) -> &str {
     s.strip_prefix('\u{FEFF}').unwrap_or(s).trim_end_matches('\r')
+}
+
+/// Returns the read positions covered by each sample-barcode (`B`) segment in `rs`, in order.
+/// Only the last segment of a read structure may be variable length, so every fixed-length `B`
+/// segment has a fixed offset.  Errors if a `B` segment is variable length.
+fn sample_barcode_spans(rs: &ReadStructure) -> Result<Vec<Range<usize>>> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for seg in rs.iter() {
+        if seg.kind == SegmentType::SampleBarcode {
+            let len = seg.length.ok_or_else(|| {
+                anyhow!(
+                    "sample-barcode segment {seg} in read structure {rs} must have a fixed length"
+                )
+            })?;
+            spans.push(offset..offset + len);
+        }
+        match seg.length {
+            Some(len) => offset += len,
+            None => break,
+        }
+    }
+    Ok(spans)
+}
+
+/// Describes where a sample's read structure for input `input_idx` (0-based) came from, for
+/// error messages: its own `read_structure_<n>` cell or the `--read-structures` fallback.
+fn read_structure_source(sample: &Sample, input_idx: usize) -> String {
+    if sample.read_structures.is_some() {
+        format!("sample {}'s `{READ_STRUCTURE_PREFIX}{}`", sample.sample_id, input_idx + 1)
+    } else {
+        format!(
+            "the `--read-structures` fallback for sample {} (input {})",
+            sample.sample_id,
+            input_idx + 1,
+        )
+    }
 }
 
 /// Returns the offset of the first Template segment in a read structure.  If the read structure
@@ -953,6 +1004,18 @@ mod tests {
         assert!(msg.contains("crosses the matching window boundary"), "got: {msg}");
     }
 
+    /// A sample-barcode segment after the template that crosses a (forced) narrow window is
+    /// rejected too, naming where the segment ends.
+    #[test]
+    fn test_build_matching_patterns_post_template_b_crossing_window_errors() {
+        let s1 = sample_with_rs("S1", "ACGTCCCCCCCC", &["4B10T8B"]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        let defaults = vec![make_rs("4B10T8B")];
+        let err = group.build_matching_patterns(&defaults, &[20]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("segment ends at base 22, but the window is 20"), "{msg}");
+    }
+
     /// A `SampleGroup` constructed directly (bypassing `from_samples`' barcode-length
     /// validation) whose barcode is shorter than its read structure's sample-barcode
     /// segments surfaces a clean error naming the declared vs. provided barcode lengths.
@@ -971,18 +1034,90 @@ mod tests {
         );
     }
 
-    /// A sample-barcode (B) segment positioned after the template is rejected with a clear
-    /// message rather than the cryptic "only consumed N of M barcode bases".
+    /// Sample-barcode (B) segments after a fixed-length template extend the matching window to
+    /// the end of the last B, and their bases are matched in read order (#107).
     #[test]
-    fn test_build_matching_patterns_barcode_after_template_errors() {
-        // 4B10T8B: barcode segments straddle the template; the trailing 8B can never match.
-        let s1 = sample_with_rs("S1", "ACGTACGTACGT", &["4B10T8B"]);
+    fn test_build_matching_patterns_barcode_after_template() {
+        // 4B10T8B: barcode segments straddle the template.
+        let s1 = sample_with_rs("S1", "ACGTCCCCCCCC", &["4B10T8B"]);
         let group = SampleGroup::from_samples(&[s1]).unwrap();
         let defaults = vec![make_rs("4B10T8B")];
         let lens = group.matching_prefix_lens(&defaults).unwrap();
-        let err = group.build_matching_patterns(&defaults, &lens).unwrap_err();
+        assert_eq!(lens, vec![22]);
+        let patterns = group.build_matching_patterns(&defaults, &lens).unwrap();
+        assert_eq!(patterns[0], b"ACGTNNNNNNNNNNCCCCCCCC".to_vec());
+    }
+
+    /// Barcode bases are taken in read order across B segments separated by a UMI, and the
+    /// window stops at the end of the last B even when other segments follow it.
+    #[test]
+    fn test_build_matching_patterns_barcodes_split_by_umi_after_template() {
+        // R2 layout from #106 (scaled down): template, index, UMI, index, then trailing skip.
+        let s1 = sample_with_rs("S1", "AAAACCCC", &["6T", "6T4B3M4B2S"]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        let defaults = vec![make_rs("6T"), make_rs("6T4B3M4B2S")];
+        let lens = group.matching_prefix_lens(&defaults).unwrap();
+        assert_eq!(lens, vec![0, 17]);
+        let patterns = group.build_matching_patterns(&defaults, &lens).unwrap();
+        assert_eq!(patterns[0], b"NNNNNNAAAANNNCCCC".to_vec());
+    }
+
+    /// A variable-length sample-barcode (B) segment has no fixed end, so a global fallback
+    /// structure ending in one is rejected in per-sample mode, naming the sample that uses it.
+    #[test]
+    fn test_matching_prefix_lens_variable_length_barcode_errors() {
+        let s1 = sample_with_rs("S1", "ACGT", &["4B+T"]);
+        let s2 = Sample::new(1, "S2".to_owned(), "TTTT".to_owned());
+        let group = SampleGroup { samples: vec![s1, s2] };
+        let defaults = vec![make_rs("4T+B")];
+        let err = group.matching_prefix_lens(&defaults).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("must precede the template"), "got: {msg}");
+        assert!(msg.contains("the `--read-structures` fallback for sample S2 (input 1)"), "{msg}");
+        assert!(msg.contains("sample-barcode segment +B"), "{msg}");
+    }
+
+    /// The matching window keeps only positions some sample's barcode occupies, across inputs
+    /// and on both sides of a template, and each sample's pattern has wildcards at the others'.
+    #[test]
+    fn test_matching_window_keeps_only_barcode_positions() {
+        let s1 = sample_with_rs("S1", "AAAACCCC", &["6T", "6T4B3M4B"]);
+        let s2 = sample_with_rs("S2", "GGGGTTTT", &["4B+T", "4B+T"]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
+        let defaults = vec![make_rs("6T"), make_rs("6T4B3M4B")];
+        let window = group.matching_window(&defaults).unwrap();
+        assert_eq!(
+            window.patterns(),
+            [b"NNNNNNNNAAAACCCC".to_vec(), b"GGGGTTTTNNNNNNNN".to_vec()].as_slice()
+        );
+        assert_eq!(
+            window.observed_bases(&[b"ACGTAC".as_slice(), b"TTTTTTAAAAGTACCCC".as_slice()]),
+            b"ACGTTTTTAAAACCCC".to_vec()
+        );
+    }
+
+    /// Positions past the end of a short read are observed as `N`, so the read can still be
+    /// compared against every sample instead of failing a length check.
+    #[test]
+    fn test_matching_window_pads_short_reads_with_no_calls() {
+        let s1 = sample_with_rs("S1", "AAAACCCC", &["6T", "6T4B3M4B"]);
+        let s2 = sample_with_rs("S2", "GGGGTTTT", &["4B+T", "4B+T"]);
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
+        let defaults = vec![make_rs("6T"), make_rs("6T4B3M4B")];
+        let window = group.matching_window(&defaults).unwrap();
+        assert_eq!(
+            window.observed_bases(&[b"GGGGA".as_slice(), b"TTTTTT".as_slice()]),
+            b"GGGGTTTTNNNNNNNN".to_vec()
+        );
+    }
+
+    /// If no position is constrained (every barcode base is a no-call), every position is kept
+    /// so the patterns are never empty.
+    #[test]
+    fn test_matching_window_all_no_call_barcodes_keeps_every_position() {
+        let s1 = sample_with_rs("S1", "NNnN", &["2M4B+T"]);
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        let window = group.matching_window(&[make_rs("2M4B+T")]).unwrap();
+        assert_eq!(window.patterns(), [b"NNNNnN".to_vec()].as_slice());
     }
 
     /// A global-only sample (mixed mode) whose barcode length doesn't match the global
