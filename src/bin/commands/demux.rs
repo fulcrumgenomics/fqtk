@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use bstr::ByteSlice;
 use clap::{Parser, ValueEnum};
 use fgoxide::io::{DelimFile, Io};
@@ -1407,6 +1407,42 @@ impl Demux {
         discarded
     }
 
+    /// Checks that the sample barcode (`B`) segments in `read_structures` can yield barcodes of
+    /// `barcode_len` bases.  Errors if there are no `B` segments, if they are all fixed length
+    /// and add up to a different length, or if they need more bases than that.  A variable-length
+    /// segment needs at least one base, since shorter reads are never demultiplexed.  Per-sample
+    /// read structures are checked when the matching patterns are built instead.
+    fn validate_barcode_length(
+        read_structures: &[ReadStructure],
+        barcode_len: usize,
+    ) -> Result<()> {
+        let segments =
+            read_structures.iter().flat_map(ReadStructure::sample_barcodes).collect_vec();
+        let structures = read_structures.iter().join(" ");
+        ensure!(
+            !segments.is_empty(),
+            "--read-structures {structures} have no sample barcode (B) segments to match against \
+             the sample barcodes."
+        );
+        let fixed_len: usize = segments.iter().filter_map(|seg| seg.length).sum();
+        let variable_count = segments.iter().filter(|seg| seg.length.is_none()).count();
+        if variable_count > 0 {
+            let min_len = fixed_len + variable_count;
+            ensure!(
+                min_len <= barcode_len,
+                "The B segments in --read-structures {structures} need at least {min_len} bases, \
+                 more than the {barcode_len} bases in each sample barcode."
+            );
+        } else {
+            ensure!(
+                fixed_len == barcode_len,
+                "The B segments in --read-structures {structures} add up to {fixed_len} bases, \
+                 but each sample barcode has {barcode_len}."
+            );
+        }
+        Ok(())
+    }
+
     /// Returns the options that ask for UMIs to be written to the header (`--umi-in-name true`,
     /// `--umi-tag`), formatted as given on the command line, if no effective read structure
     /// (global or per-sample) has a UMI (`M`) segment; otherwise returns an empty list.
@@ -1848,6 +1884,11 @@ impl Command for Demux {
             sample_group.samples.len(),
             &self.sample_metadata
         );
+        // All barcodes have the same length (checked when loading the sample metadata).
+        let barcode_len = sample_group.samples[0].barcode.len();
+        if !sample_group.has_per_sample_read_structures() {
+            Self::validate_barcode_length(&self.read_structures, barcode_len)?;
+        }
 
         // Warn when the chosen header format would drop barcode bases that are not routed
         // anywhere else, so the loss is never silent.  This runs after the sample metadata is
@@ -1994,7 +2035,20 @@ impl Command for Demux {
             let observed: Vec<u8> = if per_sample_rs {
                 read_set.matching_window_bases(&prefix_lens)
             } else {
-                read_set.sample_barcode_sequence()
+                // A variable-length `B` segment can yield more bases than the sample barcodes
+                // have, which the matcher can't compare.  Fewer bases are left unmatched.
+                let observed = read_set.sample_barcode_sequence();
+                if observed.len() > barcode_len {
+                    let name = String::from_utf8_lossy(read_set.first_header());
+                    let structures = self.read_structures.iter().join(" ");
+                    bail!(
+                        "Read {name} has {} sample barcode bases, more than the {barcode_len} \
+                         bases in each sample barcode; give the B segments in --read-structures \
+                         {structures} fixed lengths.",
+                        observed.len()
+                    );
+                }
+                observed
             };
             if let Some(barcode_match) = barcode_matcher.assign(&observed) {
                 let matched_idx = barcode_match.best_match;
@@ -5720,5 +5774,131 @@ mod tests {
         let metrics: Vec<DemuxMetric> = DelimFile::default().read_tsv(&metrics_path).unwrap();
         let demuxed: usize = metrics.iter().map(|m| m.templates).sum();
         assert_eq!(demuxed, 0, "the boundary read must be skipped, not demuxed");
+    }
+
+    // ############################################################################################
+    // Barcode length checks without per-sample read structures.
+    // ############################################################################################
+
+    /// Builds a demux over `reads` (one list of record bases per input) with `read_structures`
+    /// as `--read-structures` and one sample per barcode, without per-sample read structures.
+    fn demux_without_per_sample_rs(
+        tmp: &TempDir,
+        read_structures: &[&str],
+        reads: &[&[&str]],
+        barcodes: &[&str],
+    ) -> Demux {
+        let inputs = reads
+            .iter()
+            .enumerate()
+            .map(|(i, bases)| fastq_file(tmp, &format!("r{}", i + 1), "ex", bases))
+            .collect();
+        Demux {
+            inputs,
+            read_structures: read_structures
+                .iter()
+                .map(|rs| ReadStructure::from_str(rs).unwrap())
+                .collect(),
+            sample_metadata: metadata_file(tmp, barcodes),
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        }
+    }
+
+    /// The `B` segments in `--read-structures` must add up to the barcode length, or allow it
+    /// when one is variable length.
+    #[rstest]
+    #[case(&["3M7B+T"], 7, true)]
+    #[case(&["3B+T", "4B+T"], 7, true)]
+    #[case(&["+B"], 7, true)]
+    #[case(&["4B+T", "+B"], 7, true)]
+    #[case(&["6B+B"], 7, true)]
+    #[case(&["3M7B+T"], 6, false)]
+    #[case(&["3B+T", "4B+T"], 8, false)]
+    #[case(&["+T"], 7, false)]
+    #[case(&["+T", "+T"], 7, false)]
+    #[case(&["8B+B"], 7, false)]
+    #[case(&["7B+B"], 7, false)]
+    #[case(&["4B+T", "+B"], 4, false)]
+    fn test_validate_barcode_length(
+        #[case] read_structures: &[&str],
+        #[case] barcode_len: usize,
+        #[case] ok: bool,
+    ) {
+        let read_structures =
+            read_structures.iter().map(|rs| ReadStructure::from_str(rs).unwrap()).collect_vec();
+        let result = Demux::validate_barcode_length(&read_structures, barcode_len);
+        assert_eq!(result.is_ok(), ok, "{result:?}");
+    }
+
+    /// Fixed-length `B` segments that don't add up to the barcode length are an error before any
+    /// output is written, rather than a panic while matching the first read.
+    #[test]
+    fn test_demux_errors_when_read_structure_barcode_length_differs() {
+        let tmp = TempDir::new().unwrap();
+        let demux = demux_without_per_sample_rs(
+            &tmp,
+            &["3M7B+T"],
+            &[&["AAAGATTACTAAAAA"]],
+            &["GATTAC", "CCCCCC"],
+        );
+        let output_dir = demux.output.clone();
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("--read-structures 3M7B+T add up to 7 bases, but each"), "{msg}");
+        assert!(!output_dir.join("Sample0000.R1.fq.gz").exists());
+    }
+
+    /// Fixed-length `B` bases alone longer than the barcode are an error even when another `B`
+    /// segment is variable length.
+    #[test]
+    fn test_demux_errors_when_fixed_barcode_bases_exceed_barcode_length() {
+        let tmp = TempDir::new().unwrap();
+        let demux = demux_without_per_sample_rs(&tmp, &["8B+B"], &[&["ACGTACGTAC"]], &["ACGTACG"]);
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("need at least 9 bases, more than the 7 bases"), "{msg}");
+    }
+
+    /// A variable-length `B` segment that yields more bases than the barcode is an error naming
+    /// the read, rather than a panic in the matcher.
+    #[test]
+    fn test_demux_errors_when_variable_barcode_read_is_too_long() {
+        let tmp = TempDir::new().unwrap();
+        let demux = demux_without_per_sample_rs(
+            &tmp,
+            &["+T", "+B"],
+            &[&["AAAA", "CCCC"], &["ACGT", "ACGTA"]],
+            &["ACGT"],
+        );
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("Read ex_1 has 5 sample barcode bases, more than the 4"), "{msg}");
+    }
+
+    /// With a variable-length `B` segment, a read with as many barcode bases as the sample
+    /// barcodes is demultiplexed and one with fewer is unmatched.
+    #[test]
+    fn test_demux_variable_barcode_reads_up_to_barcode_length() {
+        let tmp = TempDir::new().unwrap();
+        let demux = demux_without_per_sample_rs(
+            &tmp,
+            &["+T", "+B"],
+            &[&["AAAA", "CCCC"], &["ACGT", "ACG"]],
+            &["ACGT"],
+        );
+        let output_dir = demux.output.clone();
+        demux.execute().unwrap();
+        let metrics: Vec<DemuxMetric> =
+            DelimFile::default().read_tsv(output_dir.join("demux-metrics.txt")).unwrap();
+        let templates = metrics.iter().map(|m| (m.sample_id.as_str(), m.templates)).collect_vec();
+        assert_eq!(templates, vec![("Sample0000", 1), ("unmatched", 1)]);
     }
 }
