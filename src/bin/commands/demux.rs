@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bstr::ByteSlice;
 use clap::{Parser, ValueEnum};
 use fgoxide::io::{DelimFile, Io};
@@ -1849,6 +1849,21 @@ impl Command for Demux {
             &self.sample_metadata
         );
 
+        // Validate per-sample read structures before any output files are created, so a bad
+        // sample sheet doesn't truncate the outputs of a previous run.
+        let per_sample_rs = sample_group.has_per_sample_read_structures();
+        let (prefix_lens, matching_patterns) = if per_sample_rs {
+            let hint = || sample_group.per_sample_mode_hint();
+            let prefix_lens =
+                sample_group.matching_prefix_lens(&self.read_structures).with_context(hint)?;
+            let patterns = sample_group
+                .build_matching_patterns(&self.read_structures, &prefix_lens)
+                .with_context(hint)?;
+            (prefix_lens, patterns)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         // Warn when the chosen header format would drop barcode bases that are not routed
         // anywhere else, so the loss is never silent.  This runs after the sample metadata is
         // parsed so that per-sample `read_structure_<n>` overrides are checked too.
@@ -1905,18 +1920,6 @@ impl Command for Demux {
             .map(|s| DemuxMetric::new(s.sample_id.as_str(), s.barcode.as_str()))
             .collect_vec();
         let mut unmatched_metric = DemuxMetric::new(self.unmatched_prefix.as_str(), ".");
-
-        let per_sample_rs = sample_group.has_per_sample_read_structures();
-        let prefix_lens = if per_sample_rs {
-            sample_group.matching_prefix_lens(&self.read_structures)?
-        } else {
-            Vec::new()
-        };
-        let matching_patterns = if per_sample_rs {
-            sample_group.build_matching_patterns(&self.read_structures, &prefix_lens)?
-        } else {
-            Vec::new()
-        };
 
         let mut barcode_matcher = if per_sample_rs {
             BarcodeMatcher::with_patterns(
@@ -5532,6 +5535,88 @@ mod tests {
             msg.contains("`read_structure_<n>` column(s)") && msg.contains("--read-structures"),
             "got: {msg}",
         );
+    }
+
+    /// An error that only per-sample mode raises names the samples that turned the mode on,
+    /// keeps the original error, and fails before any output FASTQ is created.
+    #[test]
+    fn test_demux_per_sample_only_error_explains_per_sample_mode() {
+        let tmp = TempDir::new().unwrap();
+        let r1_file =
+            fastq_file(&tmp, "r1", "ex", &[format!("ACGTACGT{}", "A".repeat(50)).as_str()]);
+        // `8B+M` is valid globally, but per-sample mode needs a fixed-length matching window.
+        let sample_metadata = metadata_file_with_rs(&tmp, &[("S1", "ACGTACGT", &["8B+M"])]);
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file],
+            read_structures: vec![ReadStructure::from_str("8B+M").unwrap()],
+            sample_metadata,
+            output_types: vec!['M'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        };
+        let output_dir = demux_inputs.output.clone();
+        let err = demux_inputs.execute().unwrap_err();
+        assert!(!output_dir.join("S1.U1.fq.gz").exists());
+        assert!(!output_dir.join("unmatched.U1.fq.gz").exists());
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Per-sample read structure mode is on because sample S1 has"),
+            "{msg}"
+        );
+        assert!(msg.contains("fixed-length matching window"), "{msg}");
+    }
+
+    /// Errors from building the per-sample matching patterns also explain per-sample mode, and
+    /// name only the sample that turned it on, not the global-only sample that failed.
+    #[test]
+    fn test_demux_per_sample_pattern_error_explains_per_sample_mode() {
+        let tmp = TempDir::new().unwrap();
+        let r1_file =
+            fastq_file(&tmp, "r1", "ex", &[format!("AAAGATTACT{}", "A".repeat(50)).as_str()]);
+        // S1 sets its own structure; S2's blank cell falls back to `3M7B+T`, which declares 7
+        // barcode bases for S2's 6-base barcode.
+        let sample_metadata = metadata_file_with_rs(
+            &tmp,
+            &[("S1", "GATTAC", &["3M6B1S+T"]), ("S2", "CCCCCC", &[""])],
+        );
+
+        let demux_inputs = Demux {
+            inputs: vec![r1_file],
+            read_structures: vec![ReadStructure::from_str("3M7B+T").unwrap()],
+            sample_metadata,
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        };
+        let output_dir = demux_inputs.output.clone();
+        let err = demux_inputs.execute().unwrap_err();
+        assert!(!output_dir.join("S1.R1.fq.gz").exists());
+        assert!(!output_dir.join("unmatched.R1.fq.gz").exists());
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Per-sample read structure mode is on because sample S1 has"),
+            "{msg}"
+        );
+        assert!(msg.contains("sample S2: (using --read-structures fallback)"), "{msg}");
     }
 
     /// Per-sample read structures may have a different `(T, B, M, C)` segment signature than
