@@ -294,6 +294,35 @@ impl SampleGroup {
         self.samples.iter().any(|s| s.read_structures.is_some())
     }
 
+    /// Returns a message saying which samples turned on per-sample read structure mode (up to
+    /// three) and how to turn it off, for errors that only that mode raises.  The mode is easy
+    /// to turn on by accident, e.g. by copying the global read structures into every row.
+    #[must_use]
+    pub fn per_sample_mode_hint(&self) -> String {
+        const MAX_NAMES: usize = 3;
+        let names: Vec<&str> = self
+            .samples
+            .iter()
+            .filter(|s| s.read_structures.is_some())
+            .map(|s| s.sample_id.as_str())
+            .collect();
+        let samples_have = match names.len() {
+            0 => return "Per-sample read structure mode is off".to_owned(),
+            1 => format!("sample {} has", names[0]),
+            n if n <= MAX_NAMES => format!("samples {} have", names.join(", ")),
+            n => {
+                let listed = names.iter().take(MAX_NAMES).join(", ");
+                format!("samples {listed} and {} more have", n - MAX_NAMES)
+            }
+        };
+        format!(
+            "Per-sample read structure mode is on because {samples_have} non-blank \
+             `{READ_STRUCTURE_PREFIX}<n>` cells in the sample metadata (the mode also checks \
+             samples that fall back to `--read-structures`); if every sample uses the same read \
+             structures, remove or blank those columns and use `--read-structures` instead"
+        )
+    }
+
     /// Returns the per-input matching prefix lengths needed to demultiplex this sample group.
     /// For each input FASTQ index, this is the maximum across samples of the number of bases
     /// before the first Template segment in that sample's read structure.  Falls back to the
@@ -1011,6 +1040,51 @@ mod tests {
         let err = group.matching_prefix_lens(&defaults).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("fixed-length matching window"), "got: {msg}");
+    }
+
+    /// The per-sample mode hint names only the samples with per-sample read structures.
+    #[test]
+    fn test_per_sample_mode_hint_names_per_sample_samples() {
+        let s1 = sample_with_rs("S1", "ACGTACGT", &["8B+T"]);
+        let s2 = Sample::new(1, "S2".to_owned(), "TTTTTTTT".to_owned());
+        let group = SampleGroup::from_samples(&[s1, s2]).unwrap();
+        let hint = group.per_sample_mode_hint();
+        assert!(hint.contains("sample S1 has non-blank `read_structure_<n>`"), "{hint}");
+        assert!(!hint.contains("S2"), "{hint}");
+        assert!(hint.contains("--read-structures"), "{hint}");
+    }
+
+    /// The per-sample mode hint names up to three samples, counts the rest, and says how to
+    /// turn the mode off.
+    #[rstest::rstest]
+    #[case(1, "because sample S1 has non-blank")]
+    #[case(2, "because samples S1, S2 have non-blank")]
+    #[case(3, "because samples S1, S2, S3 have non-blank")]
+    #[case(4, "because samples S1, S2, S3 and 1 more have non-blank")]
+    #[case(5, "because samples S1, S2, S3 and 2 more have non-blank")]
+    fn test_per_sample_mode_hint_lists_samples(#[case] count: usize, #[case] expected: &str) {
+        let samples = ["S1", "S2", "S3", "S4", "S5"]
+            .iter()
+            .zip(["AAAA", "CCCC", "GGGG", "TTTT", "ACGT"])
+            .take(count)
+            .map(|(name, bc)| sample_with_rs(name, bc, &["4B+T"]))
+            .collect_vec();
+        let group = SampleGroup::from_samples(&samples).unwrap();
+        let hint = group.per_sample_mode_hint();
+        assert!(hint.contains(expected), "{hint}");
+        assert!(
+            hint.ends_with("remove or blank those columns and use `--read-structures` instead"),
+            "{hint}"
+        );
+    }
+
+    /// Without per-sample read structures the hint says the mode is off rather than naming no
+    /// samples.
+    #[test]
+    fn test_per_sample_mode_hint_without_per_sample_structures() {
+        let s1 = Sample::new(0, "S1".to_owned(), "ACGT".to_owned());
+        let group = SampleGroup::from_samples(&[s1]).unwrap();
+        assert_eq!(group.per_sample_mode_hint(), "Per-sample read structure mode is off");
     }
 
     // ############################################################################################
