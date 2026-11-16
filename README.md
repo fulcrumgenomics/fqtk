@@ -152,8 +152,13 @@ length so that the position of the constant ligation base shifts per sample).
 
 During matching, each sample's expected pattern is constructed from its effective read
 structure by filling `B`-segment positions from the `barcode` column and treating
-`M`/`S`/`C` segment positions as `N` wildcards.  All patterns are padded with trailing `N`s
-to a per-input matching window equal to the longest pre-template prefix across samples.
+`M`/`S`/`C`/`T` segment positions as `N` wildcards.  All patterns are padded with trailing
+`N`s to a per-input matching window that covers, across samples, the longest pre-template
+prefix and every `B` segment.  `B` segments may follow a fixed-length template (e.g.
+`300T8B12M8B`).  Only the positions of some sample's `B` bases are compared, and a read
+shorter than the window is compared as if padded with `N`s.  A read too short for its
+sample's read structure, or for `--read-structures` if unmatched, is handled per
+`--skip-reasons too-few-bases`.
 
 Example metadata TSV (CODEC stagger):
 

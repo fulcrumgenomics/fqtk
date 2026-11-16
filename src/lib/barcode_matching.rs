@@ -11,6 +11,12 @@ use ahash::HashMapExt;
 
 const STARTING_CACHE_SIZE: usize = 1_000_000;
 
+/// The maximum number of entries the match cache holds.  Once full, new observed sequences are
+/// matched without being cached.  This bounds memory when nearly every read's observed bases
+/// are distinct, e.g. when per-sample matching compares bases that are template for some
+/// samples and barcode for others.
+const MAX_CACHE_SIZE: usize = 4_000_000;
+
 /// The struct that contains the info related to the best and next best sample barcode match.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BarcodeMatch {
@@ -42,6 +48,8 @@ pub struct BarcodeMatcher {
     use_cache: bool,
     /// Caching struct for storing results of previous matches
     cache: AHashMap<Vec<u8>, BarcodeMatch>,
+    /// The maximum number of entries `cache` may hold.
+    max_cache_size: usize,
 }
 
 impl BarcodeMatcher {
@@ -73,8 +81,8 @@ impl BarcodeMatcher {
     /// [`Self::expected_barcode_length`] and any error messages reflect the pattern length
     /// rather than the user-facing barcode length.  The caller's `samples` slice is not
     /// modified.  The matching loop in `Demux::execute` relies on this: the observed bytes
-    /// it submits to [`Self::assign`] are the raw matching window (= pattern length), which
-    /// would otherwise mismatch the shorter user-facing barcode length.
+    /// it submits to [`Self::assign`] are the read's bases at the matching window positions
+    /// (= pattern length), which would otherwise mismatch the user-facing barcode length.
     ///
     /// # Panics
     /// - Will panic if `samples` is empty.
@@ -127,6 +135,7 @@ impl BarcodeMatcher {
             min_mismatch_delta,
             use_cache,
             cache: AHashMap::with_capacity(STARTING_CACHE_SIZE),
+            max_cache_size: MAX_CACHE_SIZE,
         }
     }
 
@@ -221,8 +230,10 @@ impl BarcodeMatcher {
             } else {
                 let maybe_match = self.assign_internal(read_bases);
                 if let Some(internal_val) = maybe_match {
-                    self.cache.insert(read_bases.to_vec(), internal_val);
-                };
+                    if self.cache.len() < self.max_cache_size {
+                        self.cache.insert(read_bases.to_vec(), internal_val);
+                    }
+                }
                 maybe_match
             }
         } else {
@@ -368,6 +379,21 @@ mod tests {
     // ############################################################################################
     // Test BarcodeMatcher::assign
     // ############################################################################################
+    /// The match cache stops growing at its size limit, and matching still works past it.
+    #[test]
+    fn test_cache_stops_growing_at_max_size() {
+        let samples = barcodes_to_samples(&["AAAA", "CCCC"]);
+        let mut matcher = BarcodeMatcher::new(&samples, 1, 1, true);
+        matcher.max_cache_size = 2;
+        for read in ["AAAA", "AAAT", "AAAG", "CCCC"] {
+            assert!(matcher.assign(read.as_bytes()).is_some(), "{read}");
+        }
+        assert_eq!(matcher.cache.len(), 2);
+        assert!(matcher.cache.contains_key(b"AAAA".as_slice()));
+        assert!(!matcher.cache.contains_key(b"CCCC".as_slice()));
+        assert_eq!(matcher.assign(b"CCCC").map(|m| m.best_match), Some(1));
+    }
+
     // Some returns
     #[rstest]
     #[case(true)]
