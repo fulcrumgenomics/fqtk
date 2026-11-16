@@ -1,5 +1,5 @@
 use crate::commands::command::Command;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use bstr::ByteSlice;
 use clap::{Parser, ValueEnum};
 use fgoxide::io::{DelimFile, Io};
@@ -698,13 +698,17 @@ impl ReadSet {
 
 /// A struct for iterating over the records in multiple FASTQ files simultaneously, destructuring
 /// them according to the provided read structures, yielding ``ReadSet`` objects on each iteration.
+/// Unusable records are yielded as errors rather than panics: this iterator runs on a read-ahead
+/// thread, and a panic there can be lost, silently ending the input early.
 struct ReadSetIterator {
     /// Read structure object describing the structure of the reads in this file.
     read_structure: ReadStructure,
     /// The file containing FASTQ records.
     source: FastqReader<Box<dyn BufRead + Send>>,
-    /// Valid reasons for skipping reads, otherwise panic!
+    /// Valid reasons for skipping reads; other unusable reads are errors.
     skip_reasons: Vec<SkipReason>,
+    /// The path of this FASTQ source, for error messages.
+    path: PathBuf,
     /// The index of this FASTQ source (0-based), used for tracking original reads.
     source_index: usize,
     /// If true, the raw bases and qualities for each record will be retained on the resulting
@@ -714,63 +718,98 @@ struct ReadSetIterator {
     /// Pre-computed once at construction time and used to short-circuit reads that are too
     /// short.
     min_len: usize,
+    /// Set once an error has been yielded, after which the iterator ends: the FASTQ reader may
+    /// panic if read again after an I/O error.
+    failed: bool,
 }
 
 impl Iterator for ReadSetIterator {
-    type Item = ReadSet;
+    type Item = Result<ReadSet>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let item = self.next_read_set();
+        self.failed = matches!(item, Some(Err(_)));
+        item
+    }
+}
+
+impl ReadSetIterator {
+    /// Reads the next record and builds its `ReadSet`, or returns the error that prevents it.
+    fn next_read_set(&mut self) -> Option<Result<ReadSet>> {
         if let Some(rec) = self.source.next() {
-            let next_fq_rec = rec.expect("Unexpected error parsing FASTQs");
+            let path = &self.path;
+            let next_fq_rec = match rec {
+                Ok(rec) => rec,
+                // The I/O error is its own message; wrapping the FASTQ error would repeat it.
+                Err(seq_io::fastq::Error::Io(e)) => {
+                    return Some(Err(anyhow!(e).context(format!("Failed to read {path:?}"))));
+                }
+                Err(e) => {
+                    return Some(Err(anyhow!(e).context(format!("Failed to parse {path:?}"))));
+                }
+            };
             let read_name = next_fq_rec.head();
             let bases = next_fq_rec.seq();
             let quals = next_fq_rec.qual();
 
             if bases.len() < self.min_len {
                 if self.skip_reasons.contains(&SkipReason::TooFewBases) {
-                    return Some(ReadSet {
+                    return Some(Ok(ReadSet {
                         headers: vec![read_name.to_vec()],
                         segments: vec![],
                         raw_per_input: vec![],
                         skip_reason: Some(SkipReason::TooFewBases),
-                    });
+                    }));
                 }
-                panic!(
-                    "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
-                    String::from_utf8(read_name.to_vec()).unwrap(),
-                    bases.len(),
-                    self.min_len,
-                    self.read_structure
-                );
+                let name = String::from_utf8_lossy(read_name);
+                let (len, min_len) = (bases.len(), self.min_len);
+                let error = if self.keep_raw {
+                    anyhow!(
+                        "Read {name} had too few bases to demux {len} vs. {min_len} needed for \
+                         the per-sample matching window."
+                    )
+                } else {
+                    anyhow!(
+                        "Read {name} had too few bases to demux {len} vs. {min_len} needed in \
+                         read structure {}.",
+                        self.read_structure
+                    )
+                };
+                return Some(Err(error.context(TOO_FEW_BASES_HINT)));
             }
 
             // In keep_raw mode the caller will re-segment per-sample (or per-globals for
             // unmatched) downstream, so skip the up-front extraction and just retain the raw
             // bases/quals.
             if self.keep_raw {
-                return Some(ReadSet {
+                return Some(Ok(ReadSet {
                     headers: vec![read_name.to_vec()],
                     segments: vec![],
                     raw_per_input: vec![RawInput { bases: bases.to_vec(), quals: quals.to_vec() }],
                     skip_reason: None,
-                });
+                }));
             }
 
             let mut segments = Vec::with_capacity(self.read_structure.number_of_segments());
             for (read_segment_index, read_segment) in self.read_structure.iter().enumerate() {
-                let (seq, quals) =
-                    read_segment.extract_bases_and_quals(bases, quals).unwrap_or_else(|e| {
-                        panic!(
+                let (seq, quals) = match read_segment.extract_bases_and_quals(bases, quals) {
+                    Ok(seq_and_quals) => seq_and_quals,
+                    Err(e) => {
+                        return Some(Err(anyhow!(
                             "Error extracting bases (len: {}) or quals (len: {}) for the {}th read segment ({}) in read structure ({}) from FASTQ record with name {}; {}",
                             bases.len(),
                             quals.len(),
                             read_segment_index,
                             read_segment,
                             self.read_structure,
-                            String::from_utf8(read_name.to_vec()).unwrap(),
+                            String::from_utf8_lossy(read_name),
                             e
-                        )
-                    });
+                        )));
+                    }
+                };
                 segments.push(FastqSegment {
                     seq: seq.to_vec(),
                     quals: quals.to_vec(),
@@ -778,19 +817,17 @@ impl Iterator for ReadSetIterator {
                     source_index: self.source_index,
                 });
             }
-            Some(ReadSet {
+            Some(Ok(ReadSet {
                 headers: vec![read_name.to_vec()],
                 segments,
                 raw_per_input: vec![],
                 skip_reason: None,
-            })
+            }))
         } else {
             None
         }
     }
-}
 
-impl ReadSetIterator {
     /// Instantiates a new iterator over the read sets for a set of FASTQs with defined read
     /// structures.  When `keep_raw` is true, segment extraction is deferred — the resulting
     /// `ReadSet`s carry only the raw bases/quals per input so that callers can re-segment
@@ -800,11 +837,21 @@ impl ReadSetIterator {
         read_structure: ReadStructure,
         source: FastqReader<Box<dyn BufRead + Send>>,
         skip_reasons: Vec<SkipReason>,
+        path: PathBuf,
         source_index: usize,
         keep_raw: bool,
         min_len: usize,
     ) -> Self {
-        Self { read_structure, source, skip_reasons, source_index, keep_raw, min_len }
+        Self {
+            read_structure,
+            source,
+            skip_reasons,
+            path,
+            source_index,
+            keep_raw,
+            min_len,
+            failed: false,
+        }
     }
 }
 
@@ -1952,6 +1999,7 @@ impl Command for Demux {
                     read_structure,
                     source,
                     self.skip_reasons.clone(),
+                    self.inputs[source_index].clone(),
                     source_index,
                     per_sample_rs,
                     min_len,
@@ -1972,10 +2020,21 @@ impl Command for Demux {
         let mut skip_reasons: HashMap<SkipReason, usize> = HashMap::new();
         loop {
             let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
-            for iter in &mut fq_iterators {
-                if let Some(rec) = iter.next() {
-                    next_read_sets.push(rec);
+            let mut ended = Vec::new();
+            for (index, iter) in fq_iterators.iter_mut().enumerate() {
+                match iter.next() {
+                    Some(rec) => next_read_sets.push(rec?),
+                    None => ended.push(index),
                 }
+            }
+            // Checked before skipping a read, so a skipped read can't hide that an input ended.
+            if !ended.is_empty() && !next_read_sets.is_empty() {
+                let name = String::from_utf8_lossy(next_read_sets[0].first_header());
+                let paths =
+                    ended.iter().map(|&index| format!("{:?}", self.inputs[index])).join(", ");
+                bail!(
+                    "The input FASTQs have different numbers of reads: {paths} ended before read {name}."
+                );
             }
             if let Some(reason) = next_read_sets.iter().find_map(|read_set| read_set.skip_reason) {
                 let previous = skip_reasons.get(&reason).unwrap_or(&0);
@@ -1984,12 +2043,6 @@ impl Command for Demux {
             } else if next_read_sets.is_empty() {
                 break;
             }
-            assert_eq!(
-                next_read_sets.len(),
-                fq_iterators.len(),
-                "FASTQ sources out of sync at records: {:?}",
-                next_read_sets
-            );
             let read_set = ReadSet::combine_readsets(next_read_sets);
             let observed: Vec<u8> = if per_sample_rs {
                 read_set.matching_window_bases(&prefix_lens)
@@ -4309,9 +4362,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "Read ex_2 had too few bases to demux 0 vs. 1 needed in read structure +T."
-    )]
     fn test_fails_if_reads_too_short() {
         let tmp = TempDir::new().unwrap();
         let read_structures =
@@ -4348,7 +4398,13 @@ mod tests {
             umi_in_name: None,
             umi_tag: None,
         };
-        demux_inputs.execute().unwrap();
+        let msg = format!("{:#}", demux_inputs.execute().unwrap_err());
+        assert!(
+            msg.contains(
+                "Read ex_2 had too few bases to demux 0 vs. 1 needed in read structure +T."
+            ),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -5720,5 +5776,92 @@ mod tests {
         let metrics: Vec<DemuxMetric> = DelimFile::default().read_tsv(&metrics_path).unwrap();
         let demuxed: usize = metrics.iter().map(|m| m.templates).sum();
         assert_eq!(demuxed, 0, "the boundary read must be skipped, not demuxed");
+    }
+
+    // ############################################################################################
+    // Errors from reading the input FASTQs.
+    // ############################################################################################
+
+    /// Builds a demux of `inputs` with `read_structures`, for one sample with barcode `ACGTAAAA`
+    /// and no skip reasons.
+    fn demux_acgtaaaa(tmp: &TempDir, inputs: Vec<PathBuf>, read_structures: &[&str]) -> Demux {
+        Demux {
+            read_structures: read_structures
+                .iter()
+                .map(|rs| ReadStructure::from_str(rs).unwrap())
+                .collect(),
+            inputs,
+            sample_metadata: metadata_file(tmp, &["ACGTAAAA"]),
+            output_types: vec!['T'],
+            output: tmp.path().join("output"),
+            unmatched_prefix: "unmatched".to_owned(),
+            max_mismatches: 1,
+            min_mismatch_delta: 2,
+            threads: 5,
+            compression_level: 5,
+            skip_reasons: vec![],
+            template_types: vec!['T'],
+            header_format: HeaderFormatKind::Illumina,
+            umi_in_name: None,
+            umi_tag: None,
+        }
+    }
+
+    /// A read with too few bases is an error even as the first read of a read-ahead chunk, where
+    /// a panic used to be lost and the run ended early with exit status 0.
+    #[test]
+    fn test_demux_errors_on_short_read_at_read_ahead_chunk_start() {
+        let tmp = TempDir::new().unwrap();
+        let mut reads = vec!["ACGTAAAAAAAA"; 3000];
+        reads[1000] = "ACGT";
+        let demux = demux_acgtaaaa(&tmp, vec![fastq_file(&tmp, "r1", "ex", &reads)], &["8B+T"]);
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("Read ex_1000 had too few bases to demux 4 vs. 9"), "{msg}");
+        assert!(msg.contains("--skip-reasons too-few-bases"), "{msg}");
+    }
+
+    /// Inputs with different numbers of reads are an error naming the input that ended and the
+    /// read where they diverge.
+    #[test]
+    fn test_demux_errors_when_inputs_have_different_read_counts() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = fastq_file(&tmp, "r1", "ex", &["ACGTAAAAAA", "ACGTAAAAAA"]);
+        let r2 = fastq_file(&tmp, "r2", "ex", &["ACGTAAAAAA"]);
+        let demux = demux_acgtaaaa(&tmp, vec![r1, r2], &["8B+T", "+T"]);
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("r2.fastq\" ended before read ex_1."), "{msg}");
+    }
+
+    /// A malformed FASTQ record is an error naming the input and the problem.
+    #[test]
+    fn test_demux_errors_on_malformed_fastq() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = fastq_file(&tmp, "r1", "ex", &["ACGTAAAAAA"]);
+        let r2 = tmp.path().join("r2.fastq");
+        Io::default().write_lines(&r2, ["@ex_0", "ACGTAAAAAA", "+", "IIII"]).unwrap();
+        let demux = demux_acgtaaaa(&tmp, vec![r1, r2], &["8B+T", "+T"]);
+        let msg = format!("{:#}", demux.execute().unwrap_err());
+        assert!(msg.contains("Failed to parse") && msg.contains("r2.fastq"), "{msg}");
+        assert!(msg.contains("sequence length is 10, but quality length is 4"), "{msg}");
+    }
+
+    /// A truncated gzipped input is an error naming the input, reported once.
+    #[test]
+    fn test_demux_errors_on_truncated_gzip_fastq() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        for i in 0..2000 {
+            write!(encoder, "@ex_{i}\nACGTAAAAAAAA\n+\nIIIIIIIIIIII\n").unwrap();
+        }
+        let gz = encoder.finish().unwrap();
+        let r1 = tmp.path().join("r1.fastq.gz");
+        fs::write(&r1, &gz[..gz.len() / 2]).unwrap();
+        let msg = format!("{:#}", demux_acgtaaaa(&tmp, vec![r1], &["8B+T"]).execute().unwrap_err());
+        assert!(msg.contains("Failed to read") && msg.contains("r1.fastq.gz"), "{msg}");
+        assert_eq!(msg.matches("deflate").count(), 1, "{msg}");
     }
 }
